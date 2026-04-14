@@ -93,11 +93,7 @@ impl JitoBundleClient {
     }
 
     /// Fetch bundles for a range of slots.
-    pub async fn get_bundles_for_range(
-        &self,
-        start: u64,
-        end: u64,
-    ) -> Result<Vec<JitoBundle>> {
+    pub async fn get_bundles_for_range(&self, start: u64, end: u64) -> Result<Vec<JitoBundle>> {
         let mut all_bundles = Vec::new();
         for slot in start..=end {
             match self.get_bundles_for_slot(slot).await {

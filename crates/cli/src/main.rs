@@ -73,7 +73,14 @@ async fn main() -> Result<()> {
             }
         }
     } else if cli.follow {
-        follow_mode(&source, &parsers, &cli.format, cli.poll_interval, cli.window).await?;
+        follow_mode(
+            &source,
+            &parsers,
+            &cli.format,
+            cli.poll_interval,
+            cli.window,
+        )
+        .await?;
     } else {
         let slot = source.get_latest_slot().await?;
         tracing::info!("Processing latest slot: {}", slot);

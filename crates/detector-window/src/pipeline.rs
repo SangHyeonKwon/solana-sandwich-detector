@@ -2,9 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use swap_events::types::{DetectionMethod, SandwichAttack, SwapEvent};
 
-use crate::filters::{
-    self, BundleLookup, FilterConfig, NoBundleLookup,
-};
+use crate::filters::{self, BundleLookup, FilterConfig, NoBundleLookup};
 use crate::WindowDetector;
 
 /// Swap event tagged with its slot, used in the per-pool ring buffer.
@@ -77,7 +75,9 @@ impl FilteredWindowDetector {
 
     /// Evict swap events from pools older than the window.
     fn evict_old(&mut self) {
-        let cutoff = self.latest_slot.saturating_sub(self.window_slots.max(1) as u64 - 1);
+        let cutoff = self
+            .latest_slot
+            .saturating_sub(self.window_slots.max(1) as u64 - 1);
         for buffer in self.buffers.values_mut() {
             while buffer.front().map(|s| s.slot < cutoff).unwrap_or(false) {
                 buffer.pop_front();
@@ -182,11 +182,8 @@ impl FilteredWindowDetector {
                     }
 
                     // --- Confidence scoring ---
-                    let confidence = filters::compute_confidence(
-                        victim_provenance,
-                        &economic,
-                        &victim_check,
-                    );
+                    let confidence =
+                        filters::compute_confidence(victim_provenance, &economic, &victim_check);
 
                     if confidence < self.config.min_confidence {
                         continue;
@@ -234,7 +231,10 @@ impl WindowDetector for FilteredWindowDetector {
             let tagged = TaggedSwap {
                 slot,
                 fee: swap.fee.unwrap_or(5000),
-                swap: SwapEvent { slot: Some(slot), ..swap },
+                swap: SwapEvent {
+                    slot: Some(slot),
+                    ..swap
+                },
             };
             self.buffers
                 .entry(pool.clone())
@@ -295,7 +295,10 @@ mod tests {
         let mut det = FilteredWindowDetector::new(4);
 
         det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 5)]);
-        det.ingest_slot(101, vec![swap("victim", "vic", "p1", SwapDirection::Buy, 2)]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "vic", "p1", SwapDirection::Buy, 2)],
+        );
         let results = det.ingest_slot(
             102,
             vec![{
@@ -321,7 +324,10 @@ mod tests {
         let mut det = FilteredWindowDetector::new(4).with_config(config);
 
         det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)],
+        );
 
         // Backrun gets LESS than frontrun spent — not profitable
         let results = det.ingest_slot(
@@ -333,7 +339,10 @@ mod tests {
             }],
         );
 
-        assert!(results.is_empty(), "unprofitable candidates should be rejected");
+        assert!(
+            results.is_empty(),
+            "unprofitable candidates should be rejected"
+        );
     }
 
     #[test]
@@ -342,7 +351,10 @@ mod tests {
         let mut det = FilteredWindowDetector::new(4).with_known_attackers(attackers);
 
         det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("victim", "atk_alt", "p1", SwapDirection::Buy, 0)]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "atk_alt", "p1", SwapDirection::Buy, 0)],
+        );
         let results = det.ingest_slot(
             102,
             vec![{
@@ -352,22 +364,31 @@ mod tests {
             }],
         );
 
-        assert!(results.is_empty(), "known attacker as victim should be rejected");
+        assert!(
+            results.is_empty(),
+            "known attacker as victim should be rejected"
+        );
     }
 
     #[test]
     fn filtered_skips_same_slot() {
         let mut det = FilteredWindowDetector::new(4);
-        let results = det.ingest_slot(100, vec![
-            swap("front", "atk", "p1", SwapDirection::Buy, 0),
-            swap("victim", "vic", "p1", SwapDirection::Buy, 1),
-            {
-                let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 2);
-                s.amount_out = 1_100_000;
-                s
-            },
-        ]);
-        assert!(results.is_empty(), "same-slot should be left to sameblock detector");
+        let results = det.ingest_slot(
+            100,
+            vec![
+                swap("front", "atk", "p1", SwapDirection::Buy, 0),
+                swap("victim", "vic", "p1", SwapDirection::Buy, 1),
+                {
+                    let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 2);
+                    s.amount_out = 1_100_000;
+                    s
+                },
+            ],
+        );
+        assert!(
+            results.is_empty(),
+            "same-slot should be left to sameblock detector"
+        );
     }
 
     #[test]
@@ -378,13 +399,17 @@ mod tests {
         tx_map.insert("front".into(), "bundle1".into());
         tx_map.insert("victim".into(), "bundle1".into());
         tx_map.insert("back".into(), "bundle1".into());
-        let lookup = MemoryBundleLookup { tx_to_bundle: tx_map };
+        let lookup = MemoryBundleLookup {
+            tx_to_bundle: tx_map,
+        };
 
-        let mut det = FilteredWindowDetector::new(4)
-            .with_bundle_lookup(Box::new(lookup));
+        let mut det = FilteredWindowDetector::new(4).with_bundle_lookup(Box::new(lookup));
 
         det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)],
+        );
         let results = det.ingest_slot(
             102,
             vec![{
@@ -407,8 +432,14 @@ mod tests {
     fn per_pool_isolation() {
         let mut det = FilteredWindowDetector::new(4);
 
-        det.ingest_slot(100, vec![swap("f1", "atk", "pool_A", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("v1", "vic", "pool_B", SwapDirection::Buy, 0)]); // wrong pool
+        det.ingest_slot(
+            100,
+            vec![swap("f1", "atk", "pool_A", SwapDirection::Buy, 0)],
+        );
+        det.ingest_slot(
+            101,
+            vec![swap("v1", "vic", "pool_B", SwapDirection::Buy, 0)],
+        ); // wrong pool
         let results = det.ingest_slot(
             102,
             vec![{
@@ -418,7 +449,10 @@ mod tests {
             }],
         );
 
-        assert!(results.is_empty(), "victim on different pool should not match");
+        assert!(
+            results.is_empty(),
+            "victim on different pool should not match"
+        );
     }
 
     #[test]
@@ -429,24 +463,46 @@ mod tests {
         let mut det = FilteredWindowDetector::new(4);
 
         // First sandwich: atk attacks in pool_A
-        det.ingest_slot(100, vec![swap("f1", "atk", "pool_A", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("v1", "vic", "pool_A", SwapDirection::Buy, 0)]);
-        let r1 = det.ingest_slot(102, vec![{
-            let mut s = swap("b1", "atk", "pool_A", SwapDirection::Sell, 0);
-            s.amount_out = 1_100_000;
-            s
-        }]);
+        det.ingest_slot(
+            100,
+            vec![swap("f1", "atk", "pool_A", SwapDirection::Buy, 0)],
+        );
+        det.ingest_slot(
+            101,
+            vec![swap("v1", "vic", "pool_A", SwapDirection::Buy, 0)],
+        );
+        let r1 = det.ingest_slot(
+            102,
+            vec![{
+                let mut s = swap("b1", "atk", "pool_A", SwapDirection::Sell, 0);
+                s.amount_out = 1_100_000;
+                s
+            }],
+        );
         assert_eq!(r1.len(), 1, "first sandwich should be detected");
 
         // Second sandwich in pool_B: atk is the VICTIM of a different attacker
-        det.ingest_slot(103, vec![swap("f2", "atk2", "pool_B", SwapDirection::Buy, 0)]);
-        det.ingest_slot(104, vec![swap("v2", "atk", "pool_B", SwapDirection::Buy, 0)]);
-        let r2 = det.ingest_slot(105, vec![{
-            let mut s = swap("b2", "atk2", "pool_B", SwapDirection::Sell, 0);
-            s.amount_out = 1_100_000;
-            s
-        }]);
-        assert_eq!(r2.len(), 1, "atk as victim should not be rejected by self-population");
+        det.ingest_slot(
+            103,
+            vec![swap("f2", "atk2", "pool_B", SwapDirection::Buy, 0)],
+        );
+        det.ingest_slot(
+            104,
+            vec![swap("v2", "atk", "pool_B", SwapDirection::Buy, 0)],
+        );
+        let r2 = det.ingest_slot(
+            105,
+            vec![{
+                let mut s = swap("b2", "atk2", "pool_B", SwapDirection::Sell, 0);
+                s.amount_out = 1_100_000;
+                s
+            }],
+        );
+        assert_eq!(
+            r2.len(),
+            1,
+            "atk as victim should not be rejected by self-population"
+        );
     }
 
     #[test]
@@ -456,11 +512,14 @@ mod tests {
             let mut det = FilteredWindowDetector::new(4);
             det.ingest_slot(100, vec![swap("f", "atk", "p1", SwapDirection::Buy, 0)]);
             det.ingest_slot(101, vec![swap("v", "vic", "p1", SwapDirection::Buy, 0)]);
-            det.ingest_slot(102, vec![{
-                let mut s = swap("b", "atk", "p1", SwapDirection::Sell, 0);
-                s.amount_out = 1_100_000;
-                s
-            }])
+            det.ingest_slot(
+                102,
+                vec![{
+                    let mut s = swap("b", "atk", "p1", SwapDirection::Sell, 0);
+                    s.amount_out = 1_100_000;
+                    s
+                }],
+            )
         };
 
         let r1 = run();
@@ -478,14 +537,23 @@ mod tests {
         let mut det = FilteredWindowDetector::new(2);
 
         det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)],
+        );
         // Slot 102: window=2 means keep {101,102}, evict 100
-        let results = det.ingest_slot(102, vec![{
-            let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 0);
-            s.amount_out = 1_100_000;
-            s
-        }]);
-        assert!(results.is_empty(), "frontrun at slot 100 should be evicted with window=2");
+        let results = det.ingest_slot(
+            102,
+            vec![{
+                let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 0);
+                s.amount_out = 1_100_000;
+                s
+            }],
+        );
+        assert!(
+            results.is_empty(),
+            "frontrun at slot 100 should be evicted with window=2"
+        );
     }
 
     #[test]
@@ -496,20 +564,31 @@ mod tests {
         let mut tx_map = HashMap::new();
         tx_map.insert("front".into(), "bundle1".into());
         tx_map.insert("back".into(), "bundle1".into());
-        let lookup = MemoryBundleLookup { tx_to_bundle: tx_map };
+        let lookup = MemoryBundleLookup {
+            tx_to_bundle: tx_map,
+        };
 
-        let mut det = FilteredWindowDetector::new(4)
-            .with_bundle_lookup(Box::new(lookup));
+        let mut det = FilteredWindowDetector::new(4).with_bundle_lookup(Box::new(lookup));
 
         det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 0)]);
-        det.ingest_slot(101, vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)]);
-        let results = det.ingest_slot(102, vec![{
-            let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 0);
-            s.amount_out = 500_000; // unprofitable
-            s
-        }]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "vic", "p1", SwapDirection::Buy, 0)],
+        );
+        let results = det.ingest_slot(
+            102,
+            vec![{
+                let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 0);
+                s.amount_out = 500_000; // unprofitable
+                s
+            }],
+        );
 
         // Should still detect because front+back are co-bundled (econ check bypassed)
-        assert_eq!(results.len(), 1, "co-bundled front+back should bypass economic check");
+        assert_eq!(
+            results.len(),
+            1,
+            "co-bundled front+back should bypass economic check"
+        );
     }
 }

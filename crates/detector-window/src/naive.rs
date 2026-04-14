@@ -60,7 +60,6 @@ impl NaiveWindowDetector {
             // Find opposite-direction pairs (potential frontrun/backrun)
             for (i, (front_slot, frontrun)) in sorted.iter().enumerate() {
                 for (back_slot, backrun) in sorted.iter().skip(i + 1) {
-
                     // Must be opposite directions
                     if frontrun.direction == backrun.direction {
                         continue;
@@ -128,11 +127,7 @@ impl NaiveWindowDetector {
 }
 
 /// Check if victim is temporally between frontrun and backrun.
-fn is_between(
-    front: (u64, usize),
-    victim: (u64, usize),
-    back: (u64, usize),
-) -> bool {
+fn is_between(front: (u64, usize), victim: (u64, usize), back: (u64, usize)) -> bool {
     // Strict temporal ordering: front < victim < back
     (front.0, front.1) < (victim.0, victim.1) && (victim.0, victim.1) < (back.0, back.1)
 }
@@ -174,13 +169,7 @@ mod tests {
     use super::*;
     use swap_events::types::{DexType, SwapDirection};
 
-    fn swap(
-        sig: &str,
-        signer: &str,
-        pool: &str,
-        dir: SwapDirection,
-        idx: usize,
-    ) -> SwapEvent {
+    fn swap(sig: &str, signer: &str, pool: &str, dir: SwapDirection, idx: usize) -> SwapEvent {
         SwapEvent {
             signature: sig.into(),
             signer: signer.into(),

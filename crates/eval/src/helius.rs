@@ -93,9 +93,7 @@ impl HeliusClient {
 
     /// Fetch a single transaction.
     pub async fn get_parsed_transaction(&self, sig: &str) -> Result<HeliusTransaction> {
-        let txs = self
-            .get_parsed_transactions(&[sig.to_string()])
-            .await?;
+        let txs = self.get_parsed_transactions(&[sig.to_string()]).await?;
 
         txs.into_iter()
             .next()
@@ -106,8 +104,16 @@ impl HeliusClient {
 /// Format a Helius transaction for display during labeling.
 pub fn format_for_labeling(tx: &HeliusTransaction) -> String {
     let mut out = String::new();
-    out.push_str(&format!("  Sig:  {}...{}\n", &tx.signature[..8], &tx.signature[tx.signature.len().saturating_sub(8)..]));
-    out.push_str(&format!("  Type: {} | Fee payer: {}...\n", tx.tx_type, &tx.fee_payer[..8.min(tx.fee_payer.len())]));
+    out.push_str(&format!(
+        "  Sig:  {}...{}\n",
+        &tx.signature[..8],
+        &tx.signature[tx.signature.len().saturating_sub(8)..]
+    ));
+    out.push_str(&format!(
+        "  Type: {} | Fee payer: {}...\n",
+        tx.tx_type,
+        &tx.fee_payer[..8.min(tx.fee_payer.len())]
+    ));
     out.push_str(&format!("  Desc: {}\n", tx.description));
 
     if !tx.token_transfers.is_empty() {

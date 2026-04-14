@@ -10,12 +10,8 @@ use swap_events::source::BlockSource as _;
 use sandwich_eval::{
     helius::{self, HeliusClient},
     jito::JitoBundleClient,
-    labels::{
-        LabelDataset, LabelProvenance, LabeledExample, DatasetMetadata, SandwichTxSigs,
-    },
-    metrics,
-    runner,
-    sampler,
+    labels::{DatasetMetadata, LabelDataset, LabelProvenance, LabeledExample, SandwichTxSigs},
+    metrics, runner, sampler,
 };
 
 #[derive(Parser)]
@@ -158,7 +154,11 @@ async fn main() -> Result<()> {
 }
 
 async fn fetch_jito(start_slot: u64, end_slot: u64, output: &str) -> Result<()> {
-    tracing::info!("Fetching Jito bundles for slots {}..{}", start_slot, end_slot);
+    tracing::info!(
+        "Fetching Jito bundles for slots {}..{}",
+        start_slot,
+        end_slot
+    );
 
     let client = JitoBundleClient::new();
     let bundles = client.get_bundles_for_range(start_slot, end_slot).await?;
@@ -201,9 +201,7 @@ async fn measure(
     );
 
     let detections = match detector {
-        DetectorChoice::Sameblock => {
-            runner::run_sameblock_on_labels(&dataset, rpc_url).await?
-        }
+        DetectorChoice::Sameblock => runner::run_sameblock_on_labels(&dataset, rpc_url).await?,
         DetectorChoice::Window => {
             runner::run_window_on_labels(&dataset, rpc_url, window_slots).await?
         }
@@ -262,7 +260,11 @@ async fn sample(
     let sample_set = sampler::sample_slots(rpc_url, start_slot, end_slot, count).await?;
 
     let with_blocks = sample_set.sampled.iter().filter(|s| s.has_block).count();
-    let with_swaps = sample_set.sampled.iter().filter(|s| s.swap_count > 0).count();
+    let with_swaps = sample_set
+        .sampled
+        .iter()
+        .filter(|s| s.swap_count > 0)
+        .count();
     let with_candidates = sample_set
         .sampled
         .iter()
@@ -333,12 +335,22 @@ async fn label(
     let mut reader = stdin.lock();
 
     println!("\n=== Solana Sandwich Labeling Tool ===");
-    println!("  {} slots to label ({} already done)", slots_to_label.len(), already_labeled.len());
+    println!(
+        "  {} slots to label ({} already done)",
+        slots_to_label.len(),
+        already_labeled.len()
+    );
     println!("  Commands: [y]es sandwich, [n]ot sandwich, [s]kip, [q]uit\n");
 
     for (i, sample) in slots_to_label.iter().enumerate() {
-        println!("--- [{}/{}] Slot {} ({} swaps, {} candidates) ---",
-            i + 1, slots_to_label.len(), sample.slot, sample.swap_count, sample.sameblock_candidates);
+        println!(
+            "--- [{}/{}] Slot {} ({} swaps, {} candidates) ---",
+            i + 1,
+            slots_to_label.len(),
+            sample.slot,
+            sample.swap_count,
+            sample.sameblock_candidates
+        );
 
         // Get block and run detector
         let block = match source.get_block(sample.slot).await {
@@ -367,17 +379,23 @@ async fn label(
             println!("    Pool:    {}", sandwich.pool);
             println!("    DEX:     {}", sandwich.dex);
             println!("    Attacker: {}", sandwich.attacker);
-            println!("    Frontrun: {} (Buy: {} -> {})",
+            println!(
+                "    Frontrun: {} (Buy: {} -> {})",
                 &sandwich.frontrun.signature[..16.min(sandwich.frontrun.signature.len())],
                 sandwich.frontrun.amount_in,
-                sandwich.frontrun.amount_out);
-            println!("    Victim:   {} ({})",
+                sandwich.frontrun.amount_out
+            );
+            println!(
+                "    Victim:   {} ({})",
                 &sandwich.victim.signature[..16.min(sandwich.victim.signature.len())],
-                sandwich.victim.signer);
-            println!("    Backrun:  {} (Sell: {} -> {})",
+                sandwich.victim.signer
+            );
+            println!(
+                "    Backrun:  {} (Sell: {} -> {})",
                 &sandwich.backrun.signature[..16.min(sandwich.backrun.signature.len())],
                 sandwich.backrun.amount_in,
-                sandwich.backrun.amount_out);
+                sandwich.backrun.amount_out
+            );
             if let Some(profit) = sandwich.estimated_attacker_profit {
                 println!("    Est. profit: {} lamports", profit);
             }
@@ -457,7 +475,10 @@ async fn label(
                     continue;
                 }
                 "q" | "quit" => {
-                    println!("\nLabeling session ended. {} total labels.", dataset.labels.len());
+                    println!(
+                        "\nLabeling session ended. {} total labels.",
+                        dataset.labels.len()
+                    );
                     return Ok(());
                 }
                 _ => {
@@ -467,6 +488,9 @@ async fn label(
         }
     }
 
-    println!("\nLabeling complete! {} total labels.", dataset.labels.len());
+    println!(
+        "\nLabeling complete! {} total labels.",
+        dataset.labels.len()
+    );
     Ok(())
 }

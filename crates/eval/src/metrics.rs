@@ -44,10 +44,7 @@ pub enum MatchType {
 /// - A given victim is either sandwiched or not — no ambiguity
 /// - The attacker may use fresh wallets per attack
 /// - Pool + slot + victim_sig is a unique triplet
-pub fn evaluate(
-    labels: &[LabeledExample],
-    detections: &[SandwichAttack],
-) -> EvalResult {
+pub fn evaluate(labels: &[LabeledExample], detections: &[SandwichAttack]) -> EvalResult {
     // Build set of detected victim signatures for fast lookup
     let detected_victims: HashSet<&str> = detections
         .iter()
@@ -136,7 +133,11 @@ pub fn evaluate(
 impl std::fmt::Display for EvalResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Evaluation Results")?;
-        writeln!(f, "  TP: {}  FP: {}  FN: {}  TN: {}", self.true_positives, self.false_positives, self.false_negatives, self.true_negatives)?;
+        writeln!(
+            f,
+            "  TP: {}  FP: {}  FN: {}  TN: {}",
+            self.true_positives, self.false_positives, self.false_negatives, self.true_negatives
+        )?;
         writeln!(f, "  Precision: {:.1}%", self.precision * 100.0)?;
         writeln!(f, "  Recall:    {:.1}%", self.recall * 100.0)?;
         writeln!(f, "  F1:        {:.1}%", self.f1 * 100.0)?;
@@ -256,8 +257,8 @@ mod tests {
         ];
         let detections = vec![
             make_detection("v1"), // TP
-            // v2 missed -> FN
-            // v3 not detected -> TN
+                                  // v2 missed -> FN
+                                  // v3 not detected -> TN
         ];
         let result = evaluate(&labels, &detections);
         assert_eq!(result.true_positives, 1);

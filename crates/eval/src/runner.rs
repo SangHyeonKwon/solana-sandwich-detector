@@ -36,8 +36,18 @@ pub async fn run_sameblock_on_labels(
     let parsers = Arc::new(dex::all_parsers());
 
     // Collect unique slots from labels
-    let slots: Vec<u64> = dataset.labels.iter().map(|l| l.slot).collect::<HashSet<_>>().into_iter().collect();
-    tracing::info!("Fetching {} unique slots (concurrency={})", slots.len(), block_fetch_concurrency());
+    let slots: Vec<u64> = dataset
+        .labels
+        .iter()
+        .map(|l| l.slot)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    tracing::info!(
+        "Fetching {} unique slots (concurrency={})",
+        slots.len(),
+        block_fetch_concurrency()
+    );
 
     let results: Vec<_> = stream::iter(slots)
         .map(|slot| {
@@ -155,8 +165,8 @@ pub async fn run_window_on_labels(
     let lookup = MemoryBundleLookup { tx_to_bundle };
 
     // Create detector with bundle lookup
-    let mut detector = FilteredWindowDetector::new(window_slots)
-        .with_bundle_lookup(Box::new(lookup));
+    let mut detector =
+        FilteredWindowDetector::new(window_slots).with_bundle_lookup(Box::new(lookup));
 
     // Fetch blocks in parallel, extract swaps
     let source = Arc::new(source);
@@ -264,4 +274,3 @@ async fn run_slot(
     let attacks = detector_sameblock::detect_sandwiches(slot, &swaps);
     Ok(attacks)
 }
-

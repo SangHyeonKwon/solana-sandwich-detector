@@ -76,17 +76,11 @@ pub fn classify_provenance(
 
     match (&front_bundle, &victim_bundle, &back_bundle) {
         // All three in the same bundle
-        (Some(fb), Some(vb), Some(bb)) if fb == vb && vb == bb => {
-            BundleProvenance::AtomicBundle
-        }
+        (Some(fb), Some(vb), Some(bb)) if fb == vb && vb == bb => BundleProvenance::AtomicBundle,
         // Front and back in the same bundle, victim separate
-        (Some(fb), _, Some(bb)) if fb == bb => {
-            BundleProvenance::SpanningBundle
-        }
+        (Some(fb), _, Some(bb)) if fb == bb => BundleProvenance::SpanningBundle,
         // All in bundles but different ones
-        (Some(_), _, Some(_)) => {
-            BundleProvenance::TipRace
-        }
+        (Some(_), _, Some(_)) => BundleProvenance::TipRace,
         // Any tx not in a bundle
         _ => BundleProvenance::Organic,
     }
@@ -230,7 +224,10 @@ mod tests {
         map.insert("v".into(), "b1".into());
         map.insert("b".into(), "b1".into());
         let lookup = MemoryBundleLookup { tx_to_bundle: map };
-        assert_eq!(classify_provenance("f", "v", "b", &lookup), BundleProvenance::AtomicBundle);
+        assert_eq!(
+            classify_provenance("f", "v", "b", &lookup),
+            BundleProvenance::AtomicBundle
+        );
     }
 
     #[test]
@@ -240,7 +237,10 @@ mod tests {
         map.insert("b".into(), "b1".into());
         // victim not in any bundle
         let lookup = MemoryBundleLookup { tx_to_bundle: map };
-        assert_eq!(classify_provenance("f", "v", "b", &lookup), BundleProvenance::SpanningBundle);
+        assert_eq!(
+            classify_provenance("f", "v", "b", &lookup),
+            BundleProvenance::SpanningBundle
+        );
     }
 
     #[test]
@@ -250,27 +250,49 @@ mod tests {
         map.insert("v".into(), "b2".into());
         map.insert("b".into(), "b3".into());
         let lookup = MemoryBundleLookup { tx_to_bundle: map };
-        assert_eq!(classify_provenance("f", "v", "b", &lookup), BundleProvenance::TipRace);
+        assert_eq!(
+            classify_provenance("f", "v", "b", &lookup),
+            BundleProvenance::TipRace
+        );
     }
 
     #[test]
     fn provenance_organic() {
         let lookup = NoBundleLookup;
-        assert_eq!(classify_provenance("f", "v", "b", &lookup), BundleProvenance::Organic);
+        assert_eq!(
+            classify_provenance("f", "v", "b", &lookup),
+            BundleProvenance::Organic
+        );
     }
 
     #[test]
     fn economic_feasible() {
         use swap_events::types::{DexType, SwapDirection};
         let front = SwapEvent {
-            signature: "f".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 5_000_000_000, amount_out: 1_000_000, tx_index: 0, slot: None, fee: None,
+            signature: "f".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 5_000_000_000,
+            amount_out: 1_000_000,
+            tx_index: 0,
+            slot: None,
+            fee: None,
         };
         let back = SwapEvent {
-            signature: "b".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Sell, token_mint: "t".into(),
-            amount_in: 1_000_000, amount_out: 5_200_000_000, tx_index: 2, slot: None, fee: None,
+            signature: "b".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Sell,
+            token_mint: "t".into(),
+            amount_in: 1_000_000,
+            amount_out: 5_200_000_000,
+            tx_index: 2,
+            slot: None,
+            fee: None,
         };
         let config = FilterConfig::default();
         let result = check_economic_feasibility(&front, &back, 5000, 5000, &config);
@@ -282,14 +304,30 @@ mod tests {
     fn economic_not_feasible() {
         use swap_events::types::{DexType, SwapDirection};
         let front = SwapEvent {
-            signature: "f".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 5_000_000_000, amount_out: 100, tx_index: 0, slot: None, fee: None,
+            signature: "f".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 5_000_000_000,
+            amount_out: 100,
+            tx_index: 0,
+            slot: None,
+            fee: None,
         };
         let back = SwapEvent {
-            signature: "b".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Sell, token_mint: "t".into(),
-            amount_in: 100, amount_out: 4_900_000_000, tx_index: 2, slot: None, fee: None,
+            signature: "b".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Sell,
+            token_mint: "t".into(),
+            amount_in: 100,
+            amount_out: 4_900_000_000,
+            tx_index: 2,
+            slot: None,
+            fee: None,
         };
         let config = FilterConfig::default();
         let result = check_economic_feasibility(&front, &back, 5000, 5000, &config);
@@ -300,14 +338,30 @@ mod tests {
     fn victim_plausible() {
         use swap_events::types::{DexType, SwapDirection};
         let front = SwapEvent {
-            signature: "f".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 1_000_000, amount_out: 100, tx_index: 0, slot: None, fee: None,
+            signature: "f".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 1_000_000,
+            amount_out: 100,
+            tx_index: 0,
+            slot: None,
+            fee: None,
         };
         let victim = SwapEvent {
-            signature: "v".into(), signer: "vic".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 500_000, amount_out: 50, tx_index: 1, slot: None, fee: None,
+            signature: "v".into(),
+            signer: "vic".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 500_000,
+            amount_out: 50,
+            tx_index: 1,
+            slot: None,
+            fee: None,
         };
         let config = FilterConfig::default();
         let result = check_victim_plausibility(&front, &victim, &HashSet::new(), &config);
@@ -319,14 +373,30 @@ mod tests {
     fn victim_is_attacker() {
         use swap_events::types::{DexType, SwapDirection};
         let front = SwapEvent {
-            signature: "f".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 1_000_000, amount_out: 100, tx_index: 0, slot: None, fee: None,
+            signature: "f".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 1_000_000,
+            amount_out: 100,
+            tx_index: 0,
+            slot: None,
+            fee: None,
         };
         let victim = SwapEvent {
-            signature: "v".into(), signer: "atk_alt".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 500_000, amount_out: 50, tx_index: 1, slot: None, fee: None,
+            signature: "v".into(),
+            signer: "atk_alt".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 500_000,
+            amount_out: 50,
+            tx_index: 1,
+            slot: None,
+            fee: None,
         };
         let known = HashSet::from(["atk_alt".to_string()]);
         let config = FilterConfig::default();
@@ -338,16 +408,35 @@ mod tests {
     fn victim_too_small() {
         use swap_events::types::{DexType, SwapDirection};
         let front = SwapEvent {
-            signature: "f".into(), signer: "atk".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 10_000_000_000, amount_out: 100, tx_index: 0, slot: None, fee: None,
+            signature: "f".into(),
+            signer: "atk".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 10_000_000_000,
+            amount_out: 100,
+            tx_index: 0,
+            slot: None,
+            fee: None,
         };
         let victim = SwapEvent {
-            signature: "v".into(), signer: "vic".into(), dex: DexType::RaydiumV4,
-            pool: "p".into(), direction: SwapDirection::Buy, token_mint: "t".into(),
-            amount_in: 1_000, amount_out: 1, tx_index: 1, slot: None, fee: None, // 0.00001% of frontrun
+            signature: "v".into(),
+            signer: "vic".into(),
+            dex: DexType::RaydiumV4,
+            pool: "p".into(),
+            direction: SwapDirection::Buy,
+            token_mint: "t".into(),
+            amount_in: 1_000,
+            amount_out: 1,
+            tx_index: 1,
+            slot: None,
+            fee: None, // 0.00001% of frontrun
         };
-        let config = FilterConfig { min_victim_ratio: 0.01, ..Default::default() };
+        let config = FilterConfig {
+            min_victim_ratio: 0.01,
+            ..Default::default()
+        };
         let result = check_victim_plausibility(&front, &victim, &HashSet::new(), &config);
         assert!(!result.plausible);
     }
@@ -367,7 +456,11 @@ mod tests {
         };
 
         let conf = compute_confidence(BundleProvenance::AtomicBundle, &econ, &victim);
-        assert!(conf > 0.8, "atomic bundle + profitable should be high confidence: {}", conf);
+        assert!(
+            conf > 0.8,
+            "atomic bundle + profitable should be high confidence: {}",
+            conf
+        );
 
         let conf_organic = compute_confidence(BundleProvenance::Organic, &econ, &victim);
         assert!(conf_organic < conf, "organic should be lower than atomic");
