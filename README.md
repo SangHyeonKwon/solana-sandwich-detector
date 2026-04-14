@@ -35,8 +35,13 @@ Sandwich attacks are the most common form of MEV exploitation on Solana. An atta
 | DEX | Coverage |
 |-----|----------|
 | Raydium V4 | Direct swaps + CPI |
+| Raydium CLMM | Direct swaps + CPI |
+| Raydium CPMM | Direct swaps + CPI |
 | Orca Whirlpool | Direct swaps + CPI |
 | Jupiter V6 | Route-through (resolves underlying pool) |
+| Meteora DLMM | Direct swaps + CPI |
+| Pump.fun | Direct swaps + CPI |
+| Phoenix | Direct swaps + CPI |
 
 > Adding a new DEX takes ~50 lines. See [Contributing](#contributing).
 
@@ -180,8 +185,13 @@ crates/
       parser.rs          Solana block/tx parsing (handles v0 + lookup tables)
       dex/
         raydium.rs       Raydium V4 parser
+        raydium_clmm.rs  Raydium CLMM parser
+        raydium_cpmm.rs  Raydium CPMM parser
         orca.rs          Orca Whirlpool parser
         jupiter.rs       Jupiter V6 router parser
+        meteora.rs       Meteora DLMM parser
+        pumpfun.rs       Pump.fun parser
+        phoenix.rs       Phoenix parser
       source/
         rpc.rs           JSON-RPC block source
   cli/                   CLI binary (sandwich-detect)
@@ -195,7 +205,7 @@ This library is intentionally narrow: **compute over a stream of blocks → emit
 
 **In scope** (PRs welcome):
 
-- New DEX parsers (Meteora, Phoenix, Lifinity, Pump.fun, Raydium CLMM, ...)
+- New DEX parsers (Lifinity, Marinade, Sanctum, ...)
 - New `BlockSource` implementations (Yellowstone gRPC, Geyser, fixture file, WebSocket)
 - Same-block detection accuracy fixes and edge cases
 - Mainnet test fixtures
@@ -225,7 +235,7 @@ The rule of thumb: **"compute over a stream"** stays here, **"state, output, pre
 
 PRs welcome. Here's where help is most valuable:
 
-- **Add a DEX parser** — implement `DexParser` for a new protocol (Meteora, Phoenix, Lifinity, ...)
+- **Add a DEX parser** — implement `DexParser` for a new protocol (Lifinity, Marinade, Sanctum, ...)
 - **Add test fixtures** — capture mainnet blocks with confirmed sandwiches under `fixtures/`
 - **Improve pool ID resolution** — better instruction-level parsing for existing DEXes
 - **Add block sources** — gRPC (Yellowstone), WebSocket subscriptions

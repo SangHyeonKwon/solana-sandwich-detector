@@ -1,6 +1,11 @@
 pub mod jupiter;
+pub mod meteora;
 pub mod orca;
+pub mod phoenix;
+pub mod pumpfun;
 pub mod raydium;
+pub mod raydium_clmm;
+pub mod raydium_cpmm;
 
 use std::collections::HashSet;
 
@@ -25,8 +30,13 @@ pub trait DexParser: Send + Sync {
 pub fn all_parsers() -> Vec<Box<dyn DexParser>> {
     vec![
         Box::new(raydium::RaydiumV4Parser),
+        Box::new(raydium_clmm::RaydiumClmmParser),
+        Box::new(raydium_cpmm::RaydiumCpmmParser),
         Box::new(orca::OrcaWhirlpoolParser),
         Box::new(jupiter::JupiterV6Parser),
+        Box::new(meteora::MeteoraDlmmParser),
+        Box::new(pumpfun::PumpFunParser),
+        Box::new(phoenix::PhoenixParser),
     ]
 }
 
