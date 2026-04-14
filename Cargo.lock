@@ -3180,6 +3180,7 @@ dependencies = [
 name = "sandwich-detector"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bs58 0.5.1",
  "serde",

@@ -16,3 +16,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bs58 = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+solana-transaction-status = { workspace = true }
