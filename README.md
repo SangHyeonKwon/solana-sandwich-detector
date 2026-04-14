@@ -28,7 +28,7 @@ Sandwich attacks are the most common form of MEV exploitation on Solana. An atta
 
 **solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It parses swap instructions across major DEXes, groups them by pool, and flags the classic frontrun-victim-backrun pattern. A thin streaming CLI (`sandwich-detect`) is shipped alongside as a reference consumer.
 
-> Used by [Vigil](https://github.com/SangHyeonKwon/vigil) — a Solana MEV transparency platform — as the same-block detection primitive. Cross-slot detection, validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
+> Used by [Vigil](https://github.com/SangHyeonKwon/vigil-rpc) — a Solana MEV transparency platform — as the same-block detection primitive. Cross-slot detection, validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
 
 ### Supported DEXes
 
@@ -191,7 +191,7 @@ crates/
 
 ## Scope
 
-This library is intentionally narrow: **compute over a stream of blocks → emit detected attacks**. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/SangHyeonKwon/vigil) instead. The CLI follows the same rule — it's a thin streaming wrapper, not a service.
+This library is intentionally narrow: **compute over a stream of blocks → emit detected attacks**. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/SangHyeonKwon/vigil-rpc) instead. The CLI follows the same rule — it's a thin streaming wrapper, not a service.
 
 **In scope** (PRs welcome):
 
