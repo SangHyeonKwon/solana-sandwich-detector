@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/detector", "crates/cli"]
+members = [
+    "crates/swap-events",
+    "crates/detector-sameblock",
+    "crates/detector-window",
+    "crates/detector",
+    "crates/cli",
+    "crates/eval",
+]
 resolver = "2"
 
 [workspace.package]
@@ -9,6 +16,9 @@ license = "MIT"
 
 [workspace.dependencies]
 sandwich-detector = { path = "crates/detector" }
+swap-events = { path = "crates/swap-events" }
+detector-sameblock = { path = "crates/detector-sameblock" }
+detector-window = { path = "crates/detector-window" }
 solana-sdk = "2"
 solana-client = "2"
 solana-transaction-status = "2"
@@ -22,3 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 bs58 = "0.5"
 async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"

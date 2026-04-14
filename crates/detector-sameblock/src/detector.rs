@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{SandwichAttack, SwapEvent};
+use swap_events::types::{SandwichAttack, SwapEvent};
 
 /// Detect same-block sandwich attacks from a list of swap events.
 ///
@@ -71,7 +71,13 @@ pub fn detect_sandwiches(slot: u64, swaps: &[SwapEvent]) -> Vec<SandwichAttack> 
                         pool: frontrun.pool.clone(),
                         dex: frontrun.dex,
                         estimated_attacker_profit: estimate_profit(frontrun, backrun),
-                        estimated_victim_loss: None, // v1: requires pool state reconstruction
+                        estimated_victim_loss: None,
+                        frontrun_slot: None,
+                        backrun_slot: None,
+                        detection_method: None,
+                        bundle_provenance: None,
+                        confidence: None,
+                        net_profit: None,
                     });
                     found_victim = true;
                 }
@@ -96,7 +102,7 @@ fn estimate_profit(frontrun: &SwapEvent, backrun: &SwapEvent) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DexType, SwapDirection};
+    use swap_events::types::{DexType, SwapDirection};
 
     fn swap(sig: &str, signer: &str, pool: &str, dir: SwapDirection, idx: usize) -> SwapEvent {
         SwapEvent {
@@ -109,6 +115,8 @@ mod tests {
             amount_in: 1_000_000,
             amount_out: 900_000,
             tx_index: idx,
+            slot: None,
+            fee: None,
         }
     }
 
