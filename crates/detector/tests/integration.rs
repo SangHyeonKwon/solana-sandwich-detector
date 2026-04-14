@@ -1,4 +1,4 @@
-use sandwich_detector::{detector, dex, types::*};
+use sandwich_detector::{detector, dex, parser, types::*};
 
 /// Build a minimal TransactionData for testing.
 #[allow(clippy::too_many_arguments)]
@@ -240,5 +240,74 @@ fn no_swap_when_pool_unresolvable() {
     assert!(
         swaps.is_empty(),
         "Should return no swaps when pool can't be resolved"
+    );
+}
+
+/// End-to-end test against a real mainnet block (slot 285000037).
+/// This block has known sandwich attacks from multiple bots.
+#[test]
+fn mainnet_slot_285000037() {
+    let json = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/slot_285000037.json"
+    ))
+    .expect("fixture file not found — run the fetch script first");
+
+    let block: solana_transaction_status::UiConfirmedBlock =
+        serde_json::from_str(&json).expect("failed to parse fixture JSON");
+
+    let block_data = parser::parse_block(285000037, block).expect("parse_block failed");
+
+    assert!(
+        block_data.transactions.len() > 100,
+        "expected many transactions, got {}",
+        block_data.transactions.len()
+    );
+
+    let parsers = dex::all_parsers();
+    let swaps: Vec<SwapEvent> = block_data
+        .transactions
+        .iter()
+        .flat_map(|tx| dex::extract_swaps(tx, &parsers))
+        .collect();
+
+    assert!(swaps.len() > 10, "expected many swaps, got {}", swaps.len());
+
+    let sandwiches = detector::detect_sandwiches(285000037, &swaps);
+
+    assert!(
+        !sandwiches.is_empty(),
+        "expected at least 1 sandwich in this block"
+    );
+
+    // Verify basic invariants on every detected sandwich
+    for s in &sandwiches {
+        assert_eq!(s.slot, 285000037);
+        assert_eq!(s.frontrun.signer, s.backrun.signer, "attacker mismatch");
+        assert_eq!(s.frontrun.signer, s.attacker);
+        assert_ne!(s.victim.signer, s.attacker, "victim == attacker");
+        assert_ne!(
+            s.frontrun.direction, s.backrun.direction,
+            "frontrun/backrun same direction"
+        );
+        assert_eq!(
+            s.victim.direction, s.frontrun.direction,
+            "victim should match frontrun direction"
+        );
+        assert!(
+            s.frontrun.tx_index < s.victim.tx_index,
+            "frontrun must come before victim"
+        );
+        assert!(
+            s.victim.tx_index < s.backrun.tx_index,
+            "victim must come before backrun"
+        );
+    }
+
+    eprintln!(
+        "slot 285000037: {} txs, {} swaps, {} sandwiches",
+        block_data.transactions.len(),
+        swaps.len(),
+        sandwiches.len()
     );
 }
