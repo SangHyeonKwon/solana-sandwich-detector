@@ -32,6 +32,7 @@ pub struct FilteredWindowDetector {
     /// Track the latest slot seen, for eviction.
     latest_slot: u64,
     /// Already-emitted victim signatures (dedup).
+    /// TODO: prune entries whose slot has left the window to bound memory in long-running mode.
     emitted: HashSet<String>,
     /// Filter configuration.
     config: FilterConfig,

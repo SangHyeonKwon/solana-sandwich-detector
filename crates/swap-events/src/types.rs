@@ -219,6 +219,7 @@ pub struct TokenBalanceChange {
 }
 
 impl TokenBalanceChange {
+    /// Note: wraps if amounts exceed i64::MAX (~9.2e18). Rare for SPL tokens in practice.
     pub fn delta(&self) -> i64 {
         self.post_amount as i64 - self.pre_amount as i64
     }

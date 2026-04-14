@@ -14,14 +14,14 @@ use crate::labels::LabelDataset;
 use detector_window::{FilteredWindowDetector, MemoryBundleLookup, WindowDetector};
 
 fn block_fetch_concurrency() -> usize {
-    std::env::var("block_fetch_concurrency()")
+    std::env::var("BLOCK_FETCH_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20)
 }
 
 fn jito_fetch_concurrency() -> usize {
-    std::env::var("jito_fetch_concurrency()")
+    std::env::var("JITO_FETCH_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10)
@@ -265,39 +265,3 @@ async fn run_slot(
     Ok(attacks)
 }
 
-/// Get the signer of a transaction by its signature, using RPC lookup.
-/// Used for Jito bundle analysis.
-pub async fn lookup_signer(rpc_url: &str, signature: &str) -> Result<String> {
-    use solana_client::nonblocking::rpc_client::RpcClient;
-    use solana_sdk::commitment_config::CommitmentConfig;
-    use solana_sdk::signature::Signature;
-
-    let client = RpcClient::new_with_commitment(
-        rpc_url.to_string(),
-        CommitmentConfig::confirmed(),
-    );
-
-    let sig: Signature = signature.parse()?;
-    let tx = client
-        .get_transaction(
-            &sig,
-            solana_transaction_status::UiTransactionEncoding::Json,
-        )
-        .await?;
-
-    let signer = match tx.transaction.transaction {
-        solana_transaction_status::EncodedTransaction::Json(ui_tx) => {
-            ui_tx.signatures.first().and_then(|_| {
-                match ui_tx.message {
-                    solana_transaction_status::UiMessage::Raw(raw) => {
-                        raw.account_keys.first().cloned()
-                    }
-                    _ => None,
-                }
-            })
-        }
-        _ => None,
-    };
-
-    signer.ok_or_else(|| anyhow::anyhow!("Could not determine signer for {}", signature))
-}

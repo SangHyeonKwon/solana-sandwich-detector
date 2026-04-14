@@ -232,20 +232,34 @@ async fn follow_mode(
 
         if current_slot > last_slot {
             for slot in (last_slot + 1)..=current_slot {
-                // Same-block detection always runs
-                process_slot(source, parsers, slot, format).await?;
+                let block = match source.get_block(slot).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Slot {}: {}", slot, e);
+                        continue;
+                    }
+                };
+
+                let swaps: Vec<_> = block
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| dex::extract_swaps(tx, parsers))
+                    .collect();
+
+                // Same-block detection
+                let sandwiches = detector::detect_sandwiches(slot, &swaps);
+                for s in &sandwiches {
+                    output_sandwich(s, format)?;
+                }
+                tracing::info!(
+                    "Slot {}: {} swap(s), {} sandwich(es)",
+                    slot,
+                    swaps.len(),
+                    sandwiches.len()
+                );
 
                 // Window detection if enabled
                 if let Some(ref mut wd) = window_detector {
-                    let block = match source.get_block(slot).await {
-                        Ok(b) => b,
-                        Err(_) => continue,
-                    };
-                    let swaps: Vec<_> = block
-                        .transactions
-                        .iter()
-                        .flat_map(|tx| dex::extract_swaps(tx, parsers))
-                        .collect();
                     let cross = wd.ingest_slot(slot, swaps);
                     for s in &cross {
                         output_sandwich(s, format)?;
