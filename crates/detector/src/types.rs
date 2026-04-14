@@ -7,16 +7,26 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum DexType {
     RaydiumV4,
+    RaydiumClmm,
+    RaydiumCpmm,
     OrcaWhirlpool,
     JupiterV6,
+    MeteoraDlmm,
+    PumpFun,
+    Phoenix,
 }
 
 impl fmt::Display for DexType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DexType::RaydiumV4 => write!(f, "Raydium V4"),
+            DexType::RaydiumClmm => write!(f, "Raydium CLMM"),
+            DexType::RaydiumCpmm => write!(f, "Raydium CPMM"),
             DexType::OrcaWhirlpool => write!(f, "Orca Whirlpool"),
             DexType::JupiterV6 => write!(f, "Jupiter V6"),
+            DexType::MeteoraDlmm => write!(f, "Meteora DLMM"),
+            DexType::PumpFun => write!(f, "Pump.fun"),
+            DexType::Phoenix => write!(f, "Phoenix"),
         }
     }
 }

@@ -5,7 +5,15 @@
  * Generated from: crates/detector/src/types.rs
  */
 
-export type DexType = "raydium_v4" | "orca_whirlpool" | "jupiter_v6";
+export type DexType =
+  | "raydium_v4"
+  | "raydium_clmm"
+  | "raydium_cpmm"
+  | "orca_whirlpool"
+  | "jupiter_v6"
+  | "meteora_dlmm"
+  | "pump_fun"
+  | "phoenix";
 export type SwapDirection = "buy" | "sell";
 
 export interface SwapEvent {
