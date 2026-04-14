@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">solana-sandwich-detector</h1>
   <p align="center">
-    A Rust library for detecting sandwich attacks in Solana blocks.<br/>
-    Parses swap events from major DEXes and identifies frontrun/victim/backrun patterns in transaction-ordered streams.
+    A Rust library for detecting same-block and cross-slot sandwich attacks on Solana.<br/>
+    Parses swap events from 8 DEXes and identifies frontrun/victim/backrun patterns using sliding-window correlation and precision filters.
   </p>
 </p>
 
@@ -24,11 +24,11 @@
 
 ---
 
-Sandwich attacks are the most common form of MEV exploitation on Solana. An attacker front-runs a victim's swap, pushes the price, and back-runs to profit — all within the same block.
+Sandwich attacks are the most common form of MEV exploitation on Solana. An attacker front-runs a victim's swap, pushes the price, and back-runs to profit -- within the same block or across nearby slots.
 
-**solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It parses swap instructions across major DEXes, groups them by pool, and flags the classic frontrun-victim-backrun pattern. A thin streaming CLI (`sandwich-detect`) is shipped alongside as a reference consumer.
+**solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It supports **same-block detection** (classic single-slot pattern) and **cross-slot window detection** (attacks spanning multiple slots, with Jito bundle provenance, economic feasibility, and victim plausibility filters). A thin streaming CLI (`sandwich-detect`) and an evaluation framework (`sandwich-eval`) are shipped alongside.
 
-> Used by [Vigil](https://github.com/EarthIsMine/Vigil-RPC) — a Solana MEV transparency platform — as the same-block detection primitive. Cross-slot detection, validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
+> Used by [Vigil](https://github.com/EarthIsMine/Vigil-RPC) -- a Solana MEV transparency platform -- as the detection primitive. Validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
 
 ### Supported DEXes
 
@@ -49,7 +49,7 @@ Sandwich attacks are the most common form of MEV exploitation on Solana. An atta
 
 ## Quick Start
 
-The repo ships with `sandwich-detect`, a thin streaming CLI that wraps the library — useful for smoke-testing, ad-hoc analysis, and piping detections into other tools. For embedding in your own service, [use the library directly](#use-as-a-library).
+The repo ships with `sandwich-detect`, a thin streaming CLI that wraps the library -- useful for smoke-testing, ad-hoc analysis, and piping detections into other tools. For embedding in your own service, [use the library directly](#use-as-a-library).
 
 ```bash
 # Build
@@ -91,7 +91,7 @@ Each detected sandwich prints as a JSON line to stdout:
 }
 ```
 
-Pipe it anywhere — `jq`, a database, an alert system, your own dashboard.
+Pipe it anywhere -- `jq`, a database, an alert system, your own dashboard.
 
 ### More examples
 
@@ -101,6 +101,9 @@ sandwich-detect --rpc $RPC_URL --slot 285012345
 
 # Scan a range of slots
 sandwich-detect --rpc $RPC_URL --range 285012000-285012100
+
+# Cross-slot detection with a 4-slot sliding window
+sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4
 
 # Pretty-print for humans
 sandwich-detect --rpc $RPC_URL --follow --format pretty
@@ -112,21 +115,39 @@ sandwich-detect --rpc $RPC_URL --follow --format pretty
 
 ## How It Works
 
+### Same-block detection
+
 ```
 Block (slot N)
- │
- ├─ Parse transactions ──► Extract swap events per DEX
- │                          (instruction accounts + token balance deltas)
- │
- ├─ Group by pool
- │
- └─ Detect pattern:
-      tx[i]  attacker BUYS   ─┐
-      tx[j]  victim   BUYS    ├─ same pool, same direction
-      tx[k]  attacker SELLS  ─┘  opposite direction, same signer as tx[i]
+ |
+ +-- Parse transactions --> Extract swap events per DEX
+ |                          (instruction accounts + token balance deltas)
+ |
+ +-- Group by pool
+ |
+ +-- Detect pattern:
+      tx[i]  attacker BUYS   -+
+      tx[j]  victim   BUYS    +-- same pool, same direction
+      tx[k]  attacker SELLS  -+   opposite direction, same signer as tx[i]
 ```
 
-**Detection rules:**
+### Cross-slot window detection
+
+```
+Slot N:    attacker BUYS in pool P   (frontrun)
+Slot N+1:  victim BUYS in pool P     (same direction as frontrun)
+Slot N+2:  attacker SELLS in pool P  (backrun -- opposite direction)
+```
+
+The cross-slot detector (`FilteredWindowDetector`) maintains a per-pool sliding window of W slots and applies three precision filters:
+
+1. **Bundle provenance** -- Checks Jito bundle co-location (AtomicBundle > SpanningBundle > TipRace > Organic)
+2. **Economic feasibility** -- `backrun.amount_out - frontrun.amount_in > tx fees`
+3. **Victim plausibility** -- Size ratio check + known-attacker exclusion
+
+Each detection gets a composite **confidence score** (0.0-1.0) weighted across these filters.
+
+### Detection rules
 
 | Condition | Why |
 |-----------|-----|
@@ -134,7 +155,8 @@ Block (slot N)
 | `frontrun.direction != backrun.direction` | Opposite trades (buy then sell) |
 | `victim.direction == frontrun.direction` | Victim pushes price further |
 | `victim.signer != attacker` | Different wallet |
-| All in the same slot & pool | Same-block sandwich |
+| Same pool | Price impact is local to the pool |
+| Same slot (same-block) or within W slots (window) | Temporal proximity |
 
 The detector uses a **hybrid parsing approach**: instruction discriminators identify the DEX program and pool address, while pre/post token balance changes determine swap direction and amounts. This is more robust than pure instruction decoding since it works even when instruction formats change.
 
@@ -148,6 +170,8 @@ Add to your `Cargo.toml`:
 [dependencies]
 sandwich-detector = { git = "https://github.com/SangHyeonKwon/solana-sandwich-detector" }
 ```
+
+### Same-block detection
 
 ```rust
 use sandwich_detector::{detector, dex, source::{BlockSource, rpc::RpcBlockSource}};
@@ -163,14 +187,37 @@ let swaps: Vec<_> = block.transactions.iter()
 let sandwiches = detector::detect_sandwiches(slot, &swaps);
 ```
 
+### Cross-slot window detection
+
+```rust
+use sandwich_detector::window::{FilteredWindowDetector, WindowDetector};
+
+let mut detector = FilteredWindowDetector::new(4); // 4-slot window
+
+// Feed slots in order
+for (slot, swaps) in blocks_stream {
+    let attacks = detector.ingest_slot(slot, swaps);
+    for attack in &attacks {
+        println!("Sandwich detected: confidence={:.2}", attack.confidence.unwrap_or(0.0));
+    }
+}
+
+// Flush remaining buffered detections
+let remaining = detector.flush();
+```
+
 ### Key types
 
 | Type | Description |
 |------|-------------|
 | `SwapEvent` | A single parsed swap (signer, pool, direction, amounts) |
-| `SandwichAttack` | A detected sandwich (frontrun + victim + backrun) |
-| `BlockSource` | Trait — plug in your own block fetcher (RPC, gRPC, WebSocket) |
-| `DexParser` | Trait — add support for any DEX in ~50 lines |
+| `SandwichAttack` | A detected sandwich (frontrun + victim + backrun + confidence) |
+| `BlockSource` | Trait -- plug in your own block fetcher (RPC, gRPC, WebSocket) |
+| `DexParser` | Trait -- add support for any DEX in ~50 lines |
+| `WindowDetector` | Trait -- cross-slot detection with sliding window |
+| `FilteredWindowDetector` | Production detector with 3 precision filters + confidence scoring |
+| `FilterConfig` | Configurable thresholds (min profit, victim ratio, confidence) |
+| `BundleLookup` | Trait -- inject Jito bundle data for provenance classification |
 
 ---
 
@@ -178,44 +225,35 @@ let sandwiches = detector::detect_sandwiches(slot, &swaps);
 
 ```
 crates/
-  detector/              Core library
-    src/
-      types.rs           Domain types (SwapEvent, SandwichAttack, ...)
-      detector.rs        Detection algorithm + unit tests
-      parser.rs          Solana block/tx parsing (handles v0 + lookup tables)
-      dex/
-        raydium.rs       Raydium V4 parser
-        raydium_clmm.rs  Raydium CLMM parser
-        raydium_cpmm.rs  Raydium CPMM parser
-        orca.rs          Orca Whirlpool parser
-        jupiter.rs       Jupiter V6 router parser
-        meteora.rs       Meteora DLMM parser
-        pumpfun.rs       Pump.fun parser
-        phoenix.rs       Phoenix parser
-      source/
-        rpc.rs           JSON-RPC block source
+  swap-events/           Swap event types, DEX parsers, block sources
+  detector-sameblock/    Same-block sandwich detection
+  detector-window/       Cross-slot window detector + precision filters
+  detector/              Facade crate (re-exports for backward compatibility)
   cli/                   CLI binary (sandwich-detect)
+  eval/                  Evaluation framework (labels, metrics, Jito integration)
 ```
 
 ---
 
 ## Scope
 
-This library is intentionally narrow: **compute over a stream of blocks → emit detected attacks**. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/EarthIsMine/Vigil-RPC) instead. The CLI follows the same rule — it's a thin streaming wrapper, not a service.
+This library covers **detection over a stream of blocks** -- both same-block and cross-slot patterns. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/EarthIsMine/Vigil-RPC) instead.
 
 **In scope** (PRs welcome):
 
 - New DEX parsers (Lifinity, Marinade, Sanctum, ...)
 - New `BlockSource` implementations (Yellowstone gRPC, Geyser, fixture file, WebSocket)
-- Same-block detection accuracy fixes and edge cases
+- Same-block and cross-slot detection accuracy fixes
+- Confidence scoring and filter tuning
+- Jito bundle integration improvements
+- Eval framework improvements (metrics, labeling tools)
 - Mainnet test fixtures
 - Performance: allocation reduction, parallelism, batching
 - API ergonomics, documentation, examples
-- CLI flags that stay within "stream in → stream out" (input source, output format, filtering)
+- CLI flags that stay within "stream in -> stream out"
 
-**Out of scope** (these belong in a downstream consumer like Vigil, not here):
+**Out of scope** (these belong in a downstream consumer like Vigil):
 
-- Cross-slot / multi-block sandwich detection
 - Validator-aware or leader-aware analysis
 - Pool reserve reconstruction for precise victim loss
 - Multi-hop Jupiter route resolution
@@ -227,7 +265,7 @@ This library is intentionally narrow: **compute over a stream of blocks → emit
 - Web UIs, dashboards, visualizations
 - Stateful services of any kind built into the CLI
 
-The rule of thumb: **"compute over a stream"** stays here, **"state, output, presentation"** goes downstream. If you're building a product on top of this, fork the library boundary, not the library itself.
+The rule of thumb: **"compute over a stream"** stays here, **"state, output, presentation"** goes downstream.
 
 ---
 
@@ -235,14 +273,15 @@ The rule of thumb: **"compute over a stream"** stays here, **"state, output, pre
 
 PRs welcome. Here's where help is most valuable:
 
-- **Add a DEX parser** — implement `DexParser` for a new protocol (Lifinity, Marinade, Sanctum, ...)
-- **Add test fixtures** — capture mainnet blocks with confirmed sandwiches under `fixtures/`
-- **Improve pool ID resolution** — better instruction-level parsing for existing DEXes
-- **Add block sources** — gRPC (Yellowstone), WebSocket subscriptions
+- **Add a DEX parser** -- implement `DexParser` for a new protocol (Lifinity, Marinade, Sanctum, ...)
+- **Add test fixtures** -- capture mainnet blocks with confirmed sandwiches under `fixtures/`
+- **Improve detection** -- edge cases, cross-slot accuracy, confidence tuning
+- **Eval framework** -- add labeled datasets, improve metrics, new evaluation modes
+- **Add block sources** -- gRPC (Yellowstone), WebSocket subscriptions
 
 ```bash
 # Run tests
-cargo test
+cargo test --workspace
 
 # Check everything compiles
 cargo check --workspace
