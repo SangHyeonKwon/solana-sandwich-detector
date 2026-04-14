@@ -1,0 +1,10 @@
+[package]
+name = "detector-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-slot window-based sandwich detection"
+
+[dependencies]
+swap-events = { path = "../swap-events" }
+serde = { workspace = true }

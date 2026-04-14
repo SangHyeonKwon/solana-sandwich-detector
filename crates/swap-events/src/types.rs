@@ -71,6 +71,49 @@ pub struct SwapEvent {
     pub amount_out: u64,
     /// Transaction index within the block (determines ordering)
     pub tx_index: usize,
+    /// Slot number (needed for cross-slot correlation). `None` for same-block only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    /// Transaction fee in lamports. `None` if not available from parser context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee: Option<u64>,
+}
+
+/// How a sandwich was detected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionMethod {
+    SameBlock,
+    CrossSlotWindow { window_size: usize },
+    JitoBundleConfirmed { bundle_id: String },
+}
+
+/// Jito bundle relationship of a sandwich triplet.
+///
+/// Determines confidence: `AtomicBundle` ≈ 100%, `Organic` needs economic proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleProvenance {
+    /// All 3 txs in the same Jito bundle — near-certain sandwich.
+    AtomicBundle,
+    /// Frontrun + backrun in the same bundle, victim separate — high confidence.
+    SpanningBundle,
+    /// All 3 are in bundles, but different ones — medium confidence.
+    TipRace,
+    /// None of the txs are in a bundle — needs economic/victim filters.
+    Organic,
+}
+
+impl BundleProvenance {
+    /// Base confidence weight for scoring. Higher = more confident.
+    pub fn confidence_weight(&self) -> f64 {
+        match self {
+            Self::AtomicBundle => 0.95,
+            Self::SpanningBundle => 0.80,
+            Self::TipRace => 0.50,
+            Self::Organic => 0.20,
+        }
+    }
 }
 
 /// A detected sandwich attack
@@ -95,6 +138,25 @@ pub struct SandwichAttack {
     pub estimated_attacker_profit: Option<i64>,
     /// Estimated loss for the victim. `None` in v1 (requires pool state reconstruction).
     pub estimated_victim_loss: Option<i64>,
+    /// For cross-slot sandwiches: slot of the frontrun tx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontrun_slot: Option<u64>,
+    /// For cross-slot sandwiches: slot of the backrun tx.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backrun_slot: Option<u64>,
+    /// How this sandwich was detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection_method: Option<DetectionMethod>,
+    /// Jito bundle provenance classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_provenance: Option<BundleProvenance>,
+    /// Composite confidence score [0.0, 1.0] incorporating provenance + economics + victim plausibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Net economic profit for the attacker after costs (fees + tip + gas).
+    /// `None` if cost data unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_profit: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

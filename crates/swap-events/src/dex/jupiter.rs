@@ -36,6 +36,8 @@ impl DexParser for JupiterV6Parser {
             amount_in,
             amount_out,
             tx_index: tx.tx_index,
+            slot: None,
+            fee: Some(tx.fee),
         }]
     }
 }

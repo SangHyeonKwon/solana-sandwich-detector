@@ -2,16 +2,16 @@ use crate::types::{DexType, SwapEvent, TransactionData};
 
 use super::{determine_swap_from_balances, DexParser};
 
-pub const PHOENIX_PROGRAM_ID: &str = "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY";
+pub const RAYDIUM_V4_PROGRAM_ID: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 
-/// Phoenix swap instruction discriminator (byte 0)
-const SWAP_DISCRIMINATOR: u8 = 0;
+/// Raydium V4 swap instruction discriminator
+const SWAP_DISCRIMINATOR: u8 = 9;
 
-pub struct PhoenixParser;
+pub struct RaydiumV4Parser;
 
-impl DexParser for PhoenixParser {
+impl DexParser for RaydiumV4Parser {
     fn program_id(&self) -> &str {
-        PHOENIX_PROGRAM_ID
+        RAYDIUM_V4_PROGRAM_ID
     }
 
     fn parse_swaps(&self, tx: &TransactionData) -> Vec<SwapEvent> {
@@ -31,34 +31,36 @@ impl DexParser for PhoenixParser {
         vec![SwapEvent {
             signature: tx.signature.clone(),
             signer: tx.signer.clone(),
-            dex: DexType::Phoenix,
+            dex: DexType::RaydiumV4,
             pool,
             direction,
             token_mint,
             amount_in,
             amount_out,
             tx_index: tx.tx_index,
+            slot: None,
+            fee: Some(tx.fee),
         }]
     }
 }
 
-/// Market account is at accounts[0] in Phoenix swap.
+/// In Raydium V4 swap the AMM ID sits at account index 1.
 fn find_pool(tx: &TransactionData) -> Option<String> {
     for ix in &tx.instructions {
-        if ix.program_id == PHOENIX_PROGRAM_ID
+        if ix.program_id == RAYDIUM_V4_PROGRAM_ID
             && ix.data.first() == Some(&SWAP_DISCRIMINATOR)
-            && !ix.accounts.is_empty()
+            && ix.accounts.len() > 1
         {
-            return Some(ix.accounts[0].clone());
+            return Some(ix.accounts[1].clone());
         }
     }
     for group in &tx.inner_instructions {
         for ix in &group.instructions {
-            if ix.program_id == PHOENIX_PROGRAM_ID
+            if ix.program_id == RAYDIUM_V4_PROGRAM_ID
                 && ix.data.first() == Some(&SWAP_DISCRIMINATOR)
-                && !ix.accounts.is_empty()
+                && ix.accounts.len() > 1
             {
-                return Some(ix.accounts[0].clone());
+                return Some(ix.accounts[1].clone());
             }
         }
     }

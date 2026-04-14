@@ -1,0 +1,10 @@
+[package]
+name = "detector-sameblock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Same-block sandwich attack detection"
+
+[dependencies]
+swap-events = { path = "../swap-events" }
+serde = { workspace = true }
