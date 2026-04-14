@@ -28,15 +28,20 @@ Sandwich attacks are the most common form of MEV exploitation on Solana. An atta
 
 **solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It parses swap instructions across major DEXes, groups them by pool, and flags the classic frontrun-victim-backrun pattern. A thin streaming CLI (`sandwich-detect`) is shipped alongside as a reference consumer.
 
-> Used by [Vigil](https://github.com/SangHyeonKwon/vigil-rpc) — a Solana MEV transparency platform — as the same-block detection primitive. Cross-slot detection, validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
+> Used by [Vigil](https://github.com/EarthIsMine/Vigil-RPC) — a Solana MEV transparency platform — as the same-block detection primitive. Cross-slot detection, validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
 
 ### Supported DEXes
 
 | DEX | Coverage |
 |-----|----------|
 | Raydium V4 | Direct swaps + CPI |
+| Raydium CLMM | Direct swaps + CPI |
+| Raydium CPMM | Direct swaps + CPI |
 | Orca Whirlpool | Direct swaps + CPI |
 | Jupiter V6 | Route-through (resolves underlying pool) |
+| Meteora DLMM | Direct swaps + CPI |
+| Pump.fun | Direct swaps + CPI |
+| Phoenix | Direct swaps + CPI |
 
 > Adding a new DEX takes ~50 lines. See [Contributing](#contributing).
 
@@ -180,8 +185,13 @@ crates/
       parser.rs          Solana block/tx parsing (handles v0 + lookup tables)
       dex/
         raydium.rs       Raydium V4 parser
+        raydium_clmm.rs  Raydium CLMM parser
+        raydium_cpmm.rs  Raydium CPMM parser
         orca.rs          Orca Whirlpool parser
         jupiter.rs       Jupiter V6 router parser
+        meteora.rs       Meteora DLMM parser
+        pumpfun.rs       Pump.fun parser
+        phoenix.rs       Phoenix parser
       source/
         rpc.rs           JSON-RPC block source
   cli/                   CLI binary (sandwich-detect)
@@ -191,11 +201,11 @@ crates/
 
 ## Scope
 
-This library is intentionally narrow: **compute over a stream of blocks → emit detected attacks**. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/SangHyeonKwon/vigil-rpc) instead. The CLI follows the same rule — it's a thin streaming wrapper, not a service.
+This library is intentionally narrow: **compute over a stream of blocks → emit detected attacks**. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/EarthIsMine/Vigil-RPC) instead. The CLI follows the same rule — it's a thin streaming wrapper, not a service.
 
 **In scope** (PRs welcome):
 
-- New DEX parsers (Meteora, Phoenix, Lifinity, Pump.fun, Raydium CLMM, ...)
+- New DEX parsers (Lifinity, Marinade, Sanctum, ...)
 - New `BlockSource` implementations (Yellowstone gRPC, Geyser, fixture file, WebSocket)
 - Same-block detection accuracy fixes and edge cases
 - Mainnet test fixtures
@@ -225,7 +235,7 @@ The rule of thumb: **"compute over a stream"** stays here, **"state, output, pre
 
 PRs welcome. Here's where help is most valuable:
 
-- **Add a DEX parser** — implement `DexParser` for a new protocol (Meteora, Phoenix, Lifinity, ...)
+- **Add a DEX parser** — implement `DexParser` for a new protocol (Lifinity, Marinade, Sanctum, ...)
 - **Add test fixtures** — capture mainnet blocks with confirmed sandwiches under `fixtures/`
 - **Improve pool ID resolution** — better instruction-level parsing for existing DEXes
 - **Add block sources** — gRPC (Yellowstone), WebSocket subscriptions
