@@ -1,8 +1,8 @@
 <p align="center">
   <h1 align="center">solana-sandwich-detector</h1>
   <p align="center">
-    Real-time sandwich attack detection for Solana.<br/>
-    Stream blocks. Parse swaps. Catch attackers.
+    A Rust library for detecting sandwich attacks in Solana blocks.<br/>
+    Parses swap events from major DEXes and identifies frontrun/victim/backrun patterns in transaction-ordered streams.
   </p>
 </p>
 
@@ -18,6 +18,7 @@
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#how-it-works">How It Works</a> &middot;
   <a href="#use-as-a-library">Library</a> &middot;
+  <a href="#scope">Scope</a> &middot;
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -25,7 +26,9 @@
 
 Sandwich attacks are the most common form of MEV exploitation on Solana. An attacker front-runs a victim's swap, pushes the price, and back-runs to profit — all within the same block.
 
-**solana-sandwich-detector** watches Solana blocks in real-time and identifies these attacks as they happen. It parses swap instructions across major DEXes, groups them by pool, and flags the classic frontrun-victim-backrun pattern.
+**solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It parses swap instructions across major DEXes, groups them by pool, and flags the classic frontrun-victim-backrun pattern. A thin streaming CLI (`sandwich-detect`) is shipped alongside as a reference consumer.
+
+> Used by [Vigil](https://github.com/SangHyeonKwon) — a Solana MEV transparency platform — as the same-block detection primitive. Cross-slot detection, validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
 
 ### Supported DEXes
 
@@ -41,11 +44,13 @@ Sandwich attacks are the most common form of MEV exploitation on Solana. An atta
 
 ## Quick Start
 
+The repo ships with `sandwich-detect`, a thin streaming CLI that wraps the library — useful for smoke-testing, ad-hoc analysis, and piping detections into other tools. For embedding in your own service, [use the library directly](#use-as-a-library).
+
 ```bash
 # Build
 cargo build --release
 
-# Run — follow new blocks in real-time
+# Stream new blocks and print detected sandwiches as JSON lines
 ./target/release/sandwich-detect --rpc $RPC_URL --follow
 ```
 
@@ -181,6 +186,38 @@ crates/
         rpc.rs           JSON-RPC block source
   cli/                   CLI binary (sandwich-detect)
 ```
+
+---
+
+## Scope
+
+This library is intentionally narrow: **compute over a stream of blocks → emit detected attacks**. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/SangHyeonKwon) instead. The CLI follows the same rule — it's a thin streaming wrapper, not a service.
+
+**In scope** (PRs welcome):
+
+- New DEX parsers (Meteora, Phoenix, Lifinity, Pump.fun, Raydium CLMM, ...)
+- New `BlockSource` implementations (Yellowstone gRPC, Geyser, fixture file, WebSocket)
+- Same-block detection accuracy fixes and edge cases
+- Mainnet test fixtures
+- Performance: allocation reduction, parallelism, batching
+- API ergonomics, documentation, examples
+- CLI flags that stay within "stream in → stream out" (input source, output format, filtering)
+
+**Out of scope** (these belong in a downstream consumer like Vigil, not here):
+
+- Cross-slot / multi-block sandwich detection
+- Validator-aware or leader-aware analysis
+- Pool reserve reconstruction for precise victim loss
+- Multi-hop Jupiter route resolution
+- Wash-trading false-positive filters
+- ML-based confidence scoring
+- Persistence (databases, file stores, indexers)
+- Alerting (webhooks, Slack, Discord, email, ...)
+- Metrics endpoints (Prometheus, OpenTelemetry, ...)
+- Web UIs, dashboards, visualizations
+- Stateful services of any kind built into the CLI
+
+The rule of thumb: **"compute over a stream"** stays here, **"state, output, presentation"** goes downstream. If you're building a product on top of this, fork the library boundary, not the library itself.
 
 ---
 
