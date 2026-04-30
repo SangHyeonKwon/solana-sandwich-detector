@@ -1,0 +1,32 @@
+//! AMM pool state reconstruction + counterfactual replay.
+//!
+//! The detector crates identify sandwich *patterns* but cannot say how much a
+//! victim actually lost — that requires replaying the swaps through the AMM's
+//! math with real reserves. This crate provides that replay primitive.
+//!
+//! Two sources of truth for reserves:
+//!   1. **Pool config** (vault addresses, fee rate) — fetched once per pool via
+//!      `getAccountInfo` and cached. See [`RaydiumV4Config`], [`RaydiumCpmmConfig`].
+//!   2. **Vault balances at a given tx** — extracted from the tx meta's
+//!      `pre_token_balances` / `post_token_balances`. No historical RPC needed.
+//!      See [`reserves`] module.
+//!
+//! The [`counterfactual::compute_loss`] function combines these to produce a
+//! [`counterfactual::LossEstimate`] with AMM-correct victim loss and attacker profit.
+
+pub mod constant_product;
+pub mod counterfactual;
+pub mod enrichment;
+pub mod lookup;
+pub mod raydium_cpmm;
+pub mod raydium_v4;
+pub mod reserves;
+pub mod rpc;
+
+pub use constant_product::ConstantProduct;
+pub use counterfactual::{compute_loss, compute_loss_with_trace, LossEstimate};
+pub use enrichment::{enrich_attack, EnrichmentResult};
+pub use lookup::{
+    AmmKind, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup, SlotLeaderLookup,
+};
+pub use rpc::{RpcPoolLookup, RpcSlotLeaderLookup, SLOT_LEADER_PAGE_SIZE};

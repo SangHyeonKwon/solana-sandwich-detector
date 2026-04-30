@@ -1,9 +1,10 @@
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Supported DEX protocols
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DexType {
     RaydiumV4,
@@ -32,7 +33,7 @@ impl fmt::Display for DexType {
 }
 
 /// Direction of a token swap
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SwapDirection {
     /// Buying the token (SOL/quote -> token)
@@ -51,7 +52,7 @@ impl SwapDirection {
 }
 
 /// A single swap event extracted from a transaction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SwapEvent {
     /// Transaction signature
     pub signature: String,
@@ -80,7 +81,7 @@ pub struct SwapEvent {
 }
 
 /// How a sandwich was detected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionMethod {
     SameBlock,
@@ -88,10 +89,196 @@ pub enum DetectionMethod {
     JitoBundleConfirmed { bundle_id: String },
 }
 
+/// Stable attack-type taxonomy mirrored to Vigil's `mev_attack.type` column.
+/// Today the detector emits `Sandwich` (contiguous, single-slot) or
+/// `WideSandwich` (intervening txs or cross-slot). The remaining variants are
+/// placeholders for future tiers — backrun-only exploitation and the
+/// authority-hop heuristic — so the schema doesn't churn when those land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackType {
+    Sandwich,
+    WideSandwich,
+    Backrun,
+    AuthorityHop,
+}
+
+/// Severity tier for surface display (Vigil `mev_attack.severity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    /// Bucket a victim-loss to pool-reserve ratio. Anything that nudges the
+    /// pool by a basis point counts as Medium; consuming 1% of pool depth
+    /// (a meaningful liquidity event) is Critical.
+    pub fn from_loss_ratio(loss_to_pool: f64) -> Self {
+        if loss_to_pool >= 0.01 {
+            Self::Critical
+        } else if loss_to_pool >= 0.001 {
+            Self::High
+        } else if loss_to_pool >= 0.0001 {
+            Self::Medium
+        } else {
+            Self::Low
+        }
+    }
+}
+
+/// Text bucket of the float `confidence` score (Vigil `mev_receipt.loss_confidence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfidenceLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl ConfidenceLevel {
+    /// Bucket the composite confidence score `[0.0, 1.0]`. The 0.8 threshold
+    /// matches the `FilteredWindowDetector` default emission gate, so a `High`
+    /// receipt is one the production detector would already keep.
+    pub fn from_score(score: f64) -> Self {
+        if score >= 0.8 {
+            Self::High
+        } else if score >= 0.5 {
+            Self::Medium
+        } else {
+            Self::Low
+        }
+    }
+}
+
+/// Per-victim projection of a [`SandwichAttack`] mirroring Vigil's `mev_receipt`
+/// table columns. BE-managed columns (receipt id, USD pricing, protection
+/// metadata, share urls, created_at) are intentionally omitted — those are
+/// filled by the Vigil backend, not the detector.
+///
+/// A single sandwich today produces exactly one receipt; the field on
+/// `SandwichAttack` is `Vec<MevReceipt>` so wide-sandwich variants with
+/// multiple victims can fan out without breaking the schema later.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MevReceipt {
+    pub victim_tx_signature: String,
+    /// FK to `mev_attack.signature` — set to whatever the parent attack uses
+    /// as its canonical id (today: the victim tx signature).
+    pub attack_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    pub victim_wallet: String,
+    pub victim_action: SwapDirection,
+    pub victim_dex: DexType,
+    /// Input token mint. `None` when the parser didn't resolve the quote-side
+    /// mint of the pair (today only the non-quote token is tracked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_in_mint: Option<String>,
+    /// Output token mint. Same caveat as `token_in_mint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_out_mint: Option<String>,
+    pub amount_in: u64,
+    /// Counterfactual victim output (what they would have received without
+    /// the frontrun). `None` when AMM-replay enrichment didn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_amount_out: Option<u64>,
+    pub actual_amount_out: u64,
+    /// `(expected − actual) / expected`, in `[0.0, 1.0]`. `None` when expected
+    /// is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slippage: Option<f64>,
+    /// Always `true` on emitted receipts; column kept so the BE can persist
+    /// negative receipts later without a schema change.
+    pub mev_detected: bool,
+    pub mev_type: AttackType,
+    pub severity: Severity,
+    /// Loss in quote-token smallest units. `None` when AMM replay didn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_amount: Option<i64>,
+    /// `loss_amount / counterfactual_value`, in `[0.0, 1.0]`. `None` when
+    /// not derivable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_percent: Option<f64>,
+    pub loss_confidence: ConfidenceLevel,
+    /// Vigil `validator_identity` — slot leader at the victim's slot.
+    /// `None` until Tier 2 enrichment is wired up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_identity: Option<String>,
+}
+
+impl MevReceipt {
+    /// Project a [`SandwichAttack`] into a per-victim receipt mirroring
+    /// Vigil's `mev_receipt` row shape. Fields the detector cannot resolve
+    /// from current state (quote-side mint, validator identity, USD prices)
+    /// are left as `None` so later stages can fill them without recomputing.
+    pub fn from_attack(attack: &SandwichAttack) -> Self {
+        let actual_amount_out = attack.victim.amount_out;
+        let expected_amount_out = attack
+            .amm_replay
+            .as_ref()
+            .map(|r| r.counterfactual_victim_out);
+        let slippage = expected_amount_out.and_then(|expected| {
+            if expected == 0 {
+                None
+            } else {
+                Some((expected.saturating_sub(actual_amount_out) as f64) / (expected as f64))
+            }
+        });
+        let loss_percent = match (attack.victim_loss_lamports, expected_amount_out) {
+            (Some(loss), Some(expected)) if expected > 0 && loss >= 0 => {
+                Some((loss as f64) / (expected as f64))
+            }
+            _ => None,
+        };
+        let attack_signature = attack
+            .attack_signature
+            .clone()
+            .unwrap_or_else(|| attack.victim.signature.clone());
+        let mev_type = attack.attack_type.unwrap_or(AttackType::Sandwich);
+        let severity = attack.severity.unwrap_or(Severity::Low);
+        let loss_confidence = attack
+            .confidence_level
+            .unwrap_or_else(|| ConfidenceLevel::from_score(attack.confidence.unwrap_or(0.0)));
+
+        // Vigil wants both sides of the swap pair. Today only the non-quote
+        // side is tracked on `SwapEvent`; the quote side stays `None` until
+        // parser-level enrichment exposes the pair.
+        let (token_in_mint, token_out_mint) = match attack.victim.direction {
+            SwapDirection::Buy => (None, Some(attack.victim.token_mint.clone())),
+            SwapDirection::Sell => (Some(attack.victim.token_mint.clone()), None),
+        };
+
+        Self {
+            victim_tx_signature: attack.victim.signature.clone(),
+            attack_signature,
+            timestamp_ms: attack.timestamp_ms,
+            victim_wallet: attack.victim.signer.clone(),
+            victim_action: attack.victim.direction,
+            victim_dex: attack.victim.dex,
+            token_in_mint,
+            token_out_mint,
+            amount_in: attack.victim.amount_in,
+            expected_amount_out,
+            actual_amount_out,
+            slippage,
+            mev_detected: true,
+            mev_type,
+            severity,
+            loss_amount: attack.victim_loss_lamports,
+            loss_percent,
+            loss_confidence,
+            validator_identity: attack.slot_leader.clone(),
+        }
+    }
+}
+
 /// Jito bundle relationship of a sandwich triplet.
 ///
 /// Determines confidence: `AtomicBundle` ≈ 100%, `Organic` needs economic proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleProvenance {
     /// All 3 txs in the same Jito bundle — near-certain sandwich.
@@ -117,7 +304,7 @@ impl BundleProvenance {
 }
 
 /// A detected sandwich attack
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SandwichAttack {
     /// Slot number where the sandwich occurred
     pub slot: u64,
@@ -133,11 +320,27 @@ pub struct SandwichAttack {
     pub pool: String,
     /// DEX protocol
     pub dex: DexType,
-    /// Estimated profit for the attacker in quote token's smallest unit.
-    /// v1 heuristic: `backrun.amount_out - frontrun.amount_in`
+    /// Naive profit estimate (quote token, smallest unit): `backrun.amount_out - frontrun.amount_in`.
+    /// Wrong for multi-token pairs and doesn't account for price-impact dynamics.
+    /// Kept for backwards compatibility with rule-based consumers; prefer `attacker_profit`.
     pub estimated_attacker_profit: Option<i64>,
-    /// Estimated loss for the victim. `None` in v1 (requires pool state reconstruction).
-    pub estimated_victim_loss: Option<i64>,
+    /// AMM-correct victim loss in the quote-token smallest unit: the difference between
+    /// what the victim would have received without the frontrun and what they actually got.
+    /// Populated by `pool-state` enrichment when a [`PoolStateLookup`](../../pool-state)
+    /// is available; `None` if pool state couldn't be resolved.
+    /// Mirrors Vigil `mev_attack.victim_loss_lamports`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_loss_lamports: Option<i64>,
+    /// AMM-correct attacker gross profit via counterfactual replay. Populated alongside
+    /// `victim_loss_lamports`. Can differ significantly from `estimated_attacker_profit`
+    /// — the re-classification from "naive profitable" to "AMM unprofitable" is the
+    /// signal that distinguishes real extraction from false positives.
+    /// Mirrors Vigil `mev_attack.attacker_profit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attacker_profit: Option<i64>,
+    /// Price impact of the frontrun in basis points (|Δprice| / price_before × 10_000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_impact_bps: Option<u32>,
     /// For cross-slot sandwiches: slot of the frontrun tx.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontrun_slot: Option<u64>,
@@ -157,6 +360,445 @@ pub struct SandwichAttack {
     /// `None` if cost data unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net_profit: Option<i64>,
+    /// Structured reasoning trace. Each emitted detection carries the set of
+    /// orthogonal signals that fired, so a reader can independently verify why
+    /// we flagged the triplet. `None` on attacks emitted before evidence wiring
+    /// (maintains JSONL backwards compatibility).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<DetectionEvidence>,
+    /// Snapshot of the AMM replay used to compute `victim_loss_lamports` /
+    /// `attacker_profit`. Exposed so readers can recompute victim loss
+    /// themselves from the raw pool arithmetic. `None` when pool-state
+    /// enrichment didn't run or the DEX isn't supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amm_replay: Option<AmmReplayTrace>,
+
+    // -- Vigil-aligned fields (schema `vigil-v1`) ----------------------------
+    // Additive; populated by callers via [`SandwichAttack::finalize_for_vigil`]
+    // or set explicitly. Defaulted/skip-on-None so legacy JSONL still
+    // round-trips.
+    /// Canonical attack signature mirrored to Vigil's `mev_attack.signature`.
+    /// Today set to the victim tx signature so per-victim receipts can FK by
+    /// `attack_signature`. `None` on records emitted before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_signature: Option<String>,
+    /// Block timestamp in milliseconds since epoch (Vigil `mev_attack.timestamp_ms`).
+    /// Populated when the upstream block source reports `block_time`; `None`
+    /// for synthetic test fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    /// Stable attack-type taxonomy (Vigil `mev_attack.type`). `None` on records
+    /// predating this enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_type: Option<AttackType>,
+    /// Vigil-style severity bucket. Derivation requires pool-reserve context
+    /// the caller has at enrichment time, so this is set externally rather
+    /// than by `finalize_for_vigil`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
+    /// Text bucket of `confidence` (Vigil `mev_receipt.loss_confidence`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_level: Option<ConfidenceLevel>,
+    /// Slot leader at the victim's slot (Vigil `validator_identity`). `None`
+    /// until Tier 2 enrichment lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_leader: Option<String>,
+    /// `true` when the frontrun and backrun are separated by intervening txs
+    /// (`tx_index` gap > 1) or by more than one slot. Mirrors Vigil's
+    /// `sandwich_detail.is_wide_sandwich`. Defaults to `false` on legacy records.
+    #[serde(default)]
+    pub is_wide_sandwich: bool,
+    /// Per-victim receipt projection for Vigil's `mev_receipt` table. Today a
+    /// single attack maps to one receipt; `Vec` shape allows wide-sandwich
+    /// variants with multiple victims to fan out without changing the schema.
+    /// Empty on legacy records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<MevReceipt>,
+
+    // -- Vigil ERD-level projections of nested victim/replay data ----------
+    // Promoted to top-level so Vigil BE can `prisma.mevAttack.create({data: row})`
+    // without a mapping layer. Populated by `finalize_for_vigil()` from the
+    // nested `victim` SwapEvent and `amm_replay` trace. All `Option` so legacy
+    // records and pre-finalize structs still serialize.
+    /// Mirrors Vigil `mev_attack.victim_signer`. Promoted from `victim.signer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_signer: Option<String>,
+    /// Mirrors Vigil `mev_attack.victim_amount_in`. Promoted from `victim.amount_in`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_amount_in: Option<u64>,
+    /// Mirrors Vigil `mev_attack.victim_amount_out`. Promoted from `victim.amount_out`
+    /// (what the victim actually received).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_amount_out: Option<u64>,
+    /// Mirrors Vigil `mev_attack.victim_amount_out_expected`. Promoted from
+    /// `amm_replay.counterfactual_victim_out` — what the victim would have
+    /// received without the frontrun. `None` when AMM replay didn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_amount_out_expected: Option<u64>,
+}
+
+impl SandwichAttack {
+    /// Compute `is_wide_sandwich` from the current frontrun/victim/backrun
+    /// positions: any tx-index gap > 1, or any backrun_slot/frontrun_slot
+    /// differing from `slot`, marks the detection as wide.
+    pub fn compute_is_wide(&self) -> bool {
+        let front_gap = self.victim.tx_index.saturating_sub(self.frontrun.tx_index);
+        let back_gap = self.backrun.tx_index.saturating_sub(self.victim.tx_index);
+        let cross_slot = self.frontrun_slot.is_some_and(|fs| fs != self.slot)
+            || self.backrun_slot.is_some_and(|bs| bs != self.slot);
+        front_gap > 1 || back_gap > 1 || cross_slot
+    }
+
+    /// Populate Vigil-aligned derived fields from data this struct already
+    /// carries: `attack_signature`, `attack_type`, `is_wide_sandwich`,
+    /// `confidence_level`, and `receipts`. Idempotent — fields that are
+    /// already set are left untouched (so callers can pre-fill specific
+    /// values, e.g. a non-default `attack_type`, before finalizing).
+    ///
+    /// `severity` is intentionally not derived here because it requires
+    /// pool-reserve context the caller holds at enrichment time.
+    pub fn finalize_for_vigil(&mut self) {
+        if self.attack_signature.is_none() {
+            self.attack_signature = Some(self.victim.signature.clone());
+        }
+        // Always recompute is_wide_sandwich from current positions so a
+        // partially-populated struct doesn't disagree with itself.
+        self.is_wide_sandwich = self.compute_is_wide();
+        if self.attack_type.is_none() {
+            // Authority-Hop wins over Wide / Sandwich because it's more
+            // specific: it tells you the attacker swapped wallets between
+            // the frontrun and backrun. The downstream consumer can still
+            // see `is_wide_sandwich = true` if the gap was wide.
+            let has_authority_hop = self.evidence.as_ref().is_some_and(|ev| {
+                ev.passing
+                    .iter()
+                    .any(|s| matches!(s, Signal::AuthorityChain { .. }))
+            });
+            self.attack_type = Some(if has_authority_hop {
+                AttackType::AuthorityHop
+            } else if self.is_wide_sandwich {
+                AttackType::WideSandwich
+            } else {
+                AttackType::Sandwich
+            });
+        }
+        if self.confidence_level.is_none() {
+            if let Some(score) = self.confidence {
+                self.confidence_level = Some(ConfidenceLevel::from_score(score));
+            }
+        }
+        // Promote nested victim/replay data to top-level Vigil ERD columns.
+        // Always overwrite — the nested structs are the source of truth.
+        self.victim_signer = Some(self.victim.signer.clone());
+        self.victim_amount_in = Some(self.victim.amount_in);
+        self.victim_amount_out = Some(self.victim.amount_out);
+        self.victim_amount_out_expected = self
+            .amm_replay
+            .as_ref()
+            .map(|r| r.counterfactual_victim_out);
+        // Receipt projection runs last so it sees the populated fields above.
+        self.receipts = vec![MevReceipt::from_attack(self)];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ensemble evidence: structured reasoning attached to every emitted detection.
+// ---------------------------------------------------------------------------
+
+/// One of the orthogonal signals considered when scoring a candidate sandwich.
+///
+/// Each variant carries the raw evidence value so a reader can judge the call
+/// without re-running the detector. Signals are grouped into [`SignalCategory`]
+/// for ensemble-agreement counting — a detection that "fires" across more
+/// independent categories is more credible than one that scores highly in a
+/// single category.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Signal {
+    // --- structural ----------------------------------------------------
+    /// Victim tx is tightly sandwiched between frontrun and backrun in tx order.
+    OrderingTight { front_gap: usize, back_gap: usize },
+
+    // --- temporal ------------------------------------------------------
+    /// All three txs landed in the same slot.
+    SameBlock,
+    /// Cross-slot sandwich; `slot_distance = backrun_slot - frontrun_slot`.
+    CrossSlot { slot_distance: u64 },
+
+    // --- provenance ----------------------------------------------------
+    /// Jito bundle membership of the triplet, plus the raw bundle id if known.
+    Bundle {
+        provenance: BundleProvenance,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle_id: Option<String>,
+    },
+
+    // --- economic ------------------------------------------------------
+    /// Naive (same-token) profit decomposition: gross revenue, estimated cost, net.
+    NaiveProfit { gross: i64, cost: i64, net: i64 },
+    /// AMM-correct attacker profit from pool-state replay.
+    AmmProfit { attacker_profit_real: i64 },
+    /// Counterfactual victim loss and frontrun price impact from AMM replay.
+    VictimLoss { lamports: i64, impact_bps: u32 },
+    /// `1 - (actual_victim_out / counterfactual_victim_out)`, clamped to [0, 1].
+    /// A value near 1.0 means the victim received almost nothing relative to the
+    /// counterfactual — strong AMM-replay evidence of extraction.
+    ReplayConfidence { value: f64 },
+
+    // --- plausibility --------------------------------------------------
+    /// Ratio of `victim.amount_in / frontrun.amount_in`. Higher is more plausible
+    /// (victim is economically meaningful relative to the attacker's position).
+    VictimSize { ratio: f64 },
+    /// Whether the victim signer appears in the known-attacker list (attacker-on-
+    /// attacker detections are almost always false positives).
+    KnownAttackerVictim { is_known: bool },
+    /// Identity-linkage evidence: an SPL Token `SetAuthority` instruction
+    /// transferred control of an account from `from` to `to` within the
+    /// victim's window. Used by the Authority-Hop heuristic to fuse a
+    /// frontrun signed by `from` with a backrun signed by `to` even though
+    /// the two wallets look unrelated. `authority_tx` is the signature of
+    /// the tx that carried the SetAuthority — the reader can replay it to
+    /// audit the link.
+    AuthorityChain {
+        from: String,
+        to: String,
+        authority_tx: String,
+    },
+}
+
+/// Grouping used for ensemble-agreement counting. A detection "fires" in a
+/// category when at least one signal in that category has a Pass verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalCategory {
+    Structural,
+    Temporal,
+    Provenance,
+    Economic,
+    Plausibility,
+}
+
+/// Number of distinct categories the ensemble considers. Used as the
+/// denominator for `ensemble_agreement`.
+pub const ENSEMBLE_CATEGORY_COUNT: u8 = 5;
+
+/// Whether a signal supports, contradicts, or is neutral about the detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalVerdict {
+    /// Signal is evidence *for* the sandwich call.
+    Pass,
+    /// Signal was computed and points *against* the call. Only surfaced in
+    /// `--evidence-mode full`; detections are still emitted if `confidence`
+    /// passes the existing gate.
+    Fail,
+    /// Signal is neutral context (e.g. slot distance, AMM intermediate values)
+    /// that helps interpretation but doesn't vote.
+    Informational,
+}
+
+impl Signal {
+    /// Which ensemble category this signal contributes to.
+    pub fn category(&self) -> SignalCategory {
+        match self {
+            Signal::OrderingTight { .. } => SignalCategory::Structural,
+            Signal::SameBlock | Signal::CrossSlot { .. } => SignalCategory::Temporal,
+            Signal::Bundle { .. } => SignalCategory::Provenance,
+            Signal::NaiveProfit { .. }
+            | Signal::AmmProfit { .. }
+            | Signal::VictimLoss { .. }
+            | Signal::ReplayConfidence { .. } => SignalCategory::Economic,
+            Signal::VictimSize { .. }
+            | Signal::KnownAttackerVictim { .. }
+            | Signal::AuthorityChain { .. } => SignalCategory::Plausibility,
+        }
+    }
+
+    /// Pass/fail/informational classification. Thresholds here are the ones
+    /// used for ensemble agreement; they are intentionally conservative so
+    /// a signal firing Pass is meaningful on its own.
+    pub fn verdict(&self) -> SignalVerdict {
+        match *self {
+            // Structural
+            Signal::OrderingTight {
+                front_gap,
+                back_gap,
+            } => {
+                if front_gap <= 2 && back_gap <= 2 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Fail
+                }
+            }
+            // Temporal
+            Signal::SameBlock => SignalVerdict::Pass,
+            Signal::CrossSlot { slot_distance } => {
+                // Same-slot is SameBlock; window-detected cross-slot within a
+                // reasonable window is still Pass. Detectors only emit within
+                // `window_size` so this will be <= window_size in practice.
+                if slot_distance > 0 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Informational
+                }
+            }
+            // Provenance — Organic carries no positive evidence on its own.
+            Signal::Bundle { provenance, .. } => match provenance {
+                BundleProvenance::AtomicBundle
+                | BundleProvenance::SpanningBundle
+                | BundleProvenance::TipRace => SignalVerdict::Pass,
+                BundleProvenance::Organic => SignalVerdict::Informational,
+            },
+            // Economic
+            Signal::NaiveProfit { net, .. } => {
+                if net > 0 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Fail
+                }
+            }
+            Signal::AmmProfit {
+                attacker_profit_real,
+            } => {
+                if attacker_profit_real > 0 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Fail
+                }
+            }
+            Signal::VictimLoss { lamports, .. } => {
+                if lamports > 0 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Fail
+                }
+            }
+            Signal::ReplayConfidence { value } => {
+                // A 5 bps shortfall is already meaningful for large trades.
+                if value >= 0.0005 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Informational
+                }
+            }
+            // Plausibility
+            Signal::VictimSize { ratio } => {
+                if ratio >= 0.01 {
+                    SignalVerdict::Pass
+                } else {
+                    SignalVerdict::Fail
+                }
+            }
+            Signal::KnownAttackerVictim { is_known } => {
+                if is_known {
+                    SignalVerdict::Fail
+                } else {
+                    SignalVerdict::Pass
+                }
+            }
+            // The presence of an A→B authority hop is itself the evidence —
+            // detector wouldn't emit this signal unless the hop ties the
+            // frontrun to the backrun, so it's always a positive vote.
+            Signal::AuthorityChain { .. } => SignalVerdict::Pass,
+        }
+    }
+}
+
+/// Structured trace of everything the detector considered for one detection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DetectionEvidence {
+    /// Signals whose verdict was Pass.
+    pub passing: Vec<Signal>,
+    /// Signals whose verdict was Fail. Empty by default — populated only when
+    /// `--evidence-mode full` is set on the CLI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failing: Vec<Signal>,
+    /// Signals classified as Informational (context, not a vote).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub informational: Vec<Signal>,
+    /// Fraction of ensemble categories with at least one passing signal,
+    /// in `[0.0, 1.0]`. Denominator is [`ENSEMBLE_CATEGORY_COUNT`].
+    pub ensemble_agreement: f64,
+    /// Integer companion to `ensemble_agreement` — `categories_with_pass` count.
+    /// Easier to quote in prose ("4 of 5 signals fired").
+    pub categories_fired: u8,
+}
+
+impl DetectionEvidence {
+    /// Build from a flat list of signals. Routes each by its verdict, then
+    /// computes `categories_fired` / `ensemble_agreement` from the passing set.
+    pub fn from_signals(signals: Vec<Signal>) -> Self {
+        let mut passing = Vec::new();
+        let mut failing = Vec::new();
+        let mut informational = Vec::new();
+        for s in signals {
+            match s.verdict() {
+                SignalVerdict::Pass => passing.push(s),
+                SignalVerdict::Fail => failing.push(s),
+                SignalVerdict::Informational => informational.push(s),
+            }
+        }
+        let mut cats = std::collections::HashSet::new();
+        for s in &passing {
+            cats.insert(s.category());
+        }
+        let categories_fired = cats.len() as u8;
+        let ensemble_agreement = categories_fired as f64 / ENSEMBLE_CATEGORY_COUNT as f64;
+        Self {
+            passing,
+            failing,
+            informational,
+            ensemble_agreement,
+            categories_fired,
+        }
+    }
+
+    /// Append additional signals (typically produced later in the pipeline,
+    /// e.g. pool-state enrichment). Recomputes `categories_fired` /
+    /// `ensemble_agreement`.
+    pub fn extend(&mut self, signals: impl IntoIterator<Item = Signal>) {
+        for s in signals {
+            match s.verdict() {
+                SignalVerdict::Pass => self.passing.push(s),
+                SignalVerdict::Fail => self.failing.push(s),
+                SignalVerdict::Informational => self.informational.push(s),
+            }
+        }
+        let mut cats = std::collections::HashSet::new();
+        for s in &self.passing {
+            cats.insert(s.category());
+        }
+        self.categories_fired = cats.len() as u8;
+        self.ensemble_agreement = self.categories_fired as f64 / ENSEMBLE_CATEGORY_COUNT as f64;
+    }
+}
+
+/// Snapshot of the AMM replay used to compute victim loss / attacker profit.
+///
+/// Exposed on `SandwichAttack` so a reader can recompute victim loss from the
+/// raw pool arithmetic using only these fields (reserves at each step + fee).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AmmReplayTrace {
+    /// (base, quote) reserves immediately before the frontrun.
+    pub reserves_pre: (u64, u64),
+    /// Reserves after the frontrun, before the victim.
+    pub reserves_post_front: (u64, u64),
+    /// Reserves after the victim, before the backrun.
+    pub reserves_post_victim: (u64, u64),
+    /// Reserves after the backrun (end of the triplet).
+    pub reserves_post_back: (u64, u64),
+    /// Spot price (quote/base) before the frontrun.
+    pub spot_price_pre: f64,
+    /// Spot price after the frontrun — used for `price_impact_bps`.
+    pub spot_price_post_front: f64,
+    /// What the victim would have received if the frontrun hadn't happened.
+    pub counterfactual_victim_out: u64,
+    /// What the victim actually received.
+    pub actual_victim_out: u64,
+    /// Numerator of the pool's constant-product fee (e.g. 25 for 25bps).
+    pub fee_num: u32,
+    /// Denominator of the pool's fee (e.g. 10000).
+    pub fee_den: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,10 +851,17 @@ pub struct InnerInstructionGroup {
     pub instructions: Vec<InstructionData>,
 }
 
-/// Token balance change for a single account
+/// Token balance change for a single SPL token account.
 #[derive(Debug, Clone)]
 pub struct TokenBalanceChange {
+    /// SPL Token mint.
     pub mint: String,
+    /// Address of the SPL token account itself (the account whose balance changed).
+    /// Used by pool-state enrichment to match against a pool's vault addresses,
+    /// which are token account pubkeys — not to be confused with `owner`.
+    pub account: String,
+    /// Authority that owns the token account (e.g. the user's wallet for user
+    /// balances, or the pool's authority PDA for vault balances).
     pub owner: String,
     pub pre_amount: u64,
     pub post_amount: u64,
@@ -236,5 +885,519 @@ pub struct SolBalanceChange {
 impl SolBalanceChange {
     pub fn delta(&self) -> i64 {
         self.post_lamports as i64 - self.pre_lamports as i64
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+
+    #[test]
+    fn ensemble_agreement_math() {
+        // 3 distinct categories fire (Temporal, Economic, Plausibility) →
+        // agreement = 3/5 = 0.60, categories_fired = 3.
+        let signals = vec![
+            Signal::SameBlock,
+            Signal::NaiveProfit {
+                gross: 100,
+                cost: 10,
+                net: 90,
+            },
+            Signal::VictimSize { ratio: 0.5 },
+        ];
+        let ev = DetectionEvidence::from_signals(signals);
+        assert_eq!(ev.categories_fired, 3);
+        assert!((ev.ensemble_agreement - 0.6).abs() < 1e-9);
+        assert_eq!(ev.passing.len(), 3);
+        assert!(ev.failing.is_empty());
+        assert!(ev.informational.is_empty());
+    }
+
+    #[test]
+    fn fail_verdicts_routed_separately() {
+        // One passing, one failing, one informational.
+        let signals = vec![
+            Signal::SameBlock, // Pass (Temporal)
+            Signal::NaiveProfit {
+                gross: -50,
+                cost: 10,
+                net: -60, // Fail
+            },
+            Signal::Bundle {
+                provenance: BundleProvenance::Organic, // Informational
+                bundle_id: None,
+            },
+        ];
+        let ev = DetectionEvidence::from_signals(signals);
+        assert_eq!(ev.passing.len(), 1);
+        assert_eq!(ev.failing.len(), 1);
+        assert_eq!(ev.informational.len(), 1);
+        assert_eq!(ev.categories_fired, 1); // only Temporal fired
+    }
+
+    #[test]
+    fn agreement_counts_categories_not_signals() {
+        // Two Economic signals both pass — still counts as ONE category firing.
+        let signals = vec![
+            Signal::NaiveProfit {
+                gross: 100,
+                cost: 0,
+                net: 100,
+            },
+            Signal::AmmProfit {
+                attacker_profit_real: 50,
+            },
+        ];
+        let ev = DetectionEvidence::from_signals(signals);
+        assert_eq!(ev.categories_fired, 1);
+        assert!((ev.ensemble_agreement - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn extend_recomputes_agreement() {
+        let mut ev = DetectionEvidence::from_signals(vec![Signal::SameBlock]);
+        assert_eq!(ev.categories_fired, 1);
+
+        ev.extend(vec![Signal::NaiveProfit {
+            gross: 100,
+            cost: 0,
+            net: 100,
+        }]);
+        assert_eq!(ev.categories_fired, 2);
+        assert!((ev.ensemble_agreement - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stage1_jsonl_roundtrip() {
+        // Build a fully-populated SandwichAttack (both evidence and amm_replay
+        // present) and ensure it round-trips through JSON without field loss.
+        let swap = |sig: &str, signer: &str, dir: SwapDirection| SwapEvent {
+            signature: sig.into(),
+            signer: signer.into(),
+            dex: DexType::RaydiumV4,
+            pool: "POOL".into(),
+            direction: dir,
+            token_mint: "MINT".into(),
+            amount_in: 1_000_000,
+            amount_out: 900_000,
+            tx_index: 0,
+            slot: Some(10),
+            fee: Some(5000),
+        };
+
+        let evidence = DetectionEvidence::from_signals(vec![
+            Signal::SameBlock,
+            Signal::OrderingTight {
+                front_gap: 1,
+                back_gap: 1,
+            },
+            Signal::NaiveProfit {
+                gross: 200,
+                cost: 10,
+                net: 190,
+            },
+            Signal::VictimSize { ratio: 0.4 },
+            Signal::Bundle {
+                provenance: BundleProvenance::AtomicBundle,
+                bundle_id: Some("bundle-abc".into()),
+            },
+        ]);
+        let replay = AmmReplayTrace {
+            reserves_pre: (1_000, 1_000),
+            reserves_post_front: (900, 1_100),
+            reserves_post_victim: (850, 1_150),
+            reserves_post_back: (1_000, 1_000),
+            spot_price_pre: 1.0,
+            spot_price_post_front: 1.22,
+            counterfactual_victim_out: 100,
+            actual_victim_out: 80,
+            fee_num: 25,
+            fee_den: 10_000,
+        };
+
+        let attack = SandwichAttack {
+            slot: 10,
+            attacker: "atk".into(),
+            frontrun: swap("f", "atk", SwapDirection::Buy),
+            victim: swap("v", "vic", SwapDirection::Buy),
+            backrun: swap("b", "atk", SwapDirection::Sell),
+            pool: "POOL".into(),
+            dex: DexType::RaydiumV4,
+            estimated_attacker_profit: Some(200),
+            victim_loss_lamports: Some(20),
+            attacker_profit: Some(150),
+            price_impact_bps: Some(42),
+            frontrun_slot: Some(10),
+            backrun_slot: Some(10),
+            detection_method: Some(DetectionMethod::SameBlock),
+            bundle_provenance: Some(BundleProvenance::AtomicBundle),
+            confidence: Some(0.88),
+            net_profit: Some(190),
+            evidence: Some(evidence),
+            amm_replay: Some(replay),
+            attack_signature: None,
+            timestamp_ms: None,
+            attack_type: None,
+            severity: None,
+            confidence_level: None,
+            slot_leader: None,
+            is_wide_sandwich: false,
+            receipts: vec![],
+            victim_signer: None,
+            victim_amount_in: None,
+            victim_amount_out: None,
+            victim_amount_out_expected: None,
+        };
+
+        let json = serde_json::to_string(&attack).unwrap();
+        let back: SandwichAttack = serde_json::from_str(&json).unwrap();
+
+        let ev_in = attack.evidence.as_ref().unwrap();
+        let ev_out = back.evidence.as_ref().unwrap();
+        assert_eq!(ev_in.passing.len(), ev_out.passing.len());
+        assert_eq!(ev_in.categories_fired, ev_out.categories_fired);
+        assert!((ev_in.ensemble_agreement - ev_out.ensemble_agreement).abs() < 1e-9);
+        assert_eq!(
+            attack.amm_replay.unwrap().reserves_pre,
+            back.amm_replay.unwrap().reserves_pre,
+        );
+    }
+}
+
+#[cfg(test)]
+mod vigil_schema_tests {
+    //! Schema-contract tests for the `vigil-v1` output.
+    //!
+    //! These pin the JSONL shape Vigil's BE depends on: field names, the set
+    //! of new keys this tier added, and the round-trip of every new field
+    //! through serde. If any of these break, downstream Prisma persistence
+    //! breaks too — bump `crate::SCHEMA_VERSION` before merging.
+
+    use super::*;
+    use serde_json::Value;
+
+    fn swap(sig: &str, signer: &str, dir: SwapDirection, tx_index: usize) -> SwapEvent {
+        SwapEvent {
+            signature: sig.into(),
+            signer: signer.into(),
+            dex: DexType::RaydiumV4,
+            pool: "POOL".into(),
+            direction: dir,
+            token_mint: "MINT".into(),
+            amount_in: 1_000_000,
+            amount_out: 900_000,
+            tx_index,
+            slot: Some(10),
+            fee: Some(5_000),
+        }
+    }
+
+    fn fresh_attack() -> SandwichAttack {
+        SandwichAttack {
+            slot: 10,
+            attacker: "atk".into(),
+            frontrun: swap("f", "atk", SwapDirection::Buy, 1),
+            victim: swap("v", "vic", SwapDirection::Buy, 2),
+            backrun: swap("b", "atk", SwapDirection::Sell, 3),
+            pool: "POOL".into(),
+            dex: DexType::RaydiumV4,
+            estimated_attacker_profit: Some(100),
+            victim_loss_lamports: Some(50),
+            attacker_profit: Some(80),
+            price_impact_bps: Some(42),
+            frontrun_slot: Some(10),
+            backrun_slot: Some(10),
+            detection_method: Some(DetectionMethod::SameBlock),
+            bundle_provenance: None,
+            confidence: Some(0.85),
+            net_profit: Some(95),
+            evidence: None,
+            amm_replay: Some(AmmReplayTrace {
+                reserves_pre: (1_000, 1_000),
+                reserves_post_front: (900, 1_100),
+                reserves_post_victim: (850, 1_150),
+                reserves_post_back: (1_000, 1_000),
+                spot_price_pre: 1.0,
+                spot_price_post_front: 1.22,
+                counterfactual_victim_out: 100,
+                actual_victim_out: 80,
+                fee_num: 25,
+                fee_den: 10_000,
+            }),
+            attack_signature: None,
+            timestamp_ms: None,
+            attack_type: None,
+            severity: None,
+            confidence_level: None,
+            slot_leader: None,
+            is_wide_sandwich: false,
+            receipts: vec![],
+            victim_signer: None,
+            victim_amount_in: None,
+            victim_amount_out: None,
+            victim_amount_out_expected: None,
+        }
+    }
+
+    #[test]
+    fn schema_version_constant_pinned() {
+        // Vigil's BE matches on this exact string. Treat as a public contract.
+        assert_eq!(crate::SCHEMA_VERSION, "vigil-v1");
+    }
+
+    #[test]
+    fn severity_buckets_match_thresholds() {
+        // Boundary values — losing 1% of pool depth is Critical, 0.1% High,
+        // 0.01% Medium, anything below Low.
+        assert_eq!(Severity::from_loss_ratio(0.0), Severity::Low);
+        assert_eq!(Severity::from_loss_ratio(0.00009), Severity::Low);
+        assert_eq!(Severity::from_loss_ratio(0.0001), Severity::Medium);
+        assert_eq!(Severity::from_loss_ratio(0.001), Severity::High);
+        assert_eq!(Severity::from_loss_ratio(0.01), Severity::Critical);
+        assert_eq!(Severity::from_loss_ratio(0.5), Severity::Critical);
+    }
+
+    #[test]
+    fn confidence_level_buckets_match_detector_gate() {
+        // 0.8 is the production emission gate; anything ≥ 0.8 is High.
+        assert_eq!(ConfidenceLevel::from_score(0.0), ConfidenceLevel::Low);
+        assert_eq!(ConfidenceLevel::from_score(0.49), ConfidenceLevel::Low);
+        assert_eq!(ConfidenceLevel::from_score(0.5), ConfidenceLevel::Medium);
+        assert_eq!(ConfidenceLevel::from_score(0.79), ConfidenceLevel::Medium);
+        assert_eq!(ConfidenceLevel::from_score(0.8), ConfidenceLevel::High);
+        assert_eq!(ConfidenceLevel::from_score(1.0), ConfidenceLevel::High);
+    }
+
+    #[test]
+    fn finalize_for_vigil_populates_derived_fields() {
+        let mut attack = fresh_attack();
+        attack.finalize_for_vigil();
+
+        // attack_signature defaults to victim signature
+        assert_eq!(attack.attack_signature.as_deref(), Some("v"));
+        // contiguous tx_indices 1/2/3 → not wide
+        assert!(!attack.is_wide_sandwich);
+        assert_eq!(attack.attack_type, Some(AttackType::Sandwich));
+        // confidence 0.85 → High
+        assert_eq!(attack.confidence_level, Some(ConfidenceLevel::High));
+        // exactly one receipt projected
+        assert_eq!(attack.receipts.len(), 1);
+        let r = &attack.receipts[0];
+        assert_eq!(r.victim_tx_signature, "v");
+        assert_eq!(r.attack_signature, "v");
+        assert_eq!(r.victim_wallet, "vic");
+        assert!(r.mev_detected);
+        // amm_replay was populated, so receipt sees the counterfactual
+        assert_eq!(r.expected_amount_out, Some(100));
+        assert_eq!(r.actual_amount_out, 900_000);
+        // Vigil ERD-aligned promoted fields are populated from nested data.
+        assert_eq!(attack.victim_signer.as_deref(), Some("vic"));
+        assert_eq!(attack.victim_amount_in, Some(1_000_000));
+        assert_eq!(attack.victim_amount_out, Some(900_000));
+        assert_eq!(attack.victim_amount_out_expected, Some(100));
+    }
+
+    #[test]
+    fn finalize_for_vigil_flags_wide_sandwich_on_index_gap() {
+        let mut attack = fresh_attack();
+        attack.frontrun.tx_index = 0;
+        attack.victim.tx_index = 5;
+        attack.backrun.tx_index = 10;
+
+        attack.finalize_for_vigil();
+
+        assert!(attack.is_wide_sandwich);
+        assert_eq!(attack.attack_type, Some(AttackType::WideSandwich));
+    }
+
+    #[test]
+    fn finalize_for_vigil_flags_wide_sandwich_on_cross_slot() {
+        let mut attack = fresh_attack();
+        attack.frontrun_slot = Some(9);
+        attack.backrun_slot = Some(11);
+
+        attack.finalize_for_vigil();
+
+        assert!(attack.is_wide_sandwich);
+        assert_eq!(attack.attack_type, Some(AttackType::WideSandwich));
+    }
+
+    #[test]
+    fn finalize_for_vigil_picks_authority_hop_over_wide_when_chain_signal_present() {
+        // Authority-Hop heuristic: a Signal::AuthorityChain in passing
+        // evidence overrides the default Sandwich/WideSandwich classification.
+        // This is the integration contract between
+        // `detector::authority_hop` and the emission path — promote rejected
+        // wallet-mismatch candidates into AttackType::AuthorityHop.
+        let mut attack = fresh_attack();
+        attack.frontrun.tx_index = 0;
+        attack.victim.tx_index = 5;
+        attack.backrun.tx_index = 10; // wide gaps, but authority-hop wins.
+        attack.evidence = Some(DetectionEvidence::from_signals(vec![
+            Signal::SameBlock,
+            Signal::AuthorityChain {
+                from: "WALLET_A".into(),
+                to: "WALLET_B".into(),
+                authority_tx: "tx_hop_sig".into(),
+            },
+        ]));
+
+        attack.finalize_for_vigil();
+
+        assert_eq!(attack.attack_type, Some(AttackType::AuthorityHop));
+        // is_wide_sandwich is still computed truthfully — readers can see
+        // both attributes.
+        assert!(attack.is_wide_sandwich);
+    }
+
+    #[test]
+    fn finalize_for_vigil_falls_back_to_wide_when_no_chain_signal() {
+        // Same wide layout but without the AuthorityChain signal — should
+        // pick WideSandwich, the next-most-specific bucket.
+        let mut attack = fresh_attack();
+        attack.frontrun.tx_index = 0;
+        attack.victim.tx_index = 5;
+        attack.backrun.tx_index = 10;
+        attack.evidence = Some(DetectionEvidence::from_signals(vec![Signal::SameBlock]));
+
+        attack.finalize_for_vigil();
+
+        assert_eq!(attack.attack_type, Some(AttackType::WideSandwich));
+    }
+
+    #[test]
+    fn finalize_for_vigil_is_idempotent() {
+        // Pre-set values must be preserved (caller-supplied attack_type, etc.).
+        let mut attack = fresh_attack();
+        attack.attack_signature = Some("custom-sig".into());
+        attack.attack_type = Some(AttackType::AuthorityHop);
+        attack.confidence_level = Some(ConfidenceLevel::Low);
+
+        attack.finalize_for_vigil();
+
+        assert_eq!(attack.attack_signature.as_deref(), Some("custom-sig"));
+        assert_eq!(attack.attack_type, Some(AttackType::AuthorityHop));
+        assert_eq!(attack.confidence_level, Some(ConfidenceLevel::Low));
+
+        // Receipts are always rebuilt — calling twice should still leave one.
+        attack.finalize_for_vigil();
+        assert_eq!(attack.receipts.len(), 1);
+    }
+
+    #[test]
+    fn vigil_v1_jsonl_round_trip_preserves_new_fields() {
+        let mut attack = fresh_attack();
+        attack.timestamp_ms = Some(1_700_000_000_000);
+        attack.severity = Some(Severity::High);
+        attack.slot_leader = Some("validator-pubkey".into());
+        attack.finalize_for_vigil();
+
+        let json = serde_json::to_string(&attack).expect("serialize");
+        let back: SandwichAttack = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.attack_signature, attack.attack_signature);
+        assert_eq!(back.timestamp_ms, attack.timestamp_ms);
+        assert_eq!(back.attack_type, attack.attack_type);
+        assert_eq!(back.severity, attack.severity);
+        assert_eq!(back.confidence_level, attack.confidence_level);
+        assert_eq!(back.slot_leader, attack.slot_leader);
+        assert_eq!(back.is_wide_sandwich, attack.is_wide_sandwich);
+        assert_eq!(back.receipts.len(), attack.receipts.len());
+        let (r_in, r_out) = (&attack.receipts[0], &back.receipts[0]);
+        assert_eq!(r_in.victim_tx_signature, r_out.victim_tx_signature);
+        assert_eq!(r_in.severity, r_out.severity);
+        assert_eq!(r_in.loss_confidence, r_out.loss_confidence);
+        assert_eq!(r_in.validator_identity, r_out.validator_identity);
+    }
+
+    #[test]
+    fn vigil_v1_emits_expected_top_level_keys() {
+        let mut attack = fresh_attack();
+        attack.severity = Some(Severity::Medium);
+        attack.timestamp_ms = Some(123);
+        attack.slot_leader = Some("leader".into());
+        attack.finalize_for_vigil();
+
+        let v: Value = serde_json::to_value(&attack).expect("to_value");
+        let obj = v.as_object().expect("object");
+        for key in [
+            "attack_signature",
+            "timestamp_ms",
+            "attack_type",
+            "severity",
+            "confidence_level",
+            "slot_leader",
+            "is_wide_sandwich",
+            "receipts",
+            "victim_signer",
+            "victim_amount_in",
+            "victim_amount_out",
+            "victim_amount_out_expected",
+        ] {
+            assert!(obj.contains_key(key), "missing top-level key: {key}");
+        }
+        // Receipts should serialize as an array of mev_receipt rows.
+        let receipts = obj["receipts"].as_array().expect("receipts is array");
+        assert_eq!(receipts.len(), 1);
+        let r = &receipts[0];
+        for key in [
+            "victim_tx_signature",
+            "attack_signature",
+            "victim_wallet",
+            "victim_action",
+            "victim_dex",
+            "amount_in",
+            "actual_amount_out",
+            "mev_detected",
+            "mev_type",
+            "severity",
+            "loss_confidence",
+        ] {
+            assert!(
+                r.get(key).is_some(),
+                "missing receipt key: {key}, full: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_jsonl_without_new_fields_still_deserializes() {
+        // Construct a minimal JSON object with only pre-vigil-v1 fields and
+        // verify it still parses (back-compat for old fixtures).
+        let legacy = serde_json::json!({
+            "slot": 1,
+            "attacker": "a",
+            "frontrun": {
+                "signature": "f", "signer": "a",
+                "dex": "raydium_v4", "pool": "p",
+                "direction": "buy", "token_mint": "m",
+                "amount_in": 1, "amount_out": 1,
+                "tx_index": 0
+            },
+            "victim": {
+                "signature": "v", "signer": "v",
+                "dex": "raydium_v4", "pool": "p",
+                "direction": "buy", "token_mint": "m",
+                "amount_in": 1, "amount_out": 1,
+                "tx_index": 1
+            },
+            "backrun": {
+                "signature": "b", "signer": "a",
+                "dex": "raydium_v4", "pool": "p",
+                "direction": "sell", "token_mint": "m",
+                "amount_in": 1, "amount_out": 1,
+                "tx_index": 2
+            },
+            "pool": "p",
+            "dex": "raydium_v4",
+            "estimated_attacker_profit": null,
+            "victim_loss_lamports": null
+        });
+        let attack: SandwichAttack =
+            serde_json::from_value(legacy).expect("legacy json must still parse");
+        assert!(attack.attack_signature.is_none());
+        assert!(attack.attack_type.is_none());
+        assert!(attack.receipts.is_empty());
+        assert!(!attack.is_wide_sandwich);
     }
 }

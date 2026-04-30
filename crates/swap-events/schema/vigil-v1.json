@@ -1,0 +1,1051 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandwichAttack (vigil-v1)",
+  "description": "Solana sandwich-detector output schema, version vigil-v1. Each detection serializes one row of this shape; lines prefixed with `_header` or `_heartbeat` are framing and not validated against this schema.",
+  "type": "object",
+  "required": [
+    "attacker",
+    "backrun",
+    "dex",
+    "frontrun",
+    "pool",
+    "slot",
+    "victim"
+  ],
+  "properties": {
+    "slot": {
+      "description": "Slot number where the sandwich occurred",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "attacker": {
+      "description": "Attacker's wallet address",
+      "type": "string"
+    },
+    "frontrun": {
+      "description": "The frontrun transaction (attacker's first trade)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SwapEvent"
+        }
+      ]
+    },
+    "victim": {
+      "description": "The victim transaction (sandwiched trade)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SwapEvent"
+        }
+      ]
+    },
+    "backrun": {
+      "description": "The backrun transaction (attacker's closing trade)",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SwapEvent"
+        }
+      ]
+    },
+    "pool": {
+      "description": "Pool where the sandwich occurred",
+      "type": "string"
+    },
+    "dex": {
+      "description": "DEX protocol",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DexType"
+        }
+      ]
+    },
+    "estimated_attacker_profit": {
+      "description": "Naive profit estimate (quote token, smallest unit): `backrun.amount_out - frontrun.amount_in`. Wrong for multi-token pairs and doesn't account for price-impact dynamics. Kept for backwards compatibility with rule-based consumers; prefer `attacker_profit`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "victim_loss_lamports": {
+      "description": "AMM-correct victim loss in the quote-token smallest unit: the difference between what the victim would have received without the frontrun and what they actually got. Populated by `pool-state` enrichment when a [`PoolStateLookup`](../../pool-state) is available; `None` if pool state couldn't be resolved. Mirrors Vigil `mev_attack.victim_loss_lamports`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "attacker_profit": {
+      "description": "AMM-correct attacker gross profit via counterfactual replay. Populated alongside `victim_loss_lamports`. Can differ significantly from `estimated_attacker_profit` — the re-classification from \"naive profitable\" to \"AMM unprofitable\" is the signal that distinguishes real extraction from false positives. Mirrors Vigil `mev_attack.attacker_profit`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "price_impact_bps": {
+      "description": "Price impact of the frontrun in basis points (|Δprice| / price_before × 10_000).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "frontrun_slot": {
+      "description": "For cross-slot sandwiches: slot of the frontrun tx.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "backrun_slot": {
+      "description": "For cross-slot sandwiches: slot of the backrun tx.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "detection_method": {
+      "description": "How this sandwich was detected.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DetectionMethod"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bundle_provenance": {
+      "description": "Jito bundle provenance classification.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BundleProvenance"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "confidence": {
+      "description": "Composite confidence score [0.0, 1.0] incorporating provenance + economics + victim plausibility.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "net_profit": {
+      "description": "Net economic profit for the attacker after costs (fees + tip + gas). `None` if cost data unavailable.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "evidence": {
+      "description": "Structured reasoning trace. Each emitted detection carries the set of orthogonal signals that fired, so a reader can independently verify why we flagged the triplet. `None` on attacks emitted before evidence wiring (maintains JSONL backwards compatibility).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DetectionEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "amm_replay": {
+      "description": "Snapshot of the AMM replay used to compute `victim_loss_lamports` / `attacker_profit`. Exposed so readers can recompute victim loss themselves from the raw pool arithmetic. `None` when pool-state enrichment didn't run or the DEX isn't supported.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AmmReplayTrace"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "attack_signature": {
+      "description": "Canonical attack signature mirrored to Vigil's `mev_attack.signature`. Today set to the victim tx signature so per-victim receipts can FK by `attack_signature`. `None` on records emitted before this field existed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timestamp_ms": {
+      "description": "Block timestamp in milliseconds since epoch (Vigil `mev_attack.timestamp_ms`). Populated when the upstream block source reports `block_time`; `None` for synthetic test fixtures.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "attack_type": {
+      "description": "Stable attack-type taxonomy (Vigil `mev_attack.type`). `None` on records predating this enum.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AttackType"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "severity": {
+      "description": "Vigil-style severity bucket. Derivation requires pool-reserve context the caller has at enrichment time, so this is set externally rather than by `finalize_for_vigil`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Severity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "confidence_level": {
+      "description": "Text bucket of `confidence` (Vigil `mev_receipt.loss_confidence`).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ConfidenceLevel"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "slot_leader": {
+      "description": "Slot leader at the victim's slot (Vigil `validator_identity`). `None` until Tier 2 enrichment lands.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "is_wide_sandwich": {
+      "description": "`true` when the frontrun and backrun are separated by intervening txs (`tx_index` gap > 1) or by more than one slot. Mirrors Vigil's `sandwich_detail.is_wide_sandwich`. Defaults to `false` on legacy records.",
+      "default": false,
+      "type": "boolean"
+    },
+    "receipts": {
+      "description": "Per-victim receipt projection for Vigil's `mev_receipt` table. Today a single attack maps to one receipt; `Vec` shape allows wide-sandwich variants with multiple victims to fan out without changing the schema. Empty on legacy records.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/MevReceipt"
+      }
+    },
+    "victim_signer": {
+      "description": "Mirrors Vigil `mev_attack.victim_signer`. Promoted from `victim.signer`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "victim_amount_in": {
+      "description": "Mirrors Vigil `mev_attack.victim_amount_in`. Promoted from `victim.amount_in`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "victim_amount_out": {
+      "description": "Mirrors Vigil `mev_attack.victim_amount_out`. Promoted from `victim.amount_out` (what the victim actually received).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "victim_amount_out_expected": {
+      "description": "Mirrors Vigil `mev_attack.victim_amount_out_expected`. Promoted from `amm_replay.counterfactual_victim_out` — what the victim would have received without the frontrun. `None` when AMM replay didn't run.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "SwapEvent": {
+      "description": "A single swap event extracted from a transaction",
+      "type": "object",
+      "required": [
+        "amount_in",
+        "amount_out",
+        "dex",
+        "direction",
+        "pool",
+        "signature",
+        "signer",
+        "token_mint",
+        "tx_index"
+      ],
+      "properties": {
+        "signature": {
+          "description": "Transaction signature",
+          "type": "string"
+        },
+        "signer": {
+          "description": "Transaction signer (fee payer)",
+          "type": "string"
+        },
+        "dex": {
+          "description": "DEX that executed the swap",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DexType"
+            }
+          ]
+        },
+        "pool": {
+          "description": "Pool/AMM address",
+          "type": "string"
+        },
+        "direction": {
+          "description": "Swap direction",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SwapDirection"
+            }
+          ]
+        },
+        "token_mint": {
+          "description": "The non-SOL/non-quote token mint",
+          "type": "string"
+        },
+        "amount_in": {
+          "description": "Amount of token going in (in smallest unit)",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "amount_out": {
+          "description": "Amount of token going out",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tx_index": {
+          "description": "Transaction index within the block (determines ordering)",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "slot": {
+          "description": "Slot number (needed for cross-slot correlation). `None` for same-block only.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "fee": {
+          "description": "Transaction fee in lamports. `None` if not available from parser context.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DexType": {
+      "description": "Supported DEX protocols",
+      "type": "string",
+      "enum": [
+        "raydium_v4",
+        "raydium_clmm",
+        "raydium_cpmm",
+        "orca_whirlpool",
+        "jupiter_v6",
+        "meteora_dlmm",
+        "pump_fun",
+        "phoenix"
+      ]
+    },
+    "SwapDirection": {
+      "description": "Direction of a token swap",
+      "oneOf": [
+        {
+          "description": "Buying the token (SOL/quote -> token)",
+          "type": "string",
+          "enum": [
+            "buy"
+          ]
+        },
+        {
+          "description": "Selling the token (token -> SOL/quote)",
+          "type": "string",
+          "enum": [
+            "sell"
+          ]
+        }
+      ]
+    },
+    "DetectionMethod": {
+      "description": "How a sandwich was detected.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "same_block"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "cross_slot_window"
+          ],
+          "properties": {
+            "cross_slot_window": {
+              "type": "object",
+              "required": [
+                "window_size"
+              ],
+              "properties": {
+                "window_size": {
+                  "type": "integer",
+                  "format": "uint",
+                  "minimum": 0.0
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "jito_bundle_confirmed"
+          ],
+          "properties": {
+            "jito_bundle_confirmed": {
+              "type": "object",
+              "required": [
+                "bundle_id"
+              ],
+              "properties": {
+                "bundle_id": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "BundleProvenance": {
+      "description": "Jito bundle relationship of a sandwich triplet.\n\nDetermines confidence: `AtomicBundle` ≈ 100%, `Organic` needs economic proof.",
+      "oneOf": [
+        {
+          "description": "All 3 txs in the same Jito bundle — near-certain sandwich.",
+          "type": "string",
+          "enum": [
+            "atomic_bundle"
+          ]
+        },
+        {
+          "description": "Frontrun + backrun in the same bundle, victim separate — high confidence.",
+          "type": "string",
+          "enum": [
+            "spanning_bundle"
+          ]
+        },
+        {
+          "description": "All 3 are in bundles, but different ones — medium confidence.",
+          "type": "string",
+          "enum": [
+            "tip_race"
+          ]
+        },
+        {
+          "description": "None of the txs are in a bundle — needs economic/victim filters.",
+          "type": "string",
+          "enum": [
+            "organic"
+          ]
+        }
+      ]
+    },
+    "DetectionEvidence": {
+      "description": "Structured trace of everything the detector considered for one detection.",
+      "type": "object",
+      "required": [
+        "categories_fired",
+        "ensemble_agreement",
+        "passing"
+      ],
+      "properties": {
+        "passing": {
+          "description": "Signals whose verdict was Pass.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Signal"
+          }
+        },
+        "failing": {
+          "description": "Signals whose verdict was Fail. Empty by default — populated only when `--evidence-mode full` is set on the CLI.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Signal"
+          }
+        },
+        "informational": {
+          "description": "Signals classified as Informational (context, not a vote).",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Signal"
+          }
+        },
+        "ensemble_agreement": {
+          "description": "Fraction of ensemble categories with at least one passing signal, in `[0.0, 1.0]`. Denominator is [`ENSEMBLE_CATEGORY_COUNT`].",
+          "type": "number",
+          "format": "double"
+        },
+        "categories_fired": {
+          "description": "Integer companion to `ensemble_agreement` — `categories_with_pass` count. Easier to quote in prose (\"4 of 5 signals fired\").",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Signal": {
+      "description": "One of the orthogonal signals considered when scoring a candidate sandwich.\n\nEach variant carries the raw evidence value so a reader can judge the call without re-running the detector. Signals are grouped into [`SignalCategory`] for ensemble-agreement counting — a detection that \"fires\" across more independent categories is more credible than one that scores highly in a single category.",
+      "oneOf": [
+        {
+          "description": "Victim tx is tightly sandwiched between frontrun and backrun in tx order.",
+          "type": "object",
+          "required": [
+            "back_gap",
+            "front_gap",
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "ordering_tight"
+              ]
+            },
+            "front_gap": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "back_gap": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "All three txs landed in the same slot.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "same_block"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Cross-slot sandwich; `slot_distance = backrun_slot - frontrun_slot`.",
+          "type": "object",
+          "required": [
+            "kind",
+            "slot_distance"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "cross_slot"
+              ]
+            },
+            "slot_distance": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "Jito bundle membership of the triplet, plus the raw bundle id if known.",
+          "type": "object",
+          "required": [
+            "kind",
+            "provenance"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bundle"
+              ]
+            },
+            "provenance": {
+              "$ref": "#/definitions/BundleProvenance"
+            },
+            "bundle_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Naive (same-token) profit decomposition: gross revenue, estimated cost, net.",
+          "type": "object",
+          "required": [
+            "cost",
+            "gross",
+            "kind",
+            "net"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "naive_profit"
+              ]
+            },
+            "gross": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "cost": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "net": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "AMM-correct attacker profit from pool-state replay.",
+          "type": "object",
+          "required": [
+            "attacker_profit_real",
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "amm_profit"
+              ]
+            },
+            "attacker_profit_real": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "Counterfactual victim loss and frontrun price impact from AMM replay.",
+          "type": "object",
+          "required": [
+            "impact_bps",
+            "kind",
+            "lamports"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "victim_loss"
+              ]
+            },
+            "lamports": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "impact_bps": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "`1 - (actual_victim_out / counterfactual_victim_out)`, clamped to [0, 1]. A value near 1.0 means the victim received almost nothing relative to the counterfactual — strong AMM-replay evidence of extraction.",
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "replay_confidence"
+              ]
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Ratio of `victim.amount_in / frontrun.amount_in`. Higher is more plausible (victim is economically meaningful relative to the attacker's position).",
+          "type": "object",
+          "required": [
+            "kind",
+            "ratio"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "victim_size"
+              ]
+            },
+            "ratio": {
+              "type": "number",
+              "format": "double"
+            }
+          }
+        },
+        {
+          "description": "Whether the victim signer appears in the known-attacker list (attacker-on- attacker detections are almost always false positives).",
+          "type": "object",
+          "required": [
+            "is_known",
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "known_attacker_victim"
+              ]
+            },
+            "is_known": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "Identity-linkage evidence: an SPL Token `SetAuthority` instruction transferred control of an account from `from` to `to` within the victim's window. Used by the Authority-Hop heuristic to fuse a frontrun signed by `from` with a backrun signed by `to` even though the two wallets look unrelated. `authority_tx` is the signature of the tx that carried the SetAuthority — the reader can replay it to audit the link.",
+          "type": "object",
+          "required": [
+            "authority_tx",
+            "from",
+            "kind",
+            "to"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "authority_chain"
+              ]
+            },
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            },
+            "authority_tx": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "AmmReplayTrace": {
+      "description": "Snapshot of the AMM replay used to compute victim loss / attacker profit.\n\nExposed on `SandwichAttack` so a reader can recompute victim loss from the raw pool arithmetic using only these fields (reserves at each step + fee).",
+      "type": "object",
+      "required": [
+        "actual_victim_out",
+        "counterfactual_victim_out",
+        "fee_den",
+        "fee_num",
+        "reserves_post_back",
+        "reserves_post_front",
+        "reserves_post_victim",
+        "reserves_pre",
+        "spot_price_post_front",
+        "spot_price_pre"
+      ],
+      "properties": {
+        "reserves_pre": {
+          "description": "(base, quote) reserves immediately before the frontrun.",
+          "type": "array",
+          "items": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "reserves_post_front": {
+          "description": "Reserves after the frontrun, before the victim.",
+          "type": "array",
+          "items": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "reserves_post_victim": {
+          "description": "Reserves after the victim, before the backrun.",
+          "type": "array",
+          "items": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "reserves_post_back": {
+          "description": "Reserves after the backrun (end of the triplet).",
+          "type": "array",
+          "items": [
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2
+        },
+        "spot_price_pre": {
+          "description": "Spot price (quote/base) before the frontrun.",
+          "type": "number",
+          "format": "double"
+        },
+        "spot_price_post_front": {
+          "description": "Spot price after the frontrun — used for `price_impact_bps`.",
+          "type": "number",
+          "format": "double"
+        },
+        "counterfactual_victim_out": {
+          "description": "What the victim would have received if the frontrun hadn't happened.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "actual_victim_out": {
+          "description": "What the victim actually received.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "fee_num": {
+          "description": "Numerator of the pool's constant-product fee (e.g. 25 for 25bps).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "fee_den": {
+          "description": "Denominator of the pool's fee (e.g. 10000).",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "AttackType": {
+      "description": "Stable attack-type taxonomy mirrored to Vigil's `mev_attack.type` column. Today the detector emits `Sandwich` (contiguous, single-slot) or `WideSandwich` (intervening txs or cross-slot). The remaining variants are placeholders for future tiers — backrun-only exploitation and the authority-hop heuristic — so the schema doesn't churn when those land.",
+      "type": "string",
+      "enum": [
+        "sandwich",
+        "wide_sandwich",
+        "backrun",
+        "authority_hop"
+      ]
+    },
+    "Severity": {
+      "description": "Severity tier for surface display (Vigil `mev_attack.severity`).",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "ConfidenceLevel": {
+      "description": "Text bucket of the float `confidence` score (Vigil `mev_receipt.loss_confidence`).",
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "MevReceipt": {
+      "description": "Per-victim projection of a [`SandwichAttack`] mirroring Vigil's `mev_receipt` table columns. BE-managed columns (receipt id, USD pricing, protection metadata, share urls, created_at) are intentionally omitted — those are filled by the Vigil backend, not the detector.\n\nA single sandwich today produces exactly one receipt; the field on `SandwichAttack` is `Vec<MevReceipt>` so wide-sandwich variants with multiple victims can fan out without breaking the schema later.",
+      "type": "object",
+      "required": [
+        "actual_amount_out",
+        "amount_in",
+        "attack_signature",
+        "loss_confidence",
+        "mev_detected",
+        "mev_type",
+        "severity",
+        "victim_action",
+        "victim_dex",
+        "victim_tx_signature",
+        "victim_wallet"
+      ],
+      "properties": {
+        "victim_tx_signature": {
+          "type": "string"
+        },
+        "attack_signature": {
+          "description": "FK to `mev_attack.signature` — set to whatever the parent attack uses as its canonical id (today: the victim tx signature).",
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "victim_wallet": {
+          "type": "string"
+        },
+        "victim_action": {
+          "$ref": "#/definitions/SwapDirection"
+        },
+        "victim_dex": {
+          "$ref": "#/definitions/DexType"
+        },
+        "token_in_mint": {
+          "description": "Input token mint. `None` when the parser didn't resolve the quote-side mint of the pair (today only the non-quote token is tracked).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_out_mint": {
+          "description": "Output token mint. Same caveat as `token_in_mint`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "amount_in": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "expected_amount_out": {
+          "description": "Counterfactual victim output (what they would have received without the frontrun). `None` when AMM-replay enrichment didn't run.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "actual_amount_out": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "slippage": {
+          "description": "`(expected − actual) / expected`, in `[0.0, 1.0]`. `None` when expected is unknown.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "mev_detected": {
+          "description": "Always `true` on emitted receipts; column kept so the BE can persist negative receipts later without a schema change.",
+          "type": "boolean"
+        },
+        "mev_type": {
+          "$ref": "#/definitions/AttackType"
+        },
+        "severity": {
+          "$ref": "#/definitions/Severity"
+        },
+        "loss_amount": {
+          "description": "Loss in quote-token smallest units. `None` when AMM replay didn't run.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "loss_percent": {
+          "description": "`loss_amount / counterfactual_value`, in `[0.0, 1.0]`. `None` when not derivable.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "loss_confidence": {
+          "$ref": "#/definitions/ConfidenceLevel"
+        },
+        "validator_identity": {
+          "description": "Vigil `validator_identity` — slot leader at the victim's slot. `None` until Tier 2 enrichment is wired up.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

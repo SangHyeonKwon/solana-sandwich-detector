@@ -14,7 +14,10 @@ use crate::types::{
 };
 
 /// Known quote/base token mints (SOL, USDC, USDT)
-const QUOTE_MINTS: &[&str] = &[
+/// Mints treated as the "quote" side of a pool across the whole codebase.
+/// Shared with pool-state so that pool configs label base/quote the same way
+/// swap parsers do (Buy = spend quote → receive base).
+pub const QUOTE_MINTS: &[&str] = &[
     "So11111111111111111111111111111111111111112", // Wrapped SOL
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
@@ -76,7 +79,10 @@ pub(crate) fn invokes_program(tx: &TransactionData, program_id: &str) -> bool {
         })
 }
 
-fn is_quote_mint(mint: &str) -> bool {
+/// True if `mint` is a recognised quote-side mint (wSOL / USDC / USDT).
+/// Used by swap parsers to decide Buy/Sell and by pool-state to orient
+/// pool configs; they share one list so the two sides can't drift.
+pub fn is_quote_mint(mint: &str) -> bool {
     QUOTE_MINTS.contains(&mint)
 }
 
@@ -167,12 +173,14 @@ mod tests {
         let changes = vec![
             TokenBalanceChange {
                 mint: "USDC".into(),
+                account: "user_usdc_acc".into(),
                 owner: "user".into(),
                 pre_amount: 1000,
                 post_amount: 0,
             },
             TokenBalanceChange {
                 mint: "TOKEN".into(),
+                account: "user_token_acc".into(),
                 owner: "user".into(),
                 pre_amount: 0,
                 post_amount: 500,
@@ -191,6 +199,7 @@ mod tests {
         // Signer spent SOL (unwrapped), got a token
         let changes = vec![TokenBalanceChange {
             mint: "TOKEN".into(),
+            account: "user_token_acc".into(),
             owner: "user".into(),
             pre_amount: 0,
             post_amount: 500,
@@ -214,6 +223,7 @@ mod tests {
         // Signer spent a token, got SOL (unwrapped)
         let changes = vec![TokenBalanceChange {
             mint: "TOKEN".into(),
+            account: "user_token_acc".into(),
             owner: "user".into(),
             pre_amount: 500,
             post_amount: 0,
