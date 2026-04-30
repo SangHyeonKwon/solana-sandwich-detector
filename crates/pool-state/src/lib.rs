@@ -30,6 +30,7 @@ pub use constant_product::ConstantProduct;
 pub use counterfactual::{compute_loss, compute_loss_with_trace, LossEstimate};
 pub use enrichment::{enrich_attack, EnrichmentResult};
 pub use lookup::{
-    AmmKind, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup, SlotLeaderLookup,
+    AmmKind, DynamicPoolState, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup,
+    SlotLeaderLookup,
 };
 pub use rpc::{RpcPoolLookup, RpcSlotLeaderLookup, SLOT_LEADER_PAGE_SIZE};

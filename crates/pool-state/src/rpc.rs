@@ -19,7 +19,7 @@ use swap_events::types::DexType;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::lookup::{PoolConfig, PoolStateLookup, SlotLeaderLookup};
+use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLookup};
 use crate::{orca_whirlpool, raydium_cpmm, raydium_v4};
 
 pub struct RpcPoolLookup {
@@ -82,6 +82,50 @@ impl PoolStateLookup for RpcPoolLookup {
             .entry(pool.to_string())
             .or_insert(fetched.clone())
             .clone()
+    }
+
+    /// Fetch the pool's dynamic state via `getAccountInfo`, parsing the
+    /// account blob with the same layout reader the static-config path
+    /// uses. Not cached — dynamic state evolves every swap, so a stale
+    /// snapshot is worse than a fresh round-trip. Whirlpool is the only
+    /// kind we can serve today; other dynamic-state DEXes return `None`
+    /// (the trait default) and stay opt-in.
+    ///
+    /// `slot` is accepted but unused. Mainnet `getAccountInfo` returns
+    /// latest-confirmed state, which lines up with stream-mode detection
+    /// where enrichment runs within a few hundred ms of the frontrun
+    /// landing. Archival-anchored fetches (slot-precise pre-frontrun
+    /// state) need a different RPC and land in a follow-up.
+    async fn pool_dynamic_state(
+        &self,
+        pool: &str,
+        dex: DexType,
+        _slot: u64,
+    ) -> Option<DynamicPoolState> {
+        if !matches!(dex, DexType::OrcaWhirlpool) {
+            return None;
+        }
+        let pubkey = match pool.parse::<Pubkey>() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(pool, error = %e, "invalid pool pubkey for dynamic state");
+                return None;
+            }
+        };
+        let account = match self.client.get_account(&pubkey).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(pool, error = %e, "pool account fetch failed for dynamic state");
+                return None;
+            }
+        };
+        let pool_state = orca_whirlpool::parse_pool_state(&account.data)?;
+        Some(DynamicPoolState::Whirlpool {
+            sqrt_price_q64: pool_state.sqrt_price_q64,
+            liquidity: pool_state.liquidity,
+            tick_current_index: pool_state.tick_current_index,
+            tick_spacing: pool_state.tick_spacing,
+        })
     }
 }
 
