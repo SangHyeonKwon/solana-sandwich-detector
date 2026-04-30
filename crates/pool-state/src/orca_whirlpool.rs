@@ -266,7 +266,7 @@ pub mod tick_math {
 ///   * Uniswap V3 `sqrt_price_math::get_next_sqrt_price_from_amount_in`
 ///   * `orca-so/whirlpools` `programs/whirlpool/src/math/sqrt_price_math.rs`
 pub mod swap_math {
-    use crate::fixed_point::mul_div_floor;
+    use crate::fixed_point::{mul_div_ceil, mul_div_floor};
     use primitive_types::U256;
 
     /// Q64.64 scaling factor (`1 << 64`).
@@ -340,6 +340,219 @@ pub mod swap_math {
         }
         let delta = mul_div_floor(amount_b, Q64, liquidity)?;
         sqrt_price_q64.checked_add(delta)
+    }
+
+    /// Token-a delta required to slide `sqrt_price` across the closed
+    /// interval `[sp_lower, sp_upper]` at constant `liquidity`.
+    ///
+    /// Closed form:
+    /// ```text
+    ///   amount_a = L * Q64 * (sp_upper - sp_lower) / (sp_lower * sp_upper)
+    /// ```
+    ///
+    /// `round_up = true` is the LP-protective direction (the LP receives at
+    /// least this many tokens A); `false` is for the trader-receiving side
+    /// (the trader receives at most this many). Mirrors V3
+    /// `SqrtPriceMath::getAmount0Delta`.
+    ///
+    /// Returns `None` when:
+    ///   * `liquidity == 0`,
+    ///   * `sp_lower == 0` (would div-by-zero downstream),
+    ///   * `sp_lower > sp_upper` (caller error — the helper requires a
+    ///     pre-ordered pair),
+    ///   * any U256 intermediate or the rounded result overflows `u128`.
+    pub fn delta_amount_a(
+        sp_lower: u128,
+        sp_upper: u128,
+        liquidity: u128,
+        round_up: bool,
+    ) -> Option<u128> {
+        if liquidity == 0 || sp_lower == 0 || sp_lower > sp_upper {
+            return None;
+        }
+        if sp_lower == sp_upper {
+            return Some(0);
+        }
+        let numerator_1 = U256::from(liquidity) << 64;
+        let numerator_2 = U256::from(sp_upper - sp_lower);
+        let dividend = numerator_1.checked_mul(numerator_2)?;
+        let result = if round_up {
+            // V3: divRoundingUp(mulDivRoundingUp(N1, N2, sp_upper), sp_lower).
+            // Two-step ceil: divide by the larger denominator first to keep
+            // the intermediate small, then by the smaller.
+            let denom_upper = U256::from(sp_upper);
+            let q1 = dividend / denom_upper;
+            let r1 = dividend % denom_upper;
+            let upper_div = if r1.is_zero() {
+                q1
+            } else {
+                q1.checked_add(U256::one())?
+            };
+            let denom_lower = U256::from(sp_lower);
+            let q2 = upper_div / denom_lower;
+            let r2 = upper_div % denom_lower;
+            if r2.is_zero() {
+                q2
+            } else {
+                q2.checked_add(U256::one())?
+            }
+        } else {
+            // floor: dividend / sp_upper / sp_lower.
+            dividend / U256::from(sp_upper) / U256::from(sp_lower)
+        };
+        if result.bits() > 128 {
+            None
+        } else {
+            Some(result.low_u128())
+        }
+    }
+
+    /// Token-b delta required to slide `sqrt_price` across `[sp_lower,
+    /// sp_upper]` at constant `liquidity`. Closed form:
+    /// ```text
+    ///   amount_b = L * (sp_upper - sp_lower) / Q64
+    /// ```
+    /// Mirrors V3 `SqrtPriceMath::getAmount1Delta`.
+    pub fn delta_amount_b(
+        sp_lower: u128,
+        sp_upper: u128,
+        liquidity: u128,
+        round_up: bool,
+    ) -> Option<u128> {
+        if liquidity == 0 || sp_lower > sp_upper {
+            return None;
+        }
+        if sp_lower == sp_upper {
+            return Some(0);
+        }
+        let diff = sp_upper - sp_lower;
+        if round_up {
+            mul_div_ceil(liquidity, diff, Q64)
+        } else {
+            mul_div_floor(liquidity, diff, Q64)
+        }
+    }
+
+    /// Outcome of a single within-tick exact-input swap step.
+    ///
+    /// `amount_in` is the *consumed* portion (excluding fee); `fee_amount`
+    /// is the LP cut taken from the gross `amount_remaining` the caller
+    /// passed in. Invariant: `amount_in + fee_amount ≤ amount_remaining + 1`
+    /// (the `+1` is V3's standard 1-unit ceiling slack on the fee path; we
+    /// mirror it so chain-vs-replay diffs stay below detector resolution).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SwapStepResult {
+        pub sqrt_price_next: u128,
+        pub amount_in: u128,
+        pub amount_out: u128,
+        pub fee_amount: u128,
+    }
+
+    /// One within-tick step of an exact-input swap.
+    ///
+    /// The caller supplies the segment's target `sqrt_price` (the next
+    /// initialised tick boundary or a user-imposed limit) along with the
+    /// gross `amount_remaining`; the result tells the caller whether the
+    /// segment ran to completion (`sqrt_price_next == sqrt_price_target`)
+    /// or was capped by `amount_remaining`.
+    ///
+    /// Direction is inferred from `sqrt_price_target` vs `sqrt_price_current`:
+    ///   * `current >= target` → a→b (token_a in, price drops),
+    ///   * `current <  target` → b→a (token_b in, price rises).
+    ///
+    /// Mirrors V3 `SwapMath::computeSwapStep` with the exact-input branch
+    /// only — sandwich replay never feeds an exact-output swap, so the
+    /// negative-`amount_remaining` half is dead code we don't carry.
+    ///
+    /// `fee_num / fee_den` is the LP fee fraction (e.g. Whirlpool's 30bps
+    /// pool: `fee_num=3000, fee_den=1_000_000`). Returns `None` on
+    /// degenerate inputs (`liquidity == 0`, `fee_den == 0`,
+    /// `fee_num >= fee_den`) or any arithmetic saturation downstream.
+    pub fn compute_swap_step_exact_in(
+        sqrt_price_current: u128,
+        sqrt_price_target: u128,
+        liquidity: u128,
+        amount_remaining: u128,
+        fee_num: u128,
+        fee_den: u128,
+    ) -> Option<SwapStepResult> {
+        if liquidity == 0 || fee_den == 0 || fee_num >= fee_den {
+            return None;
+        }
+        let zero_for_one = sqrt_price_current >= sqrt_price_target;
+        // Strip the LP fee off `amount_remaining` so the curve-traversal
+        // math sees only the net amount that actually moves sqrt_price.
+        let amount_less_fee =
+            mul_div_floor(amount_remaining, fee_den - fee_num, fee_den)?;
+
+        // Amount needed to walk all the way to `target`. Round *up* — LP-
+        // protective: we'd rather slightly under-advance than over-advance.
+        let amount_in_to_target = if zero_for_one {
+            delta_amount_a(sqrt_price_target, sqrt_price_current, liquidity, true)?
+        } else {
+            delta_amount_b(sqrt_price_current, sqrt_price_target, liquidity, true)?
+        };
+
+        // Does the remaining input cover the full segment, or are we
+        // capped short of `target`?
+        let (sqrt_price_next, reaches_target) = if amount_less_fee >= amount_in_to_target {
+            (sqrt_price_target, true)
+        } else if zero_for_one {
+            (
+                next_sqrt_price_a_in(sqrt_price_current, liquidity, amount_less_fee)?,
+                false,
+            )
+        } else {
+            (
+                next_sqrt_price_b_in(sqrt_price_current, liquidity, amount_less_fee)?,
+                false,
+            )
+        };
+
+        // Recompute amount_in / amount_out at the resolved next price.
+        // `amount_in` is rounded *up* (LP gets at least this much in);
+        // `amount_out` is rounded *down* (trader gets at most this much
+        // out). Both are LP-protective.
+        let (amount_in, amount_out) = if zero_for_one {
+            let lo = sqrt_price_next;
+            let hi = sqrt_price_current;
+            let a_in = if reaches_target {
+                amount_in_to_target
+            } else {
+                delta_amount_a(lo, hi, liquidity, true)?
+            };
+            let b_out = delta_amount_b(lo, hi, liquidity, false)?;
+            (a_in, b_out)
+        } else {
+            let lo = sqrt_price_current;
+            let hi = sqrt_price_next;
+            let b_in = if reaches_target {
+                amount_in_to_target
+            } else {
+                delta_amount_b(lo, hi, liquidity, true)?
+            };
+            let a_out = delta_amount_a(lo, hi, liquidity, false)?;
+            (b_in, a_out)
+        };
+
+        // Fee allocation. When the segment was cap-limited, *all* the
+        // remaining gross gets consumed and the slack becomes the fee —
+        // this is V3's `amountRemaining - amountIn` trick that ensures
+        // `amount_in + fee_amount == amount_remaining` exactly on the
+        // !reach path. When the segment ran to target, recompute the fee
+        // proportional to the consumed `amount_in` (rounded up).
+        let fee_amount = if !reaches_target {
+            amount_remaining.checked_sub(amount_in)?
+        } else {
+            mul_div_ceil(amount_in, fee_num, fee_den - fee_num)?
+        };
+
+        Some(SwapStepResult {
+            sqrt_price_next,
+            amount_in,
+            amount_out,
+            fee_amount,
+        })
     }
 }
 
@@ -713,6 +926,200 @@ mod tests {
                 "b_in drift: l={}, sp={}, amount={}, actual={}, oracle={}",
                 l, sp, amount, actual, expected,
             );
+        }
+    }
+
+    // ----- delta_amount_a / delta_amount_b -----------------------------
+
+    #[test]
+    fn delta_amount_a_zero_diff_is_zero() {
+        let sp = swap_math::Q64;
+        assert_eq!(swap_math::delta_amount_a(sp, sp, 1_000_000, true), Some(0));
+        assert_eq!(swap_math::delta_amount_a(sp, sp, 1_000_000, false), Some(0));
+    }
+
+    #[test]
+    fn delta_amount_a_rejects_inverted_bounds() {
+        // sp_lower > sp_upper is a caller error.
+        let sp_lo = 2 * swap_math::Q64;
+        let sp_hi = swap_math::Q64;
+        assert_eq!(swap_math::delta_amount_a(sp_lo, sp_hi, 1_000_000, true), None);
+    }
+
+    #[test]
+    fn delta_amount_a_round_up_is_at_least_round_down() {
+        // Same segment, both directions. Round-up ≥ round-down by ≤1 unit.
+        let sp_lo = swap_math::Q64;
+        let sp_hi = sp_lo + (sp_lo / 1000); // +0.1%
+        let l = 1_000_000_000u128;
+        let up = swap_math::delta_amount_a(sp_lo, sp_hi, l, true).unwrap();
+        let down = swap_math::delta_amount_a(sp_lo, sp_hi, l, false).unwrap();
+        assert!(up >= down);
+        // Ceiling-vs-floor differ by at most the two-step rounding (≤2).
+        assert!(up - down <= 2);
+    }
+
+    #[test]
+    fn delta_amount_b_zero_diff_is_zero() {
+        let sp = swap_math::Q64;
+        assert_eq!(swap_math::delta_amount_b(sp, sp, 1_000_000, true), Some(0));
+    }
+
+    #[test]
+    fn delta_amount_b_round_up_is_floor_or_floor_plus_one() {
+        // Single mul_div_floor vs mul_div_ceil ⇒ at most +1 unit.
+        let sp_lo = swap_math::Q64;
+        let sp_hi = sp_lo + 12_345;
+        let l = 1_234_567_890u128;
+        let up = swap_math::delta_amount_b(sp_lo, sp_hi, l, true).unwrap();
+        let down = swap_math::delta_amount_b(sp_lo, sp_hi, l, false).unwrap();
+        assert!(up == down || up == down + 1);
+    }
+
+    // ----- compute_swap_step_exact_in ----------------------------------
+
+    /// 30 bps fee, healthy pool, modest amount. Caps short of an
+    /// arbitrarily distant target ⇒ `!reach`, full `amount_remaining`
+    /// consumed, sqrt_price drops (a→b).
+    #[test]
+    fn swap_step_a_to_b_capped_uses_all_remaining() {
+        let sp_current = swap_math::Q64;
+        let sp_target = swap_math::Q64 / 2; // far below — won't reach
+        let l = 1_000_000_000u128;
+        let amount = 100_000u128;
+        let r = swap_math::compute_swap_step_exact_in(
+            sp_current, sp_target, l, amount, 3_000, 1_000_000,
+        )
+        .unwrap();
+        assert!(r.sqrt_price_next < sp_current);
+        assert!(r.sqrt_price_next > sp_target, "shouldn't have reached target");
+        assert_eq!(r.amount_in + r.fee_amount, amount);
+        assert!(r.amount_out > 0);
+    }
+
+    /// Same shape, b→a direction. Target far above current.
+    #[test]
+    fn swap_step_b_to_a_capped_uses_all_remaining() {
+        let sp_current = swap_math::Q64;
+        let sp_target = swap_math::Q64 * 2;
+        let l = 1_000_000_000u128;
+        let amount = 100_000u128;
+        let r = swap_math::compute_swap_step_exact_in(
+            sp_current, sp_target, l, amount, 3_000, 1_000_000,
+        )
+        .unwrap();
+        assert!(r.sqrt_price_next > sp_current);
+        assert!(r.sqrt_price_next < sp_target);
+        assert_eq!(r.amount_in + r.fee_amount, amount);
+        assert!(r.amount_out > 0);
+    }
+
+    /// Tiny target, oversized `amount_remaining` ⇒ `reach`, leftover
+    /// stays in `amount_remaining - amount_in - fee_amount` (caller's
+    /// next segment problem).
+    #[test]
+    fn swap_step_a_to_b_reaches_target_with_excess_remaining() {
+        let sp_current = swap_math::Q64;
+        let sp_target = sp_current - (sp_current / 10_000); // 1 bp drop, very close
+        let l = 1_000_000_000u128;
+        let amount = 1_000_000_000u128; // way more than needed
+        let r = swap_math::compute_swap_step_exact_in(
+            sp_current, sp_target, l, amount, 3_000, 1_000_000,
+        )
+        .unwrap();
+        assert_eq!(r.sqrt_price_next, sp_target);
+        // Reach path: amount_in + fee may overshoot amount_remaining by ≤1
+        // due to V3's ceiling fee, but here amount is enormous so the
+        // residual is well-defined.
+        assert!(r.amount_in + r.fee_amount <= amount);
+        assert!(r.amount_out > 0);
+    }
+
+    #[test]
+    fn swap_step_rejects_zero_liquidity() {
+        assert_eq!(
+            swap_math::compute_swap_step_exact_in(
+                swap_math::Q64,
+                swap_math::Q64 / 2,
+                0,
+                100,
+                3_000,
+                1_000_000,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn swap_step_rejects_degenerate_fee() {
+        let sp = swap_math::Q64;
+        // fee >= den — non-physical.
+        assert_eq!(
+            swap_math::compute_swap_step_exact_in(sp, sp / 2, 1_000_000, 100, 1_000_000, 1_000_000),
+            None,
+        );
+        assert_eq!(
+            swap_math::compute_swap_step_exact_in(sp, sp / 2, 1_000_000, 100, 1, 0),
+            None,
+        );
+    }
+
+    proptest! {
+        /// Fee balance: `amount_in + fee_amount` is bounded by
+        /// `amount_remaining` on `!reach`, and by `amount_remaining + 1`
+        /// on `reach` (V3's standard 1-unit ceiling slack on the fee
+        /// recomputation). Direction-correct sqrt_price update either way.
+        #[test]
+        fn prop_swap_step_a_to_b_invariants(
+            l in 1_000_000u128..1_000_000_000_000u128,
+            sp_int in 2u128..(1u128 << 16),
+            target_frac in 1u128..100u128, // target = current * (100 - target_frac) / 100
+            amount in 1u128..1_000_000u128,
+            fee_bps in 1u128..1_000u128, // up to 10 bps
+        ) {
+            let sp_current = sp_int * swap_math::Q64;
+            let sp_target = sp_current * (100 - target_frac) / 100;
+            let r = swap_math::compute_swap_step_exact_in(
+                sp_current, sp_target, l, amount, fee_bps * 100, 1_000_000,
+            );
+            if let Some(r) = r {
+                prop_assert!(r.sqrt_price_next <= sp_current);
+                prop_assert!(r.sqrt_price_next >= sp_target);
+                let total = r.amount_in.saturating_add(r.fee_amount);
+                if r.sqrt_price_next == sp_target {
+                    // reach: ≤ amount_remaining + 1 (ceiling fee slack)
+                    prop_assert!(total <= amount + 1, "reach overshot: total={}, amount={}", total, amount);
+                } else {
+                    // !reach: exact equality
+                    prop_assert_eq!(total, amount);
+                }
+            }
+        }
+
+        /// b→a mirror: sqrt_price rises, same fee balance shape.
+        #[test]
+        fn prop_swap_step_b_to_a_invariants(
+            l in 1_000_000u128..1_000_000_000_000u128,
+            sp_int in 1u128..(1u128 << 14),
+            target_frac in 1u128..100u128,
+            amount in 1u128..1_000_000u128,
+            fee_bps in 1u128..1_000u128,
+        ) {
+            let sp_current = sp_int * swap_math::Q64;
+            let sp_target = sp_current * (100 + target_frac) / 100;
+            let r = swap_math::compute_swap_step_exact_in(
+                sp_current, sp_target, l, amount, fee_bps * 100, 1_000_000,
+            );
+            if let Some(r) = r {
+                prop_assert!(r.sqrt_price_next >= sp_current);
+                prop_assert!(r.sqrt_price_next <= sp_target);
+                let total = r.amount_in.saturating_add(r.fee_amount);
+                if r.sqrt_price_next == sp_target {
+                    prop_assert!(total <= amount + 1);
+                } else {
+                    prop_assert_eq!(total, amount);
+                }
+            }
         }
     }
 }
