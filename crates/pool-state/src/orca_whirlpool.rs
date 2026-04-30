@@ -358,6 +358,9 @@ pub mod tick_math {
 ///   * Uniswap V3 `sqrt_price_math::get_next_sqrt_price_from_amount_in`
 ///   * `orca-so/whirlpools` `programs/whirlpool/src/math/sqrt_price_math.rs`
 pub mod swap_math {
+    use super::tick_array::{ticks_per_array_span, ParsedTickArray, TickData};
+    use super::tick_math;
+    use super::WhirlpoolPool;
     use crate::fixed_point::{mul_div_ceil, mul_div_floor};
     use primitive_types::U256;
 
@@ -644,6 +647,219 @@ pub mod swap_math {
             amount_out,
             fee_amount,
         })
+    }
+
+    /// Outcome of a cross-tick exact-input swap. Aggregate of one or more
+    /// [`compute_swap_step_exact_in`] segments, with `liquidity_net`
+    /// applied at every crossed initialised tick.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CrossTickSwapResult {
+        /// Pool state after the swap completes — sqrt_price, liquidity,
+        /// and tick_current_index all updated.
+        pub pool: WhirlpoolPool,
+        /// Total token-out the trader receives.
+        pub amount_out: u128,
+        /// Total fee withheld across all segments. `amount_in_consumed
+        /// + fee_amount == amount_in` (the gross input is fully spent
+        /// when the walk completes; if it doesn't, the function returns
+        /// `None`).
+        pub fee_amount: u128,
+    }
+
+    /// Defensive cap on the number of segments a single cross-tick swap
+    /// can take. Five tick-arrays' worth of ticks (5 * 88 = 440)
+    /// brackets every realistic sandwich amount on a healthy Whirlpool;
+    /// anything beyond means the caller fetched too few arrays or the
+    /// pool has runaway liquidity_net deltas. Either way, returning
+    /// `None` is safer than spinning.
+    const MAX_SWAP_ITERATIONS: usize = 440;
+
+    /// One cross-tick exact-input swap.
+    ///
+    /// Iterates: find next initialised tick in the swap direction →
+    /// [`compute_swap_step_exact_in`] up to that tick → if the segment
+    /// reaches the boundary, apply `liquidity_net` (negated for a→b per
+    /// V3 convention) and step into the next array, else stop.
+    /// Mirrors the swap loop in `orca-so/whirlpools`'s `swap_manager.rs`.
+    ///
+    /// `tick_arrays` must be supplied in *swap order* — descending
+    /// `start_tick_index` for `a_to_b`, ascending for `!a_to_b` —
+    /// because the helper scans them front-to-back when looking for the
+    /// next initialised tick. Caller is responsible for fetching the
+    /// right ones via [`crate::PoolStateLookup::tick_arrays`] and
+    /// passing them through.
+    ///
+    /// Returns `None` when:
+    ///   * `pool.liquidity == 0`, `fee_den == 0`, or `fee_num >= fee_den`,
+    ///   * the walk runs out of initialised ticks within the supplied
+    ///     arrays (caller fetched too few),
+    ///   * the iteration cap [`MAX_SWAP_ITERATIONS`] is hit,
+    ///   * `liquidity_net` would push active liquidity below zero
+    ///     (impossible on a real pool — defensive),
+    ///   * any [`compute_swap_step_exact_in`] sub-call saturates.
+    pub fn cross_tick_swap(
+        pool_0: WhirlpoolPool,
+        amount_in: u128,
+        a_to_b: bool,
+        fee_num: u128,
+        fee_den: u128,
+        tick_arrays: &[Option<ParsedTickArray>],
+    ) -> Option<CrossTickSwapResult> {
+        if pool_0.liquidity == 0 || fee_den == 0 || fee_num >= fee_den {
+            return None;
+        }
+        if amount_in == 0 {
+            return Some(CrossTickSwapResult {
+                pool: pool_0,
+                amount_out: 0,
+                fee_amount: 0,
+            });
+        }
+
+        let mut pool = pool_0;
+        let mut amount_remaining = amount_in;
+        let mut total_out: u128 = 0;
+        let mut total_fee: u128 = 0;
+
+        for _ in 0..MAX_SWAP_ITERATIONS {
+            if amount_remaining == 0 {
+                return Some(CrossTickSwapResult {
+                    pool,
+                    amount_out: total_out,
+                    fee_amount: total_fee,
+                });
+            }
+
+            let next_tick = find_next_initialised_tick_in_arrays(
+                tick_arrays,
+                pool.tick_current_index,
+                pool.tick_spacing,
+                a_to_b,
+            )?;
+            let target_sqrt_price = tick_math::sqrt_price_at_tick(next_tick);
+
+            let r = compute_swap_step_exact_in(
+                pool.sqrt_price_q64,
+                target_sqrt_price,
+                pool.liquidity,
+                amount_remaining,
+                fee_num,
+                fee_den,
+            )?;
+
+            let consumed = r.amount_in.checked_add(r.fee_amount)?;
+            amount_remaining = amount_remaining.saturating_sub(consumed);
+            total_out = total_out.checked_add(r.amount_out)?;
+            total_fee = total_fee.checked_add(r.fee_amount)?;
+            pool.sqrt_price_q64 = r.sqrt_price_next;
+
+            if r.sqrt_price_next == target_sqrt_price {
+                // Crossed the boundary; apply liquidity_net.
+                let tick_data = lookup_tick_data(tick_arrays, next_tick, pool.tick_spacing)?;
+                // V3 convention: liquidity_net is signed for the b→a
+                // direction (tick increasing). a→b applies the
+                // negation.
+                let delta = if a_to_b {
+                    tick_data.liquidity_net.checked_neg()?
+                } else {
+                    tick_data.liquidity_net
+                };
+                let new_liquidity = (pool.liquidity as i128).checked_add(delta)?;
+                if new_liquidity < 0 {
+                    return None;
+                }
+                pool.liquidity = new_liquidity as u128;
+                // V3: a→b advances tick_current to `next - 1`; b→a
+                // lands exactly on `next`. Mirrors `swap_manager.rs`.
+                pool.tick_current_index = if a_to_b { next_tick - 1 } else { next_tick };
+            } else {
+                // Capped by amount_remaining mid-segment; we're done.
+                pool.tick_current_index = tick_math::tick_at_sqrt_price_q64(r.sqrt_price_next);
+                return Some(CrossTickSwapResult {
+                    pool,
+                    amount_out: total_out,
+                    fee_amount: total_fee,
+                });
+            }
+        }
+
+        // Iteration cap exhausted with input still remaining — caller
+        // didn't pre-fetch enough arrays, or the pool's liquidity_net
+        // sequence is pathological.
+        None
+    }
+
+    /// Find the next initialised tick in the swap direction, scanning
+    /// the supplied arrays front-to-back. Returns `None` when no
+    /// further initialised tick exists in the supplied range.
+    ///
+    /// `tick_arrays` must be in swap order (descending start_tick_index
+    /// for `a_to_b`, ascending otherwise).
+    fn find_next_initialised_tick_in_arrays(
+        tick_arrays: &[Option<ParsedTickArray>],
+        current_tick: i32,
+        tick_spacing: u16,
+        a_to_b: bool,
+    ) -> Option<i32> {
+        for opt in tick_arrays {
+            let array = opt.as_ref()?;
+            if a_to_b {
+                // Tick decreasing: scan slots from highest to lowest,
+                // pick the first initialised slot strictly less than
+                // `current_tick`.
+                for (i, tick) in array.ticks.iter().enumerate().rev() {
+                    if !tick.initialised {
+                        continue;
+                    }
+                    let tick_idx = array.tick_index_at(i, tick_spacing);
+                    if tick_idx < current_tick {
+                        return Some(tick_idx);
+                    }
+                }
+            } else {
+                // Tick increasing: scan slots low-to-high, pick the
+                // first initialised slot strictly greater than
+                // `current_tick`.
+                for (i, tick) in array.ticks.iter().enumerate() {
+                    if !tick.initialised {
+                        continue;
+                    }
+                    let tick_idx = array.tick_index_at(i, tick_spacing);
+                    if tick_idx > current_tick {
+                        return Some(tick_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up the [`TickData`] at `target_tick`. Returns `None` when
+    /// the tick falls outside every supplied array (caller fetched the
+    /// wrong start indices).
+    fn lookup_tick_data(
+        tick_arrays: &[Option<ParsedTickArray>],
+        target_tick: i32,
+        tick_spacing: u16,
+    ) -> Option<TickData> {
+        let span = ticks_per_array_span(tick_spacing);
+        for array in tick_arrays.iter().filter_map(|x| x.as_ref()) {
+            let array_min = array.start_tick_index;
+            let array_max_exclusive = array_min + span;
+            if target_tick < array_min || target_tick >= array_max_exclusive {
+                continue;
+            }
+            let offset = (target_tick - array_min) / (tick_spacing as i32);
+            // Defensive: if tick_spacing doesn't divide evenly, the
+            // tick isn't on the array's grid. Real Whirlpool ticks
+            // always align, but the `as usize` cast would otherwise
+            // index out of bounds on a malformed input.
+            if (target_tick - array_min) % (tick_spacing as i32) != 0 {
+                return None;
+            }
+            return array.ticks.get(offset as usize).copied();
+        }
+        None
     }
 }
 
@@ -1650,5 +1866,171 @@ mod tests {
             .expect("should stay within [-64, 0]");
         assert!(new_pool.sqrt_price_q64 < sp);
         assert!(new_pool.tick_current_index >= -64);
+    }
+
+    // ----- cross_tick_swap ---------------------------------------------
+
+    use tick_array::{ParsedTickArray, TickData, TICK_ARRAY_SIZE};
+
+    /// Build a TickArray fixture with a sparse list of `(slot,
+    /// liquidity_net)` entries. All listed slots are marked
+    /// initialised; the rest default to uninitialised.
+    fn make_array(start_tick_index: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
+        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        for (i, net) in slots {
+            ticks[*i] = TickData {
+                initialised: true,
+                liquidity_net: *net,
+            };
+        }
+        ParsedTickArray {
+            start_tick_index,
+            ticks,
+        }
+    }
+
+    /// Multi-LP fixture: two overlapping LP positions with the pool
+    /// seated in both ranges at tick=0. The tight LP brackets the
+    /// nearby boundary the cross test needs to hit; the wide LP keeps
+    /// liquidity non-zero past that boundary so a cross + cap pattern
+    /// is possible (single-LP fixtures deplete to zero on the first
+    /// cross, which is a degenerate path the test wants to *avoid*).
+    ///
+    ///   * LP1 (tight): [-128, 128], liquidity 1B.
+    ///     boundaries at slots 2 (tick 128) of array 0 and 86 (tick
+    ///     -128) of array -5632.
+    ///   * LP2 (wide): [-2048, 2048], liquidity 500M.
+    ///     boundaries at slots 32 (tick 2048) of array 0 and 56 (tick
+    ///     -2048) of array -5632.
+    ///
+    /// Returns the pool snapshot plus the tick_arrays sequence ordered
+    /// for an a→b walk (descending start indices).
+    fn double_lp_fixture_a_to_b() -> (WhirlpoolPool, Vec<Option<ParsedTickArray>>) {
+        let pool = WhirlpoolPool {
+            liquidity: 1_500_000_000,
+            sqrt_price_q64: tick_math::sqrt_price_at_tick(0),
+            tick_current_index: 0,
+            tick_spacing: 64,
+            fee_rate_hundredths_bps: 3_000,
+        };
+        // tick_index_at(slot, 64): array start 0 → ticks 0, 64, 128,
+        // 192, 256, ...; array start -5632 → ticks -5632, -5568, ...,
+        // -64.
+        let array_at_zero = make_array(0, &[(2, -1_000_000_000), (32, -500_000_000)]);
+        let array_at_neg_5632 = make_array(-5632, &[(86, 1_000_000_000), (56, 500_000_000)]);
+        // a→b descends through ticks ⇒ scan order is array_at_zero
+        // (covers [0, 5631]) first, then array_at_neg_5632 (covers
+        // [-5632, -65]).
+        (pool, vec![Some(array_at_zero), Some(array_at_neg_5632)])
+    }
+
+    fn double_lp_fixture_b_to_a() -> (WhirlpoolPool, Vec<Option<ParsedTickArray>>) {
+        let (pool, mut arrays) = double_lp_fixture_a_to_b();
+        // b→a ascends ⇒ array order reverses: -5632 first, 0 next.
+        // (Pool is at tick=0, so the b→a walk needs to look from the
+        // current array onward — the helper ignores ticks ≤ current,
+        // so leading with array -5632 is fine and exercises the skip
+        // logic.)
+        arrays.reverse();
+        (pool, arrays)
+    }
+
+    #[test]
+    fn cross_tick_swap_zero_amount_is_identity() {
+        let (pool, arrays) = double_lp_fixture_a_to_b();
+        let r = swap_math::cross_tick_swap(pool, 0, true, 3_000, 1_000_000, &arrays).unwrap();
+        assert_eq!(r.pool, pool);
+        assert_eq!(r.amount_out, 0);
+        assert_eq!(r.fee_amount, 0);
+    }
+
+    #[test]
+    fn cross_tick_swap_zero_liquidity_returns_none() {
+        let pool = WhirlpoolPool {
+            liquidity: 0,
+            sqrt_price_q64: swap_math::Q64,
+            tick_current_index: 0,
+            tick_spacing: 64,
+            fee_rate_hundredths_bps: 3_000,
+        };
+        let arrays: Vec<Option<ParsedTickArray>> = vec![Some(make_array(0, &[]))];
+        assert!(swap_math::cross_tick_swap(pool, 100, true, 3_000, 1_000_000, &arrays).is_none(),);
+    }
+
+    #[test]
+    fn cross_tick_swap_no_arrays_returns_none() {
+        let (pool, _) = double_lp_fixture_a_to_b();
+        // No tick_arrays ⇒ find_next_initialised_tick yields None on
+        // the first iteration.
+        assert!(swap_math::cross_tick_swap(pool, 100_000, true, 3_000, 1_000_000, &[]).is_none());
+    }
+
+    #[test]
+    fn cross_tick_swap_caps_within_first_segment() {
+        // Modest swap on 1.5B liquidity stays well above the next
+        // boundary (-128). One segment, no boundary cross, liquidity
+        // unchanged.
+        let (pool, arrays) = double_lp_fixture_a_to_b();
+        let r = swap_math::cross_tick_swap(pool, 100_000, true, 3_000, 1_000_000, &arrays).unwrap();
+        assert!(r.pool.sqrt_price_q64 < pool.sqrt_price_q64);
+        assert!(r.pool.sqrt_price_q64 > tick_math::sqrt_price_at_tick(-128));
+        assert_eq!(
+            r.pool.liquidity, pool.liquidity,
+            "no boundary crossed ⇒ liquidity unchanged",
+        );
+        assert!(r.amount_out > 0);
+        assert!(r.fee_amount > 0);
+    }
+
+    #[test]
+    fn cross_tick_swap_a_to_b_crosses_one_boundary_and_drops_liquidity() {
+        // a→b cross of -128: pool.liquidity 1.5B → 0.5B (LP1 exits;
+        // LP2 [-2048, 2048] still active). Amount tuned to clear the
+        // -128 boundary but cap before reaching -2048 (the next LP2
+        // lower-edge) at the post-cross liquidity of 500M.
+        let (pool, arrays) = double_lp_fixture_a_to_b();
+        let r =
+            swap_math::cross_tick_swap(pool, 50_000_000, true, 3_000, 1_000_000, &arrays).unwrap();
+        // Crossed -128 but stopped short of -2048.
+        assert!(r.pool.sqrt_price_q64 <= tick_math::sqrt_price_at_tick(-128));
+        assert!(r.pool.sqrt_price_q64 > tick_math::sqrt_price_at_tick(-2048));
+        // After exactly one cross of -128, LP1 (1B) drops out:
+        //   1.5B + (-(+1B)) = 500M.
+        assert_eq!(r.pool.liquidity, 500_000_000);
+        // tick_current advances past the boundary in the a→b sense.
+        assert!(r.pool.tick_current_index < -128);
+        // Total fee accumulated across both segments (pre-cross +
+        // post-cross).
+        assert!(r.fee_amount > 0);
+    }
+
+    #[test]
+    fn cross_tick_swap_b_to_a_crosses_one_boundary_and_drops_liquidity() {
+        // Mirror in the b→a direction. tick=128 boundary; LP1
+        // deactivates ⇒ liquidity 1.5B → 0.5B; cap before reaching
+        // tick=2048 (LP2 upper) at the post-cross liquidity.
+        let (pool, arrays) = double_lp_fixture_b_to_a();
+        let r =
+            swap_math::cross_tick_swap(pool, 50_000_000, false, 3_000, 1_000_000, &arrays).unwrap();
+        assert!(r.pool.sqrt_price_q64 >= tick_math::sqrt_price_at_tick(128));
+        assert!(r.pool.sqrt_price_q64 < tick_math::sqrt_price_at_tick(2048));
+        assert_eq!(r.pool.liquidity, 500_000_000);
+        assert!(r.pool.tick_current_index >= 128);
+        assert!(r.fee_amount > 0);
+    }
+
+    #[test]
+    fn cross_tick_swap_runs_out_of_arrays_returns_none() {
+        // a→b walk only fed the first array (covers [0, 5631]). When
+        // the swap needs to cross into negative ticks, find_next runs
+        // out of arrays ⇒ None.
+        let (pool, mut arrays) = double_lp_fixture_a_to_b();
+        // Drop the negative-tick array.
+        arrays.truncate(1);
+        // Large swap that needs to cross -128.
+        assert!(
+            swap_math::cross_tick_swap(pool, 100_000_000, true, 3_000, 1_000_000, &arrays)
+                .is_none(),
+        );
     }
 }
