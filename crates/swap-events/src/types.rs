@@ -602,6 +602,31 @@ pub enum Signal {
         with_victim: i64,
         without_victim: i64,
     },
+
+    /// End-state model-vs-chain check (Tier 3.1). Compares
+    /// `amm_replay.reserves_post_back` (what our replay says the pool's
+    /// vaults should hold after the backrun) against the chain's actual
+    /// post-backrun vault balances, taken from the backrun tx's
+    /// `post_token_balances`. `divergence_bps` is the larger of the two
+    /// side-wise relative deltas (base, quote), expressed in basis points.
+    ///
+    /// This is the headline self-proof for the replay engine: where
+    /// `InvariantResidual` checks each step against parser-observed
+    /// `amount_out`, this checks the *final* reconstructed pool state
+    /// against on-chain ground truth. A small divergence is positive
+    /// confirmation that every reserves transition we computed lined up with
+    /// the chain — which means the upstream `victim_loss` /
+    /// `attacker_profit_real` numbers can be trusted at face value. A large
+    /// divergence indicates we missed an instruction (rebalance, fee
+    /// withdrawal, multi-hop CPI) and the replay-derived figures should be
+    /// discounted. Routed to the Economic category. Pass on its own isn't
+    /// evidence *for* a sandwich — that comes from the AMM-replay signals —
+    /// so this signal only votes Fail (or Informational) per the
+    /// `InvariantResidual` precedent.
+    ReservesMatchPostState {
+        divergence_bps: u32,
+        passed: bool,
+    },
 }
 
 /// Replay step where an [`Signal::InvariantResidual`] was measured.
@@ -655,7 +680,8 @@ impl Signal {
             | Signal::AmmProfit { .. }
             | Signal::VictimLoss { .. }
             | Signal::ReplayConfidence { .. }
-            | Signal::InvariantResidual { .. } => SignalCategory::Economic,
+            | Signal::InvariantResidual { .. }
+            | Signal::ReservesMatchPostState { .. } => SignalCategory::Economic,
             Signal::VictimSize { .. }
             | Signal::KnownAttackerVictim { .. }
             | Signal::AuthorityChain { .. }
@@ -784,6 +810,21 @@ impl Signal {
                     SignalVerdict::Fail
                 } else {
                     SignalVerdict::Informational
+                }
+            }
+
+            // End-state model fidelity. `passed` is the precomputed verdict
+            // (divergence_bps < threshold). Pass-as-vote isn't an outcome
+            // here — same rationale as InvariantResidual: faithful math is
+            // not evidence *for* a sandwich, only a guarantee that the
+            // replay numbers are trustworthy. Big divergence flips to Fail
+            // so a downstream consumer doesn't quote a victim_loss the
+            // model couldn't reproduce.
+            Signal::ReservesMatchPostState { passed, .. } => {
+                if passed {
+                    SignalVerdict::Informational
+                } else {
+                    SignalVerdict::Fail
                 }
             }
         }

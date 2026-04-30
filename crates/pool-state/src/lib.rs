@@ -16,6 +16,7 @@
 
 pub mod constant_product;
 pub mod counterfactual;
+pub mod diff_test;
 pub mod enrichment;
 pub mod lookup;
 pub mod raydium_cpmm;

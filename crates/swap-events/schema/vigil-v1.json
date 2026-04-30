@@ -821,6 +821,31 @@
               "format": "int64"
             }
           }
+        },
+        {
+          "description": "End-state model-vs-chain check (Tier 3.1). Compares `amm_replay.reserves_post_back` (what our replay says the pool's vaults should hold after the backrun) against the chain's actual post-backrun vault balances, taken from the backrun tx's `post_token_balances`. `divergence_bps` is the larger of the two side-wise relative deltas (base, quote), expressed in basis points.\n\nThis is the headline self-proof for the replay engine: where `InvariantResidual` checks each step against parser-observed `amount_out`, this checks the *final* reconstructed pool state against on-chain ground truth. A small divergence is positive confirmation that every reserves transition we computed lined up with the chain — which means the upstream `victim_loss` / `attacker_profit_real` numbers can be trusted at face value. A large divergence indicates we missed an instruction (rebalance, fee withdrawal, multi-hop CPI) and the replay-derived figures should be discounted. Routed to the Economic category. Pass on its own isn't evidence *for* a sandwich — that comes from the AMM-replay signals — so this signal only votes Fail (or Informational) per the `InvariantResidual` precedent.",
+          "type": "object",
+          "required": [
+            "divergence_bps",
+            "kind",
+            "passed"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "reserves_match_post_state"
+              ]
+            },
+            "divergence_bps": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "passed": {
+              "type": "boolean"
+            }
+          }
         }
       ]
     },

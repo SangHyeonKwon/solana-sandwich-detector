@@ -433,9 +433,10 @@ async fn enrichment_produces_victim_loss_on_fixture() {
         let Some(frontrun_tx) = tx_by_sig.get(&attack.frontrun.signature) else {
             continue;
         };
+        let backrun_tx = tx_by_sig.get(&attack.backrun.signature);
         attempted += 1;
         let mut attack = attack;
-        let res = enrich_attack(&mut attack, frontrun_tx, &lookup).await;
+        let res = enrich_attack(&mut attack, frontrun_tx, backrun_tx, &lookup).await;
         if res == EnrichmentResult::Enriched {
             enriched_ok += 1;
             if attack.victim_loss_lamports.unwrap_or(0) > 0 {

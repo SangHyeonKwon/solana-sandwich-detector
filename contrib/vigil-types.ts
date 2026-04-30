@@ -130,6 +130,20 @@ export type Signal =
       kind: "counterfactual_attacker_profit";
       with_victim: number;
       without_victim: number;
+    }
+  /**
+   * End-state model-vs-chain reconciliation (Tier 3.1). `divergence_bps` is
+   * the larger of the side-wise relative gaps between `amm_replay.reserves_post_back`
+   * and the actual post-backrun vault balances pulled from the backrun tx's
+   * `post_token_balances`. `passed = divergence_bps < 100`. A passing signal
+   * is positive proof that the replay's reserves trajectory matches chain
+   * reality — the strongest single guarantee that `victim_loss` /
+   * `attacker_profit_real` are trustworthy.
+   */
+  | {
+      kind: "reserves_match_post_state";
+      divergence_bps: number;
+      passed: boolean;
     };
 
 export interface DetectionEvidence {
