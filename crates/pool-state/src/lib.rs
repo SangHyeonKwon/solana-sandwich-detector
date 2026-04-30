@@ -19,6 +19,7 @@ pub mod counterfactual;
 pub mod diff_test;
 pub mod enrichment;
 pub mod lookup;
+pub mod orca_whirlpool;
 pub mod raydium_cpmm;
 pub mod raydium_v4;
 pub mod reserves;

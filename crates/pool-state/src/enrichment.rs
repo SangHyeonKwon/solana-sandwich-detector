@@ -15,6 +15,7 @@ use swap_events::types::{
     DetectionEvidence, ReplayStep, SandwichAttack, Severity, Signal, TransactionData,
 };
 
+use crate::lookup::AmmKind;
 use crate::{compute_loss_with_trace, diff_test, reserves, ConstantProduct, PoolStateLookup};
 
 /// Outcome of an enrichment attempt. Signals *why* it failed so callers can
@@ -54,6 +55,15 @@ pub async fn enrich_attack(
     let Some(config) = lookup.pool_config(&attack.pool, attack.dex).await else {
         return EnrichmentResult::ConfigUnavailable;
     };
+
+    // Dispatch by AMM kind. Constant-product math (Raydium V4 / CPMM)
+    // proceeds inline; concentrated-liquidity DEXes (Whirlpool) need a
+    // different replay path that's still pending — short-circuit so
+    // callers don't read replay-derived numbers that were never computed.
+    match config.kind {
+        AmmKind::RaydiumV4 | AmmKind::RaydiumCpmm => {}
+        AmmKind::OrcaWhirlpool => return EnrichmentResult::UnsupportedDex,
+    }
 
     let Some(tx_reserves) = reserves::extract(frontrun_tx, &config) else {
         let accounts: Vec<&str> = frontrun_tx
@@ -520,6 +530,24 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
         };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::UnsupportedDex);
+        assert!(attack.victim_loss_lamports.is_none());
+    }
+
+    #[tokio::test]
+    async fn reports_unsupported_dex_for_whirlpool_until_replay_lands() {
+        // Whirlpool config parses fine, but the AMM-kind dispatch gates
+        // it out until concentrated-liquidity replay lands. Caller must
+        // see UnsupportedDex (not Enriched) so it doesn't consume
+        // replay-derived numbers that weren't computed.
+        let mut attack = make_attack();
+        attack.dex = DexType::OrcaWhirlpool;
+        let mut config = make_config();
+        config.kind = AmmKind::OrcaWhirlpool;
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup { config };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::UnsupportedDex);

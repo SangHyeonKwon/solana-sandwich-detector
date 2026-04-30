@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::lookup::{PoolConfig, PoolStateLookup, SlotLeaderLookup};
-use crate::{raydium_cpmm, raydium_v4};
+use crate::{orca_whirlpool, raydium_cpmm, raydium_v4};
 
 pub struct RpcPoolLookup {
     client: Arc<RpcClient>,
@@ -60,6 +60,7 @@ impl RpcPoolLookup {
         match dex {
             DexType::RaydiumV4 => raydium_v4::parse_config(pool, &account.data),
             DexType::RaydiumCpmm => raydium_cpmm::parse_config(pool, &account.data),
+            DexType::OrcaWhirlpool => orca_whirlpool::parse_config(pool, &account.data),
             _ => None,
         }
     }

@@ -12,15 +12,23 @@ use swap_events::types::DexType;
 pub enum AmmKind {
     RaydiumV4,
     RaydiumCpmm,
+    /// Orca Whirlpool concentrated-liquidity AMM. Config (vault / mint /
+    /// fee) and pool-state (sqrt_price / liquidity / tick) parsing are
+    /// in [`crate::orca_whirlpool`]; replay support lands in a follow-up
+    /// — `enrich_attack` currently routes this kind to
+    /// [`EnrichmentResult::UnsupportedDex`](crate::EnrichmentResult).
+    OrcaWhirlpool,
 }
 
 impl AmmKind {
-    /// Map a [`DexType`] to an AMM kind this crate can replay. Returns `None`
-    /// for DEXes we don't yet support (CLMM, Orca, Meteora, Pump.fun, Phoenix, Jupiter).
+    /// Map a [`DexType`] to an AMM kind this crate can recognise. Returns
+    /// `None` for DEXes we have neither config parsing nor replay for
+    /// (Pump.fun, Phoenix, Jupiter, Meteora DLMM, Raydium CLMM).
     pub fn from_dex(dex: DexType) -> Option<Self> {
         match dex {
             DexType::RaydiumV4 => Some(AmmKind::RaydiumV4),
             DexType::RaydiumCpmm => Some(AmmKind::RaydiumCpmm),
+            DexType::OrcaWhirlpool => Some(AmmKind::OrcaWhirlpool),
             _ => None,
         }
     }
