@@ -635,6 +635,224 @@ pub mod swap_math {
     }
 }
 
+/// Whirlpool TickArray account: 88-tick chunk indexed by `start_tick_index`.
+///
+/// The cross-tick walk (step 3-δ) iterates across one or more arrays to
+/// traverse a swap, applying `liquidity_net` at each crossed initialised
+/// tick. This module covers parsing only — the walk algorithm itself
+/// lives in [`swap_math`] (or its successor); we just expose the data it
+/// needs.
+///
+/// Account layout (Anchor `#[account(zero_copy(unsafe))]`, `#[repr(C)]`):
+/// ```text
+///   field                            offset       size
+///   discriminator                         0          8
+///   start_tick_index: i32                 8          4
+///   padding                              12          4    (i128 alignment)
+///   ticks: [Tick; 88]                    16     88*128
+///   whirlpool: Pubkey                 11280         32
+/// ```
+///
+/// Each `Tick` (`#[repr(C)]` `bool + 15-pad + i128 + 4*u128 + [u128;3]`):
+/// ```text
+///   field                       inner offset  size
+///   initialized: bool                       0    1
+///   padding                                 1   15
+///   liquidity_net: i128                    16   16
+///   liquidity_gross: u128                  32   16
+///   fee_growth_outside_a: u128             48   16
+///   fee_growth_outside_b: u128             64   16
+///   reward_growths_outside: [u128;3]       80   48
+///   ----- total                                 128
+/// ```
+///
+/// We deliberately drop everything but `initialized` and `liquidity_net`
+/// — the cross-tick walk only crosses *initialised* ticks and only needs
+/// the net delta to update active liquidity. The other fields are LP
+/// accounting state that doesn't affect swap math.
+///
+/// Reference:
+///   <https://github.com/orca-so/whirlpools/blob/main/programs/whirlpool/src/state/tick.rs>
+pub mod tick_array {
+    /// Number of ticks per `TickArray` account (Whirlpool program
+    /// constant — fixed by the on-chain layout).
+    pub const TICK_ARRAY_SIZE: usize = 88;
+
+    const DISCRIMINATOR_LEN: usize = 8;
+    /// On-chain `Tick` size with `#[repr(C)]` padding.
+    const TICK_LEN: usize = 128;
+
+    const TICK_OFFSET_INITIALISED: usize = 0;
+    const TICK_OFFSET_LIQUIDITY_NET: usize = 16;
+
+    const OFFSET_START_TICK: usize = DISCRIMINATOR_LEN;
+    /// Ticks start at offset 16: `start_tick_index` + 4 bytes of
+    /// `#[repr(C)]` padding to align the i128 inside each Tick.
+    const OFFSET_TICKS: usize = OFFSET_START_TICK + 4 + 4;
+    /// Minimum account-data length covering every tick we read. The
+    /// trailing `whirlpool: Pubkey` field is intentionally skipped — the
+    /// caller already knows the parent pool, so re-parsing it is dead
+    /// work.
+    pub const MIN_LAYOUT_LEN: usize = OFFSET_TICKS + TICK_LEN * TICK_ARRAY_SIZE;
+
+    /// Subset of on-chain `Tick` fields the cross-tick walk needs.
+    ///
+    /// `liquidity_gross`, `fee_growth_outside_*`, and
+    /// `reward_growths_outside` are LP accounting and don't affect swap
+    /// traversal — leaving them on the wire keeps the parser narrow.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct TickData {
+        /// Whether an LP position has a boundary at this tick. Cross-
+        /// tick walk skips uninitialised slots — `liquidity_net` is
+        /// meaningless on those.
+        pub initialised: bool,
+        /// Net liquidity delta when crossing this tick in the b→a
+        /// direction (tick increasing). Signed: LP position upper-edges
+        /// subtract, lower-edges add. The a→b walk applies the
+        /// negation (V3 convention).
+        pub liquidity_net: i128,
+    }
+
+    /// One parsed TickArray account.
+    #[derive(Debug, Clone)]
+    pub struct ParsedTickArray {
+        /// Tick index of the first slot. Always a multiple of
+        /// `tick_spacing * TICK_ARRAY_SIZE`.
+        pub start_tick_index: i32,
+        pub ticks: [TickData; TICK_ARRAY_SIZE],
+    }
+
+    impl ParsedTickArray {
+        /// Tick index of the slot at position `i` (0..[`TICK_ARRAY_SIZE`]).
+        /// `tick_spacing` isn't stored on the array — it's a property of
+        /// the parent Whirlpool — so the caller passes it in.
+        pub fn tick_index_at(&self, i: usize, tick_spacing: u16) -> i32 {
+            self.start_tick_index + (i as i32) * (tick_spacing as i32)
+        }
+    }
+
+    /// Parse a `TickArray` account blob. Returns `None` for blobs shorter
+    /// than [`MIN_LAYOUT_LEN`].
+    ///
+    /// `initialized` bytes other than `0` or `1` are treated as
+    /// uninitialised — defensive against malformed accounts. The on-
+    /// chain serialiser only ever writes `0` or `1`, so this only kicks
+    /// in when something has corrupted the data.
+    pub fn parse_tick_array(data: &[u8]) -> Option<ParsedTickArray> {
+        if data.len() < MIN_LAYOUT_LEN {
+            return None;
+        }
+        let start_tick_index = read_i32(data, OFFSET_START_TICK)?;
+        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        for (i, slot) in ticks.iter_mut().enumerate() {
+            let tick_offset = OFFSET_TICKS + i * TICK_LEN;
+            let initialised_byte = *data.get(tick_offset + TICK_OFFSET_INITIALISED)?;
+            let initialised = initialised_byte == 1;
+            let liquidity_net = read_i128(data, tick_offset + TICK_OFFSET_LIQUIDITY_NET)?;
+            *slot = TickData {
+                initialised,
+                liquidity_net,
+            };
+        }
+        Some(ParsedTickArray {
+            start_tick_index,
+            ticks,
+        })
+    }
+
+    fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
+        let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+        Some(i32::from_le_bytes(bytes))
+    }
+
+    fn read_i128(data: &[u8], offset: usize) -> Option<i128> {
+        let bytes: [u8; 16] = data.get(offset..offset + 16)?.try_into().ok()?;
+        Some(i128::from_le_bytes(bytes))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Build a synthetic TickArray blob with the given start index
+        /// and a sparse list of `(slot, initialised, liquidity_net)`
+        /// overrides. Bytes outside the overrides are zero.
+        fn make_blob(start_tick_index: i32, overrides: &[(usize, bool, i128)]) -> Vec<u8> {
+            let mut data = vec![0u8; MIN_LAYOUT_LEN];
+            data[OFFSET_START_TICK..OFFSET_START_TICK + 4]
+                .copy_from_slice(&start_tick_index.to_le_bytes());
+            for (i, initialised, liquidity_net) in overrides {
+                let tick_offset = OFFSET_TICKS + i * TICK_LEN;
+                data[tick_offset + TICK_OFFSET_INITIALISED] = u8::from(*initialised);
+                data[tick_offset + TICK_OFFSET_LIQUIDITY_NET
+                    ..tick_offset + TICK_OFFSET_LIQUIDITY_NET + 16]
+                    .copy_from_slice(&liquidity_net.to_le_bytes());
+            }
+            data
+        }
+
+        #[test]
+        fn parse_extracts_start_tick_and_ticks() {
+            let blob = make_blob(
+                -2816, // 64 * 88 * (-1/2) — a plausible negative-region start.
+                &[(5, true, 1_000_000_000), (44, true, -500_000_000)],
+            );
+            let p = parse_tick_array(&blob).unwrap();
+            assert_eq!(p.start_tick_index, -2816);
+            assert!(p.ticks[5].initialised);
+            assert_eq!(p.ticks[5].liquidity_net, 1_000_000_000);
+            assert!(p.ticks[44].initialised);
+            assert_eq!(p.ticks[44].liquidity_net, -500_000_000);
+            // Untouched slots default to uninitialised, zero net.
+            assert!(!p.ticks[0].initialised);
+            assert_eq!(p.ticks[0].liquidity_net, 0);
+            assert!(!p.ticks[87].initialised);
+        }
+
+        #[test]
+        fn parse_rejects_short_blob() {
+            assert!(parse_tick_array(&[0u8; 100]).is_none());
+            assert!(parse_tick_array(&vec![0u8; MIN_LAYOUT_LEN - 1]).is_none());
+            assert!(parse_tick_array(&vec![0u8; MIN_LAYOUT_LEN]).is_some());
+        }
+
+        #[test]
+        fn tick_index_at_uses_caller_supplied_spacing() {
+            let p = parse_tick_array(&make_blob(0, &[])).unwrap();
+            assert_eq!(p.tick_index_at(0, 64), 0);
+            assert_eq!(p.tick_index_at(1, 64), 64);
+            assert_eq!(p.tick_index_at(87, 64), 87 * 64);
+            // Negative starts propagate cleanly.
+            let p = parse_tick_array(&make_blob(-5632, &[])).unwrap();
+            assert_eq!(p.tick_index_at(0, 64), -5632);
+            assert_eq!(p.tick_index_at(10, 64), -5632 + 10 * 64);
+        }
+
+        #[test]
+        fn non_canonical_initialised_byte_treated_as_uninitialised() {
+            // bool serialisation is 0 or 1; anything else means the blob
+            // has been tampered with or corrupted. Treat as
+            // uninitialised so the walk doesn't mis-apply liquidity_net.
+            let mut blob = make_blob(0, &[]);
+            blob[OFFSET_TICKS + TICK_OFFSET_INITIALISED] = 0xFF;
+            let p = parse_tick_array(&blob).unwrap();
+            assert!(!p.ticks[0].initialised);
+        }
+
+        #[test]
+        fn liquidity_net_round_trips_signed_extremes() {
+            let blob = make_blob(
+                0,
+                &[(0, true, i128::MAX), (1, true, i128::MIN), (2, true, -1)],
+            );
+            let p = parse_tick_array(&blob).unwrap();
+            assert_eq!(p.ticks[0].liquidity_net, i128::MAX);
+            assert_eq!(p.ticks[1].liquidity_net, i128::MIN);
+            assert_eq!(p.ticks[2].liquidity_net, -1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
