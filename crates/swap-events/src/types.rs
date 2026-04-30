@@ -398,6 +398,15 @@ pub struct SandwichAttack {
     /// enrichment didn't run or the DEX isn't supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amm_replay: Option<AmmReplayTrace>,
+    /// Whirlpool-specific replay trace — populated only when `dex` is
+    /// `OrcaWhirlpool` and pool-state enrichment ran successfully.
+    /// Mirrors [`AmmReplayTrace`] in spirit: lets a reader recompute
+    /// victim loss / attacker profit from the raw concentrated-liquidity
+    /// arithmetic. Distinct field rather than an enum so the existing
+    /// `amm_replay` shape stays backward-compatible for ConstantProduct
+    /// consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whirlpool_replay: Option<WhirlpoolReplayTrace>,
 
     // -- Vigil-aligned fields (schema `vigil-v1`) ----------------------------
     // Additive; populated by callers via [`SandwichAttack::finalize_for_vigil`]
@@ -945,6 +954,89 @@ pub struct AmmReplayTrace {
     pub fee_den: u32,
 }
 
+/// Whirlpool (concentrated-liquidity) replay trace — the analogue of
+/// [`AmmReplayTrace`] for the V3-style swap math added in Tier 3.4.
+///
+/// Surfaces the per-step sqrt_price / liquidity / tick the replay walked
+/// through, so a reader can reconstruct the swap arithmetic the same way
+/// `AmmReplayTrace` lets them re-derive constant-product victim_loss from
+/// raw reserves.
+///
+/// `u128` fields (sqrt_price, liquidity) serialise as **base-10 decimal
+/// strings** to preserve precision in JSON consumers — JS's `number` is
+/// a 53-bit float and would lose information on values past `2^53`.
+/// Q64.64 sqrt_prices sit around `2^64`, well past that. TS-side parsers
+/// should use `BigInt(...)` to read these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WhirlpoolReplayTrace {
+    /// Q64.64 sqrt(price) immediately before the frontrun.
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub sqrt_price_pre: u128,
+    /// Sqrt-price after the frontrun, before the victim.
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub sqrt_price_post_front: u128,
+    /// Sqrt-price after the victim, before the backrun.
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub sqrt_price_post_victim: u128,
+    /// Sqrt-price after the backrun (end of the triplet).
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub sqrt_price_post_back: u128,
+
+    /// Active liquidity at each step. Constant within one tick band, but
+    /// changes when a leg's swap walks past an initialised tick boundary
+    /// (LP positions activate / deactivate per V3 conventions).
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub liquidity_pre: u128,
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub liquidity_post_front: u128,
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub liquidity_post_victim: u128,
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub liquidity_post_back: u128,
+
+    /// Tick (price bucket) at each step. `floor(log_{1.0001}(price))`.
+    /// Fits in `i32` per Whirlpool's own layout; safe in JSON.
+    pub tick_current_pre: i32,
+    pub tick_current_post_front: i32,
+    pub tick_current_post_victim: i32,
+    pub tick_current_post_back: i32,
+
+    /// What the victim would have received without the frontrun.
+    pub counterfactual_victim_out: u64,
+    /// What the victim actually received.
+    pub actual_victim_out: u64,
+
+    /// LP fee fraction. Whirlpool uses `fee_num` in hundredths-of-bps
+    /// against `fee_den = 1_000_000` (e.g. `3000 / 1_000_000` = 30 bps).
+    pub fee_num: u32,
+    pub fee_den: u32,
+}
+
+/// Serde adapter that serialises a `u128` as a base-10 decimal string
+/// rather than a JSON number, so JS consumers can `BigInt(...)` it
+/// without losing precision past `2^53`. Only used by
+/// [`WhirlpoolReplayTrace`] today.
+mod u128_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u128, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<u128, D::Error> {
+        let s = String::deserialize(de)?;
+        s.parse::<u128>().map_err(serde::de::Error::custom)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal block/transaction types (not serialized to JSON output)
 // ---------------------------------------------------------------------------
@@ -1181,6 +1273,7 @@ mod evidence_tests {
             net_profit: Some(190),
             evidence: Some(evidence),
             amm_replay: Some(replay),
+            whirlpool_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,
@@ -1272,6 +1365,7 @@ mod vigil_schema_tests {
                 fee_num: 25,
                 fee_den: 10_000,
             }),
+            whirlpool_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,
@@ -1716,5 +1810,92 @@ mod vigil_schema_tests {
         assert_eq!(ev.categories_fired, 1);
         assert_eq!(ev.passing.len(), 1);
         assert_eq!(ev.informational.len(), 1);
+    }
+
+    #[test]
+    fn whirlpool_replay_trace_round_trips_with_string_u128_fields() {
+        // u128 fields (sqrt_price, liquidity) serialise as base-10
+        // strings. Round-trip pins both directions and the on-the-wire
+        // shape Vigil's BE will see.
+        let trace = WhirlpoolReplayTrace {
+            sqrt_price_pre: 1u128 << 64,
+            sqrt_price_post_front: (1u128 << 64) - 12_345,
+            sqrt_price_post_victim: (1u128 << 64) - 23_456,
+            sqrt_price_post_back: (1u128 << 64) - 1_000,
+            liquidity_pre: 1_500_000_000,
+            liquidity_post_front: 500_000_000,
+            liquidity_post_victim: 500_000_000,
+            liquidity_post_back: 1_500_000_000,
+            tick_current_pre: 0,
+            tick_current_post_front: -129,
+            tick_current_post_victim: -150,
+            tick_current_post_back: -1,
+            counterfactual_victim_out: 100,
+            actual_victim_out: 80,
+            fee_num: 3_000,
+            fee_den: 1_000_000,
+        };
+        let json = serde_json::to_string(&trace).expect("serialise");
+        // sqrt_price = 1<<64 = 18_446_744_073_709_551_616 — past u53,
+        // proves we serialise as string rather than JSON number.
+        assert!(
+            json.contains("\"sqrt_price_pre\":\"18446744073709551616\""),
+            "u128 sqrt_price should serialise as a base-10 string, got: {json}",
+        );
+        assert!(
+            json.contains("\"liquidity_pre\":\"1500000000\""),
+            "u128 liquidity should serialise as a base-10 string, got: {json}",
+        );
+        // Round-trip back.
+        let decoded: WhirlpoolReplayTrace = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(decoded, trace);
+    }
+
+    #[test]
+    fn sandwich_attack_skips_whirlpool_replay_when_none() {
+        // The new optional field is `skip_serializing_if = "Option::is_none"`
+        // — legacy ConstantProduct attacks must round-trip unchanged in
+        // shape (no rogue `whirlpool_replay: null` keys).
+        let attack = fresh_attack();
+        assert!(attack.whirlpool_replay.is_none());
+        let json = serde_json::to_string(&attack).expect("serialise");
+        assert!(
+            !json.contains("whirlpool_replay"),
+            "skip-on-None should keep the key out of the JSON; got: {json}",
+        );
+    }
+
+    #[test]
+    fn sandwich_attack_emits_whirlpool_replay_when_some() {
+        let mut attack = fresh_attack();
+        attack.dex = DexType::OrcaWhirlpool;
+        attack.whirlpool_replay = Some(WhirlpoolReplayTrace {
+            sqrt_price_pre: 1u128 << 64,
+            sqrt_price_post_front: 1u128 << 63,
+            sqrt_price_post_victim: 1u128 << 63,
+            sqrt_price_post_back: 1u128 << 64,
+            liquidity_pre: 1_000_000,
+            liquidity_post_front: 1_000_000,
+            liquidity_post_victim: 1_000_000,
+            liquidity_post_back: 1_000_000,
+            tick_current_pre: 0,
+            tick_current_post_front: -1,
+            tick_current_post_victim: -2,
+            tick_current_post_back: 0,
+            counterfactual_victim_out: 100,
+            actual_victim_out: 80,
+            fee_num: 3_000,
+            fee_den: 1_000_000,
+        });
+        let json = serde_json::to_string(&attack).expect("serialise");
+        let value: Value = serde_json::from_str(&json).expect("parse");
+        let trace = value
+            .get("whirlpool_replay")
+            .expect("whirlpool_replay key present when Some");
+        assert_eq!(
+            trace["sqrt_price_pre"].as_str(),
+            Some("18446744073709551616"),
+        );
+        assert_eq!(trace["tick_current_post_front"].as_i64(), Some(-1));
     }
 }
