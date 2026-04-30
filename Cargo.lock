@@ -3347,6 +3347,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "reqwest",
+ "sandwich-detector",
  "serde",
  "serde_json",
  "solana-client",
