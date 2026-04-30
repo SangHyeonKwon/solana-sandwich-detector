@@ -28,7 +28,8 @@ pub mod rpc;
 
 pub use constant_product::ConstantProduct;
 pub use counterfactual::{
-    compute_loss, compute_loss_whirlpool, compute_loss_with_trace, LossEstimate,
+    compute_loss, compute_loss_whirlpool, compute_loss_whirlpool_with_trace,
+    compute_loss_with_trace, LossEstimate,
 };
 pub use enrichment::{enrich_attack, EnrichmentResult};
 pub use lookup::{

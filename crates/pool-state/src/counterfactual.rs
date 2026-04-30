@@ -14,7 +14,7 @@
 //! All values are in the quote-token smallest unit (typically lamports for
 //! SOL-quoted pools, or USDC micro-units for USDC-quoted pools).
 
-use swap_events::types::{AmmReplayTrace, SandwichAttack, SwapDirection};
+use swap_events::types::{AmmReplayTrace, SandwichAttack, SwapDirection, WhirlpoolReplayTrace};
 
 use crate::orca_whirlpool::swap_math;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
@@ -235,35 +235,35 @@ fn reserves_to_u64(pool: &ConstantProduct) -> (u64, u64) {
     )
 }
 
-/// Replay a detected sandwich through a Whirlpool pool, *within-tick only*.
+/// Replay a detected sandwich through a Whirlpool pool, returning the
+/// loss estimate paired with a per-step [`WhirlpoolReplayTrace`].
 ///
-/// Returns `None` when:
-///   * direction invariants break (same as [`compute_loss`]),
-///   * any leg's swap can't be computed by either the within-tick fast
-///     path or the cross-tick fallback (caller fed too few `tick_arrays`,
-///     liquidity drains to zero mid-walk, etc).
+/// Mirrors [`compute_loss_with_trace`] for the V3-style swap math:
+/// same `LossEstimate` shape, same `Option` failure modes, plus a
+/// snapshot of `(sqrt_price, liquidity, tick_current)` at the four
+/// canonical checkpoints (pre-frontrun, post-frontrun, post-victim,
+/// post-back) so a reader can re-derive victim_loss from the raw
+/// concentrated-liquidity arithmetic.
 ///
 /// `tick_arrays` is the caller's pre-fetched view of the Whirlpool's
 /// TickArrays, in any order — the helper sorts per-leg by swap
 /// direction. Pass `&[]` to disable the cross-tick fallback (tests do
-/// this for the within-tick-only paths). Production callers obtain the
-/// arrays via [`crate::PoolStateLookup::tick_arrays`].
+/// this for the within-tick-only paths). Production callers obtain
+/// the arrays via [`crate::PoolStateLookup::tick_arrays`].
 ///
-/// Output shape mirrors [`compute_loss`] (same `LossEstimate` fields),
-/// so callers can hand both DEX kinds through the same downstream
-/// pipeline (severity derivation, signal emission). `AmmReplayTrace`
-/// isn't returned because Whirlpool replay doesn't yet have a trace
-/// shape — vault reserves don't represent active-liquidity reserves
-/// under concentrated liquidity, and a meaningful trace would need
-/// sqrt_price + tick state per step. Surfacing that lives in a follow-up.
-pub fn compute_loss_whirlpool(
+/// Returns `None` when:
+///   * direction invariants break (same as [`compute_loss`]),
+///   * any leg's swap can't be computed by either the within-tick
+///     fast path or the cross-tick fallback (caller fed too few
+///     `tick_arrays`, liquidity drains to zero mid-walk, etc).
+pub fn compute_loss_whirlpool_with_trace(
     attack: &SandwichAttack,
     pool_0: WhirlpoolPool,
     fee_num: u128,
     fee_den: u128,
     base_is_token_a: bool,
     tick_arrays: &[ParsedTickArray],
-) -> Option<LossEstimate> {
+) -> Option<(LossEstimate, WhirlpoolReplayTrace)> {
     // Direction sanity (mirrors compute_loss_with_trace).
     if attack.victim.direction != attack.frontrun.direction {
         return None;
@@ -337,7 +337,7 @@ pub fn compute_loss_whirlpool(
     };
 
     // 4. Backrun on pool_2.
-    let (_pool_3, backrun_out, _b_fee) = try_swap_with_fallback(
+    let (pool_3, backrun_out, _b_fee) = try_swap_with_fallback(
         pool_2,
         attack.backrun.amount_in as u128,
         backrun_a_to_b,
@@ -404,7 +404,7 @@ pub fn compute_loss_whirlpool(
         _ => (None, None),
     };
 
-    Some(LossEstimate {
+    let loss = LossEstimate {
         victim_loss,
         attacker_profit_real,
         price_impact_bps,
@@ -416,7 +416,54 @@ pub fn compute_loss_whirlpool(
         counterfactual_attacker_profit_no_victim,
         victim_loss_lower,
         victim_loss_upper,
-    })
+    };
+
+    let trace = WhirlpoolReplayTrace {
+        sqrt_price_pre: pool_0.sqrt_price_q64,
+        sqrt_price_post_front: pool_1.sqrt_price_q64,
+        sqrt_price_post_victim: pool_2.sqrt_price_q64,
+        sqrt_price_post_back: pool_3.sqrt_price_q64,
+        liquidity_pre: pool_0.liquidity,
+        liquidity_post_front: pool_1.liquidity,
+        liquidity_post_victim: pool_2.liquidity,
+        liquidity_post_back: pool_3.liquidity,
+        tick_current_pre: pool_0.tick_current_index,
+        tick_current_post_front: pool_1.tick_current_index,
+        tick_current_post_victim: pool_2.tick_current_index,
+        tick_current_post_back: pool_3.tick_current_index,
+        counterfactual_victim_out: narrow_u64(counterfactual_victim_out),
+        actual_victim_out: narrow_u64(actual_victim_out),
+        // fee_num / fee_den come in as u128 to match the swap-math
+        // layer; Whirlpool's on-chain fee_rate is u16 of hundredths-
+        // of-bps against a u32 1_000_000 denominator, so narrowing
+        // here is lossless for any legal pool.
+        fee_num: fee_num as u32,
+        fee_den: fee_den as u32,
+    };
+
+    Some((loss, trace))
+}
+
+/// Like [`compute_loss_whirlpool_with_trace`] but discards the trace.
+/// Use this when the caller only needs the [`LossEstimate`] (e.g.,
+/// downstream code that doesn't surface the per-step replay view).
+pub fn compute_loss_whirlpool(
+    attack: &SandwichAttack,
+    pool_0: WhirlpoolPool,
+    fee_num: u128,
+    fee_den: u128,
+    base_is_token_a: bool,
+    tick_arrays: &[ParsedTickArray],
+) -> Option<LossEstimate> {
+    compute_loss_whirlpool_with_trace(
+        attack,
+        pool_0,
+        fee_num,
+        fee_den,
+        base_is_token_a,
+        tick_arrays,
+    )
+    .map(|(loss, _trace)| loss)
 }
 
 /// Whirlpool spot price (token_b per token_a) from a Q64.64 sqrt_price.
@@ -966,6 +1013,58 @@ mod tests {
             .expect("cross-tick fallback should resolve all legs");
         assert!(loss.victim_loss > 0, "got victim_loss={}", loss.victim_loss);
         assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
+    }
+
+    /// Trace captures the per-step pool state so a reader can re-derive
+    /// the swap arithmetic from raw sqrt_price / liquidity / tick.
+    /// Pin the four checkpoints against the inputs the helper saw, plus
+    /// the direction-correct sqrt_price drop (a→b ⇒ price decreasing).
+    #[test]
+    fn whirlpool_trace_captures_per_step_state() {
+        let pool_0 = make_whirlpool(1_000_000_000_000, 10, 64);
+        // Pre-simulate the frontrun (within-tick at this fixture) so the
+        // backrun's amount_in matches the attacker's actual output.
+        let (_, fr_out, _) = pool_0
+            .apply_swap_within_tick(100_000_000, false, 3_000, 1_000_000)
+            .expect("frontrun within-tick");
+        let mut attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 100_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 10_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 0, 0),
+        );
+        attack.backrun.amount_in = fr_out as u64;
+
+        let (loss, trace) =
+            compute_loss_whirlpool_with_trace(&attack, pool_0, 3_000, 1_000_000, true, &[])
+                .expect("within-tick replay should resolve");
+
+        // Pre-frontrun checkpoint matches the input pool exactly.
+        assert_eq!(trace.sqrt_price_pre, pool_0.sqrt_price_q64);
+        assert_eq!(trace.liquidity_pre, pool_0.liquidity);
+        assert_eq!(trace.tick_current_pre, pool_0.tick_current_index);
+
+        // Buy-first sandwich with base_is_token_a=true ⇒ frontrun is
+        // b→a ⇒ sqrt_price *rises*. Subsequent leg cycles back partway.
+        assert!(trace.sqrt_price_post_front > trace.sqrt_price_pre);
+        assert!(trace.sqrt_price_post_victim >= trace.sqrt_price_post_front);
+        // Backrun is a→b (Sell) ⇒ sqrt_price drops back below post-victim.
+        assert!(trace.sqrt_price_post_back < trace.sqrt_price_post_victim);
+
+        // Within-tick path keeps liquidity constant across all four
+        // checkpoints (no tick boundary crossed at this fixture's scale).
+        assert_eq!(trace.liquidity_pre, trace.liquidity_post_front);
+        assert_eq!(trace.liquidity_post_front, trace.liquidity_post_victim);
+        assert_eq!(trace.liquidity_post_victim, trace.liquidity_post_back);
+
+        // Trace's victim figures match the LossEstimate.
+        assert_eq!(trace.actual_victim_out, loss.actual_victim_out);
+        assert_eq!(
+            trace.counterfactual_victim_out,
+            loss.counterfactual_victim_out,
+        );
+        // Fee fields propagate.
+        assert_eq!(trace.fee_num, 3_000);
+        assert_eq!(trace.fee_den, 1_000_000);
     }
 
     /// `base_is_token_a=false` (base sits on token_b — happens when

@@ -20,8 +20,8 @@ use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
 use crate::{
-    compute_loss_whirlpool, compute_loss_with_trace, diff_test, reserves, ConstantProduct,
-    PoolStateLookup,
+    compute_loss_whirlpool_with_trace, compute_loss_with_trace, diff_test, reserves,
+    ConstantProduct, PoolStateLookup,
 };
 
 /// Outcome of an enrichment attempt. Signals *why* it failed so callers can
@@ -70,13 +70,13 @@ pub async fn enrich_attack(
         return EnrichmentResult::ConfigUnavailable;
     };
 
-    // Dispatch by AMM kind. Each path produces (loss, trace_opt,
-    // pool_quote_tvl) — `trace_opt` is `Some` only for the constant-
-    // product path because Whirlpool's "trace" needs sqrt_price + tick
-    // state per step, which doesn't fit AmmReplayTrace's reserves-tuple
-    // shape (follow-up). Common attack-field / signal wiring runs after
-    // the match.
-    let (loss, trace_opt, pool_quote_tvl) = match config.kind {
+    // Dispatch by AMM kind. Each path produces (loss,
+    // amm_replay_trace_opt, whirlpool_replay_trace_opt,
+    // pool_quote_tvl). The two trace options are mutually exclusive —
+    // ConstantProduct fills `amm_replay_trace_opt`, Whirlpool fills
+    // `whirlpool_replay_trace_opt`. Common attack-field / signal
+    // wiring runs after the match.
+    let (loss, trace_opt, whirlpool_trace_opt, pool_quote_tvl) = match config.kind {
         AmmKind::RaydiumV4 | AmmKind::RaydiumCpmm => {
             let Some(tx_reserves) = reserves::extract(frontrun_tx, &config) else {
                 let accounts: Vec<&str> = frontrun_tx
@@ -102,7 +102,7 @@ pub async fn enrich_attack(
             let Some((loss, trace)) = compute_loss_with_trace(attack, pool_0) else {
                 return EnrichmentResult::ReplayFailed;
             };
-            (loss, Some(trace), tx_reserves.pre.1)
+            (loss, Some(trace), None, tx_reserves.pre.1)
         }
         AmmKind::OrcaWhirlpool => {
             // Within-tick Whirlpool replay (Tier 3.4 step 4-α). Needs
@@ -158,7 +158,7 @@ pub async fn enrich_attack(
                 .into_iter()
                 .flatten()
                 .collect();
-            let Some(loss) = compute_loss_whirlpool(
+            let Some((loss, whirlpool_trace)) = compute_loss_whirlpool_with_trace(
                 attack,
                 pool_0,
                 config.fee_num as u128,
@@ -176,7 +176,7 @@ pub async fn enrich_attack(
             let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
                 .map(|r| r.pre.1)
                 .unwrap_or(0);
-            (loss, None, pool_quote_tvl)
+            (loss, None, Some(whirlpool_trace), pool_quote_tvl)
         }
     };
 
@@ -272,6 +272,9 @@ pub async fn enrich_attack(
     }
     if let Some(trace) = trace_opt {
         attack.amm_replay = Some(trace);
+    }
+    if let Some(whirlpool_trace) = whirlpool_trace_opt {
+        attack.whirlpool_replay = Some(whirlpool_trace);
     }
 
     EnrichmentResult::Enriched
@@ -714,7 +717,17 @@ mod tests {
         assert_eq!(result, EnrichmentResult::Enriched);
         assert!(attack.victim_loss_lamports.is_some());
         assert!(attack.attacker_profit.is_some());
+        // Whirlpool path doesn't populate the constant-product trace.
         assert!(attack.amm_replay.is_none());
+        // It does populate the Whirlpool-specific trace (Tier 3.4 trace-β).
+        let trace = attack.whirlpool_replay.expect("whirlpool_replay populated");
+        // Pre-state matches the dynamic state the lookup served.
+        assert_eq!(
+            trace.sqrt_price_pre,
+            crate::orca_whirlpool::tick_math::sqrt_price_at_tick(10),
+        );
+        assert_eq!(trace.liquidity_pre, 1_000_000_000_000);
+        assert_eq!(trace.tick_current_pre, 10);
     }
 
     /// TickArray fixture builder: sparse `(slot, liquidity_net)`
@@ -791,6 +804,11 @@ mod tests {
         assert_eq!(result, EnrichmentResult::Enriched);
         assert!(attack.victim_loss_lamports.is_some());
         assert!(attack.attacker_profit.is_some());
+        // Cross-tick path also populates the Whirlpool trace — the
+        // post-front liquidity should differ from pre when a boundary
+        // gets crossed (LP1 deactivates as the swap exits its range).
+        let trace = attack.whirlpool_replay.expect("whirlpool_replay populated");
+        assert_eq!(trace.liquidity_pre, 1_500_000_000);
     }
 
     #[tokio::test]
