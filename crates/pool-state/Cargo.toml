@@ -16,3 +16,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bs58 = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
