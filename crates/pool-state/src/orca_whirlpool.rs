@@ -48,6 +48,8 @@
 //! Reference:
 //!   <https://github.com/orca-so/whirlpools/blob/main/programs/whirlpool/src/state/whirlpool.rs>
 
+use std::str::FromStr;
+
 use solana_sdk::pubkey::Pubkey;
 use swap_events::dex::is_quote_mint;
 
@@ -75,6 +77,16 @@ const MIN_LAYOUT_LEN: usize = TOKEN_VAULT_B_OFFSET + 32; // 245
 /// formula it uses for Raydium.
 const FEE_RATE_DEN: u64 = 1_000_000;
 const DEFAULT_FEE_RATE_HUNDREDTHS_BPS: u64 = 3_000; // 30 bps
+
+/// Whirlpool program ID on Solana mainnet. Used by [`tick_array::tick_array_pda`]
+/// to derive the on-chain TickArray account address from `(whirlpool,
+/// start_tick_index)`. Decoded once per call from the hardcoded base58 —
+/// the cost is a few microseconds and we'd rather not pull a `pubkey!`
+/// macro into the dependency graph just for a constant.
+pub fn whirlpool_program_id() -> Pubkey {
+    Pubkey::from_str("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")
+        .expect("whirlpool program id is a hardcoded valid base58 pubkey")
+}
 
 /// Snapshot of the Whirlpool's mutable swap-relevant state at a point in
 /// time. The static side (vaults, mints, fee rate) goes in [`PoolConfig`];
@@ -674,6 +686,8 @@ pub mod swap_math {
 /// Reference:
 ///   <https://github.com/orca-so/whirlpools/blob/main/programs/whirlpool/src/state/tick.rs>
 pub mod tick_array {
+    use solana_sdk::pubkey::Pubkey;
+
     /// Number of ticks per `TickArray` account (Whirlpool program
     /// constant — fixed by the on-chain layout).
     pub const TICK_ARRAY_SIZE: usize = 88;
@@ -758,6 +772,39 @@ pub mod tick_array {
             start_tick_index,
             ticks,
         })
+    }
+
+    /// Tick span (in ticks) one TickArray account covers, given the
+    /// parent pool's `tick_spacing`. Always `TICK_ARRAY_SIZE *
+    /// tick_spacing`.
+    pub fn ticks_per_array_span(tick_spacing: u16) -> i32 {
+        (tick_spacing as i32) * (TICK_ARRAY_SIZE as i32)
+    }
+
+    /// `start_tick_index` of the TickArray that contains `tick_current`.
+    /// Always a multiple of `ticks_per_array_span(tick_spacing)`. Floors
+    /// negative ticks toward `-∞` (Rust's `/` would round toward zero,
+    /// landing in the array *above* a negative tick).
+    pub fn start_tick_index_for(tick_current: i32, tick_spacing: u16) -> i32 {
+        super::floor_to_spacing(tick_current, ticks_per_array_span(tick_spacing))
+    }
+
+    /// Whirlpool TickArray PDA. Seeds:
+    /// `[b"tick_array", whirlpool, start_tick_index_decimal_string]`.
+    /// Returned tuple is `(pda, bump)` from
+    /// `Pubkey::find_program_address`.
+    ///
+    /// Note that the third seed is the *base-10 ASCII* of
+    /// `start_tick_index` (including a leading minus for negatives) —
+    /// not its little-endian byte representation. Mirroring the Whirlpool
+    /// program's own derivation is the only thing that makes the PDA
+    /// match the on-chain account.
+    pub fn tick_array_pda(whirlpool: &Pubkey, start_tick_index: i32) -> (Pubkey, u8) {
+        let start_str = start_tick_index.to_string();
+        Pubkey::find_program_address(
+            &[b"tick_array", whirlpool.as_ref(), start_str.as_bytes()],
+            &super::whirlpool_program_id(),
+        )
     }
 
     fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
@@ -849,6 +896,67 @@ pub mod tick_array {
             assert_eq!(p.ticks[0].liquidity_net, i128::MAX);
             assert_eq!(p.ticks[1].liquidity_net, i128::MIN);
             assert_eq!(p.ticks[2].liquidity_net, -1);
+        }
+
+        #[test]
+        fn start_tick_index_for_handles_positives_and_zero() {
+            // tick_spacing=64 ⇒ array span = 88 * 64 = 5632.
+            assert_eq!(start_tick_index_for(0, 64), 0);
+            assert_eq!(start_tick_index_for(5631, 64), 0);
+            assert_eq!(start_tick_index_for(5632, 64), 5632);
+            assert_eq!(start_tick_index_for(11264, 64), 11264);
+            assert_eq!(start_tick_index_for(11265, 64), 11264);
+        }
+
+        #[test]
+        fn start_tick_index_for_floors_negatives_toward_minus_infinity() {
+            // The case where Rust's `/` would land in the array *above*
+            // (because trunc-toward-zero on negatives). Pin the proper
+            // floor.
+            assert_eq!(start_tick_index_for(-1, 64), -5632);
+            assert_eq!(start_tick_index_for(-5632, 64), -5632);
+            assert_eq!(start_tick_index_for(-5633, 64), -11264);
+            assert_eq!(start_tick_index_for(-11264, 64), -11264);
+        }
+
+        #[test]
+        fn ticks_per_array_span_is_size_times_spacing() {
+            assert_eq!(ticks_per_array_span(1), 88);
+            assert_eq!(ticks_per_array_span(64), 88 * 64);
+            assert_eq!(ticks_per_array_span(128), 88 * 128);
+        }
+
+        #[test]
+        fn tick_array_pda_is_deterministic() {
+            // PDA derivation is content-addressable: same (pool,
+            // start_tick_index) ⇒ same PDA. Pin determinism without
+            // hardcoding a mainnet address — the program-id constant
+            // already pins us to the right curve.
+            let pool = Pubkey::new_unique();
+            let (pda1, bump1) = tick_array_pda(&pool, 5632);
+            let (pda2, bump2) = tick_array_pda(&pool, 5632);
+            assert_eq!(pda1, pda2);
+            assert_eq!(bump1, bump2);
+            // Different start_tick_index ⇒ different PDA.
+            let (pda_other, _) = tick_array_pda(&pool, 0);
+            assert_ne!(pda1, pda_other);
+            // Different pool ⇒ different PDA.
+            let other_pool = Pubkey::new_unique();
+            let (pda_other_pool, _) = tick_array_pda(&other_pool, 5632);
+            assert_ne!(pda1, pda_other_pool);
+        }
+
+        #[test]
+        fn tick_array_pda_handles_negative_start_tick_index() {
+            // Negative starts go through `to_string()` ⇒ leading minus.
+            // Mirror the Whirlpool program's seed exactly is what makes
+            // the PDA match on-chain. Just pin determinism here; the
+            // cross-tick walk's integration tests will exercise the
+            // negative-index path against real fixtures.
+            let pool = Pubkey::new_unique();
+            let (pda, _) = tick_array_pda(&pool, -5632);
+            assert_eq!(pda, tick_array_pda(&pool, -5632).0);
+            assert_ne!(pda, tick_array_pda(&pool, 5632).0);
         }
     }
 }
