@@ -129,12 +129,17 @@ pub async fn enrich_attack(
                     fee_rate_hundredths_bps: 0,
                 },
             };
+            // Pass an empty `tick_arrays` slice for now — within-tick
+            // only. Step 3-δ-2-b plumbs the lookup's TickArray fetch
+            // through and narrows CrossTickUnsupported to the case
+            // where even the cross-tick fallback can't resolve.
             let Some(loss) = compute_loss_whirlpool(
                 attack,
                 pool_0,
                 config.fee_num as u128,
                 config.fee_den as u128,
                 config.base_is_token_a,
+                &[],
             ) else {
                 return EnrichmentResult::CrossTickUnsupported;
             };
