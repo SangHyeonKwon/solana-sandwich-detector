@@ -420,6 +420,7 @@ async fn enrichment_produces_victim_loss_on_fixture() {
             quote_mint: v2.mint.clone(),
             fee_num: 25,
             fee_den: 10_000,
+            base_is_token_a: false,
         };
         configs.insert(attack.pool.clone(), config);
     }

@@ -49,6 +49,14 @@ pub struct PoolConfig {
     pub quote_mint: String,
     pub fee_num: u64,
     pub fee_den: u64,
+    /// Whether `base_mint` corresponds to `token_a` in the on-chain pool's
+    /// (a, b) ordering. Concentrated-liquidity DEXes whose math is keyed
+    /// on the a/b axis (Whirlpool's `sqrt(b/a)` price, V3-style swap
+    /// formulas) need this to map a SwapDirection (Buy/Sell, in
+    /// quote-terms) to the math layer's `a_to_b` flag. Constant-product
+    /// DEXes don't care: they read everything from `vault_base` /
+    /// `vault_quote` directly, so leave this at the default `false`.
+    pub base_is_token_a: bool,
 }
 
 /// Slot-anchored *dynamic* pool state — the swap-relevant fields that

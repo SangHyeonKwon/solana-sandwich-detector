@@ -185,20 +185,28 @@ pub fn parse_config(pool_address: &str, account_data: &[u8]) -> Option<PoolConfi
     let mint_b_s = mint_b.to_string();
     // Whirlpool's a/b convention isn't inherently quote-aware, so orient
     // base/quote against the recognised quote-mint set. Same fallback as
-    // Raydium V4: refuse to enrich memecoin/memecoin pairs.
-    let (vault_base, vault_quote, base_mint, quote_mint) =
+    // Raydium V4: refuse to enrich memecoin/memecoin pairs. Track which
+    // side base lands on (`base_is_token_a`) so the swap-math layer can
+    // map SwapDirection → a_to_b correctly — Whirlpool's V3-style math
+    // is keyed on a/b, not base/quote.
+    let (vault_base, vault_quote, base_mint, quote_mint, base_is_token_a) =
         match (is_quote_mint(&mint_a_s), is_quote_mint(&mint_b_s)) {
             (true, false) => (
                 vault_b.to_string(),
                 vault_a.to_string(),
                 mint_b_s,
                 mint_a_s,
+                // mint_a is quote ⇒ base sits on mint_b ⇒ token_b.
+                false,
             ),
             (false, true) | (true, true) => (
                 vault_a.to_string(),
                 vault_b.to_string(),
                 mint_a_s,
                 mint_b_s,
+                // mint_b is quote (or both are: pick mint_a as base) ⇒
+                // base sits on mint_a ⇒ token_a.
+                true,
             ),
             (false, false) => return None,
         };
@@ -219,6 +227,7 @@ pub fn parse_config(pool_address: &str, account_data: &[u8]) -> Option<PoolConfi
         quote_mint,
         fee_num,
         fee_den,
+        base_is_token_a,
     })
 }
 
