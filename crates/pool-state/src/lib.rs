@@ -35,4 +35,5 @@ pub use lookup::{
     AmmKind, DynamicPoolState, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup,
     SlotLeaderLookup,
 };
+pub use orca_whirlpool::tick_array::{ParsedTickArray, TickData};
 pub use rpc::{RpcPoolLookup, RpcSlotLeaderLookup, SLOT_LEADER_PAGE_SIZE};

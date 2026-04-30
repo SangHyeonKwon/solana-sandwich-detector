@@ -7,6 +7,8 @@
 use async_trait::async_trait;
 use swap_events::types::DexType;
 
+use crate::orca_whirlpool::tick_array::ParsedTickArray;
+
 /// Kind of AMM that backs a pool — determines which math to apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmmKind {
@@ -109,6 +111,28 @@ pub trait PoolStateLookup: Send + Sync {
     ) -> Option<DynamicPoolState> {
         None
     }
+
+    /// Fetch one or more `TickArray` accounts for a Whirlpool pool, in
+    /// the order the caller asked for them. Returned `Vec` aligns 1:1
+    /// with `start_indices` — `None` at index `i` means the slot's
+    /// account was missing or the RPC failed for that slot.
+    ///
+    /// Default returns an empty `Vec` (not 1:1) — implementations that
+    /// don't speak the TickArray protocol stay opt-in. Callers should
+    /// treat `result.len() != start_indices.len()` as "not supported"
+    /// and fall back to within-tick replay.
+    ///
+    /// `slot` carries the same caveat as [`Self::pool_dynamic_state`] —
+    /// passed through but not yet plumbed to archival providers.
+    async fn tick_arrays(
+        &self,
+        _pool: &str,
+        _dex: DexType,
+        _start_indices: &[i32],
+        _slot: u64,
+    ) -> Vec<Option<ParsedTickArray>> {
+        Vec::new()
+    }
 }
 
 /// No-op lookup: returns `None` for every pool. Used when pool-state
@@ -170,5 +194,17 @@ mod tests {
             .pool_dynamic_state("any-pool", DexType::OrcaWhirlpool, 0)
             .await
             .is_none());
+    }
+
+    /// Same shape for `tick_arrays`: the default impl returns an empty
+    /// `Vec` so callers can detect "not supported" via length mismatch
+    /// (`result.len() != start_indices.len()`).
+    #[tokio::test]
+    async fn no_pool_lookup_tick_arrays_returns_empty() {
+        let lookup = NoPoolLookup;
+        let result = lookup
+            .tick_arrays("any-pool", DexType::OrcaWhirlpool, &[0, 5632], 0)
+            .await;
+        assert!(result.is_empty());
     }
 }

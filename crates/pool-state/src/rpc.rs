@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLookup};
+use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::{orca_whirlpool, raydium_cpmm, raydium_v4};
 
 pub struct RpcPoolLookup {
@@ -126,6 +127,51 @@ impl PoolStateLookup for RpcPoolLookup {
             tick_current_index: pool_state.tick_current_index,
             tick_spacing: pool_state.tick_spacing,
         })
+    }
+
+    /// Fetch one or more Whirlpool TickArray accounts via
+    /// `getMultipleAccounts`. PDA is derived per-slot from
+    /// `(pool, start_tick_index)`; missing accounts (slot uninitialised
+    /// on-chain or RPC dropped them) come back as `None` at the
+    /// matching index. A whole-call RPC failure fills the result with
+    /// `None`s of the right length so callers can still match
+    /// `start_indices` slot-by-slot.
+    ///
+    /// Not cached — TickArray contents change every swap that crosses
+    /// or initialises a tick within the array. A stale snapshot would
+    /// silently produce wrong replay results.
+    async fn tick_arrays(
+        &self,
+        pool: &str,
+        dex: DexType,
+        start_indices: &[i32],
+        _slot: u64,
+    ) -> Vec<Option<ParsedTickArray>> {
+        if !matches!(dex, DexType::OrcaWhirlpool) || start_indices.is_empty() {
+            return Vec::new();
+        }
+        let pool_pubkey = match pool.parse::<Pubkey>() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(pool, error = %e, "invalid pool pubkey for tick arrays");
+                return start_indices.iter().map(|_| None).collect();
+            }
+        };
+        let pdas: Vec<Pubkey> = start_indices
+            .iter()
+            .map(|&start| orca_whirlpool::tick_array::tick_array_pda(&pool_pubkey, start).0)
+            .collect();
+        let accounts = match self.client.get_multiple_accounts(&pdas).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(pool, error = %e, "tick array fetch failed");
+                return start_indices.iter().map(|_| None).collect();
+            }
+        };
+        accounts
+            .into_iter()
+            .map(|opt| opt.and_then(|a| orca_whirlpool::tick_array::parse_tick_array(&a.data)))
+            .collect()
     }
 }
 

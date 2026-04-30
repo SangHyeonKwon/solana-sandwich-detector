@@ -16,6 +16,8 @@
 
 use swap_events::types::{AmmReplayTrace, SandwichAttack, SwapDirection};
 
+use crate::orca_whirlpool::swap_math;
+use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::orca_whirlpool::WhirlpoolPool;
 use crate::ConstantProduct;
 
@@ -237,25 +239,30 @@ fn reserves_to_u64(pool: &ConstantProduct) -> (u64, u64) {
 ///
 /// Returns `None` when:
 ///   * direction invariants break (same as [`compute_loss`]),
-///   * any of the three swap legs (frontrun / victim / counterfactual /
-///     backrun / counterfactual-no-victim) crosses a tick boundary —
-///     within-tick replay can't compute the post-cross sqrt_price without
-///     the next initialised TickArray's `liquidity_net`, so we bail. The
-///     cross-tick path lands in step 3-γ/δ.
+///   * any leg's swap can't be computed by either the within-tick fast
+///     path or the cross-tick fallback (caller fed too few `tick_arrays`,
+///     liquidity drains to zero mid-walk, etc).
 ///
-/// Output shape mirrors [`compute_loss`] (same `LossEstimate` fields), so
-/// callers can hand both DEX kinds through the same downstream pipeline
-/// (severity derivation, signal emission). `AmmReplayTrace` isn't returned
-/// because Whirlpool replay doesn't yet have a trace shape — vault
-/// reserves don't represent active-liquidity reserves under concentrated
-/// liquidity, and a meaningful trace would need sqrt_price + tick state
-/// per step. Surfacing that lives in a follow-up.
+/// `tick_arrays` is the caller's pre-fetched view of the Whirlpool's
+/// TickArrays, in any order — the helper sorts per-leg by swap
+/// direction. Pass `&[]` to disable the cross-tick fallback (tests do
+/// this for the within-tick-only paths). Production callers obtain the
+/// arrays via [`crate::PoolStateLookup::tick_arrays`].
+///
+/// Output shape mirrors [`compute_loss`] (same `LossEstimate` fields),
+/// so callers can hand both DEX kinds through the same downstream
+/// pipeline (severity derivation, signal emission). `AmmReplayTrace`
+/// isn't returned because Whirlpool replay doesn't yet have a trace
+/// shape — vault reserves don't represent active-liquidity reserves
+/// under concentrated liquidity, and a meaningful trace would need
+/// sqrt_price + tick state per step. Surfacing that lives in a follow-up.
 pub fn compute_loss_whirlpool(
     attack: &SandwichAttack,
     pool_0: WhirlpoolPool,
     fee_num: u128,
     fee_den: u128,
     base_is_token_a: bool,
+    tick_arrays: &[ParsedTickArray],
 ) -> Option<LossEstimate> {
     // Direction sanity (mirrors compute_loss_with_trace).
     if attack.victim.direction != attack.frontrun.direction {
@@ -292,27 +299,33 @@ pub fn compute_loss_whirlpool(
     };
 
     // 1. Frontrun on pool_0.
-    let (pool_1, fr_out, _fr_fee) = pool_0.apply_swap_within_tick(
+    let (pool_1, fr_out, _fr_fee) = try_swap_with_fallback(
+        pool_0,
         attack.frontrun.amount_in as u128,
         frontrun_a_to_b,
         fee_num,
         fee_den,
+        tick_arrays,
     )?;
 
     // 2. Victim on pool_1 (actual outcome).
-    let (pool_2, actual_victim_out, _v_fee) = pool_1.apply_swap_within_tick(
+    let (pool_2, actual_victim_out, _v_fee) = try_swap_with_fallback(
+        pool_1,
         attack.victim.amount_in as u128,
         victim_a_to_b,
         fee_num,
         fee_den,
+        tick_arrays,
     )?;
 
     // 3. Counterfactual: victim on pool_0 (no frontrun).
-    let (_pool_no_frontrun, counterfactual_victim_out, _) = pool_0.apply_swap_within_tick(
+    let (_pool_no_frontrun, counterfactual_victim_out, _) = try_swap_with_fallback(
+        pool_0,
         attack.victim.amount_in as u128,
         victim_a_to_b,
         fee_num,
         fee_den,
+        tick_arrays,
     )?;
 
     // Loss in quote-token smallest units (same normalisation as
@@ -324,11 +337,13 @@ pub fn compute_loss_whirlpool(
     };
 
     // 4. Backrun on pool_2.
-    let (_pool_3, backrun_out, _b_fee) = pool_2.apply_swap_within_tick(
+    let (_pool_3, backrun_out, _b_fee) = try_swap_with_fallback(
+        pool_2,
         attack.backrun.amount_in as u128,
         backrun_a_to_b,
         fee_num,
         fee_den,
+        tick_arrays,
     )?;
 
     let raw_profit = (backrun_out as i64) - (attack.frontrun.amount_in as i64);
@@ -347,11 +362,13 @@ pub fn compute_loss_whirlpool(
         (((quote_per_base_1 - quote_per_base_0) / quote_per_base_0).abs() * 10_000.0) as u32;
 
     // Counterfactual attacker (Tier 3.5): backrun on pool_1 (no victim).
-    let (_pool_no_victim, backrun_out_no_victim, _) = pool_1.apply_swap_within_tick(
+    let (_pool_no_victim, backrun_out_no_victim, _) = try_swap_with_fallback(
+        pool_1,
         attack.backrun.amount_in as u128,
         backrun_a_to_b,
         fee_num,
         fee_den,
+        tick_arrays,
     )?;
     let raw_profit_no_victim = backrun_out_no_victim as i64 - attack.frontrun.amount_in as i64;
     let counterfactual_attacker_profit_no_victim = match attack.frontrun.direction {
@@ -416,6 +433,48 @@ fn whirlpool_spot_price_b_per_a(pool: WhirlpoolPool) -> f64 {
 /// returns u128 and we want a deterministic floor on malformed inputs.
 fn narrow_u64(amount: u128) -> u64 {
     amount.min(u64::MAX as u128) as u64
+}
+
+/// Try to apply a single swap leg, falling back from within-tick to
+/// cross-tick when the within-tick guard trips. Empty `tick_arrays`
+/// disables the fallback — the within-tick result is the only chance.
+///
+/// Return shape matches [`WhirlpoolPool::apply_swap_within_tick`]:
+/// `(new_pool, amount_out, fee_amount)`.
+fn try_swap_with_fallback(
+    pool: WhirlpoolPool,
+    amount: u128,
+    a_to_b: bool,
+    fee_num: u128,
+    fee_den: u128,
+    tick_arrays: &[ParsedTickArray],
+) -> Option<(WhirlpoolPool, u128, u128)> {
+    if let Some(r) = pool.apply_swap_within_tick(amount, a_to_b, fee_num, fee_den) {
+        return Some(r);
+    }
+    if tick_arrays.is_empty() {
+        return None;
+    }
+    let sorted = sort_arrays_for_direction(tick_arrays, a_to_b);
+    let r = swap_math::cross_tick_swap(pool, amount, a_to_b, fee_num, fee_den, &sorted)?;
+    Some((r.pool, r.amount_out, r.fee_amount))
+}
+
+/// Wrap caller-supplied `tick_arrays` in the `Vec<Option<ParsedTickArray>>`
+/// shape `cross_tick_swap` expects, sorted into swap order:
+///   * `a_to_b = true`  ⇒ descending `start_tick_index` (tick decreasing).
+///   * `a_to_b = false` ⇒ ascending  `start_tick_index` (tick increasing).
+fn sort_arrays_for_direction(
+    arrays: &[ParsedTickArray],
+    a_to_b: bool,
+) -> Vec<Option<ParsedTickArray>> {
+    let mut sorted = arrays.to_vec();
+    if a_to_b {
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.start_tick_index));
+    } else {
+        sorted.sort_by_key(|a| a.start_tick_index);
+    }
+    sorted.into_iter().map(Some).collect()
 }
 
 #[cfg(test)]
@@ -785,7 +844,7 @@ mod tests {
         );
         attack.backrun.amount_in = fr_out as u64;
 
-        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true)
+        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &[])
             .expect("within-tick replay should succeed on this fixture");
         assert!(
             loss.victim_loss > 0,
@@ -808,7 +867,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 1, 0),
             swap("b", "atk", SwapDirection::Sell, 1, 0),
         );
-        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),);
+        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &[]).is_none(),);
     }
 
     /// Direction mismatch (victim opposite frontrun) — same invariant
@@ -821,7 +880,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Sell, 100_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),);
+        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &[]).is_none(),);
     }
 
     #[test]
@@ -832,7 +891,80 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 100_000, 0),
             swap("b", "atk", SwapDirection::Buy, 100_000, 0),
         );
-        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),);
+        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &[]).is_none(),);
+    }
+
+    /// Multi-LP TickArray fixture for the cross-tick test below. Same
+    /// shape as the cross_tick_swap unit tests: LP1 covers `[-128,
+    /// 128]` with 1B liquidity, LP2 covers `[-2048, 2048]` with 500M.
+    /// Pool starts at tick=0 with both LPs active (1.5B total).
+    fn double_lp_arrays() -> Vec<crate::orca_whirlpool::tick_array::ParsedTickArray> {
+        use crate::orca_whirlpool::tick_array::{ParsedTickArray, TickData, TICK_ARRAY_SIZE};
+        fn array(start: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
+            let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+            for (i, net) in slots {
+                ticks[*i] = TickData {
+                    initialised: true,
+                    liquidity_net: *net,
+                };
+            }
+            ParsedTickArray {
+                start_tick_index: start,
+                ticks,
+            }
+        }
+        vec![
+            array(0, &[(2, -1_000_000_000), (32, -500_000_000)]),
+            array(-5632, &[(86, 1_000_000_000), (56, 500_000_000)]),
+        ]
+    }
+
+    /// Cross-tick fallback fires when within-tick can't resolve a leg.
+    /// Pool sits at tick=0 with sqrt_price exactly on the lower boundary
+    /// of the active band (`apply_swap_within_tick` bails on a→b right
+    /// away). With `tick_arrays` supplied, `compute_loss_whirlpool`
+    /// routes through `cross_tick_swap` and the replay succeeds.
+    #[test]
+    fn whirlpool_cross_tick_fallback_unblocks_boundary_starts() {
+        use crate::orca_whirlpool::{swap_math, tick_math};
+        let pool_0 = WhirlpoolPool {
+            liquidity: 1_500_000_000,
+            sqrt_price_q64: tick_math::sqrt_price_at_tick(0),
+            tick_current_index: 0,
+            tick_spacing: 64,
+            fee_rate_hundredths_bps: 3_000,
+        };
+        let arrays = double_lp_arrays();
+
+        // Sell-first sandwich with base=token_a ⇒ frontrun a→b. The pool's
+        // sqrt_price sits exactly on the tick=0 boundary, so the
+        // within-tick guard refuses the very first leg — the test would
+        // be vacuous if `tick_arrays = &[]`.
+        let mut attack = make_attack(
+            swap("f", "atk", SwapDirection::Sell, 1_000_000, 0),
+            swap("v", "vic", SwapDirection::Sell, 100_000, 0),
+            swap("b", "atk", SwapDirection::Buy, 0, 0),
+        );
+        // Pre-simulate the frontrun (cross-tick) so backrun.amount_in
+        // matches the attacker's actual output.
+        let mut sorted = arrays.clone();
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.start_tick_index));
+        let sorted: Vec<Option<_>> = sorted.into_iter().map(Some).collect();
+        let fr = swap_math::cross_tick_swap(pool_0, 1_000_000, true, 3_000, 1_000_000, &sorted)
+            .expect("frontrun cross-tick should resolve");
+        attack.backrun.amount_in = fr.amount_out.min(u64::MAX as u128) as u64;
+
+        // Within-tick only ⇒ first leg bails ⇒ replay fails.
+        assert!(
+            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &[]).is_none(),
+            "without tick_arrays the boundary-seated pool can't be replayed",
+        );
+
+        // Cross-tick arrays supplied ⇒ fallback fires, replay succeeds.
+        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &arrays)
+            .expect("cross-tick fallback should resolve all legs");
+        assert!(loss.victim_loss > 0, "got victim_loss={}", loss.victim_loss);
+        assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
     }
 
     /// `base_is_token_a=false` (base sits on token_b — happens when
@@ -856,7 +988,7 @@ mod tests {
         );
         attack.backrun.amount_in = fr_out as u64;
 
-        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, false)
+        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, false, &[])
             .expect("within-tick replay should succeed (base on token_b)");
         assert!(loss.victim_loss > 0);
         assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
