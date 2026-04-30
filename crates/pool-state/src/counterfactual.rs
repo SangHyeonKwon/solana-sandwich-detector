@@ -151,8 +151,7 @@ pub fn compute_loss_with_trace(
     // happened to bracket an unrelated tx.
     let (backrun_out_no_victim, _pool_no_victim) =
         pool_1.apply_swap(attack.backrun.amount_in, attack.backrun.direction);
-    let raw_profit_no_victim =
-        backrun_out_no_victim as i64 - attack.frontrun.amount_in as i64;
+    let raw_profit_no_victim = backrun_out_no_victim as i64 - attack.frontrun.amount_in as i64;
     let counterfactual_attacker_profit_no_victim = match attack.frontrun.direction {
         SwapDirection::Buy => raw_profit_no_victim,
         SwapDirection::Sell => (raw_profit_no_victim as f64 * spot_0) as i64,
@@ -364,8 +363,7 @@ pub fn compute_loss_whirlpool(
     // amounts but parser observations are u64; saturate-narrow before
     // diffing.
     let residual_bps_frontrun = residual_bps(narrow_u64(fr_out), attack.frontrun.amount_out);
-    let residual_bps_victim =
-        residual_bps(narrow_u64(actual_victim_out), attack.victim.amount_out);
+    let residual_bps_victim = residual_bps(narrow_u64(actual_victim_out), attack.victim.amount_out);
     let residual_bps_backrun = residual_bps(narrow_u64(backrun_out), attack.backrun.amount_out);
 
     // CI on victim_loss (Tier 3.3) — same envelope rule as ConstantProduct
@@ -601,7 +599,13 @@ mod tests {
         // observed → residual_bps ≈ +526.
         let observed_smaller = (fr_out as f64 * 0.95) as u64;
         let attack = make_attack(
-            swap("f", "atk", SwapDirection::Buy, 500_000_000, observed_smaller),
+            swap(
+                "f",
+                "atk",
+                SwapDirection::Buy,
+                500_000_000,
+                observed_smaller,
+            ),
             swap("v", "vic", SwapDirection::Buy, 100_000_000, 1), // any nonzero
             swap("b", "atk", SwapDirection::Sell, 1, 1),
         );
@@ -686,7 +690,13 @@ mod tests {
         let (fr_out, _) = pool.apply_swap(500_000_000, SwapDirection::Buy);
         let observed_smaller = (fr_out as f64 * 0.95) as u64;
         let attack = make_attack(
-            swap("f", "atk", SwapDirection::Buy, 500_000_000, observed_smaller),
+            swap(
+                "f",
+                "atk",
+                SwapDirection::Buy,
+                500_000_000,
+                observed_smaller,
+            ),
             swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000_000, 0),
         );
@@ -798,9 +808,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 1, 0),
             swap("b", "atk", SwapDirection::Sell, 1, 0),
         );
-        assert!(
-            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),
-        );
+        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),);
     }
 
     /// Direction mismatch (victim opposite frontrun) — same invariant
@@ -813,9 +821,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Sell, 100_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        assert!(
-            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),
-        );
+        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),);
     }
 
     #[test]
@@ -826,9 +832,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 100_000, 0),
             swap("b", "atk", SwapDirection::Buy, 100_000, 0),
         );
-        assert!(
-            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),
-        );
+        assert!(compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),);
     }
 
     /// `base_is_token_a=false` (base sits on token_b — happens when

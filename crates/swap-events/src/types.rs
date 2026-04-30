@@ -605,10 +605,7 @@ pub enum Signal {
     /// correctly) and the replay-derived figures should be discounted.
     /// Routed to the Economic category so a Fail here weighs against the
     /// other replay signals.
-    InvariantResidual {
-        step: ReplayStep,
-        residual_bps: i32,
-    },
+    InvariantResidual { step: ReplayStep, residual_bps: i32 },
 
     /// Counterfactual attacker outcome (Tier 3.5): what the attacker would
     /// have netted if the victim's tx had not happened. Computed by replaying
@@ -646,10 +643,7 @@ pub enum Signal {
     /// evidence *for* a sandwich — that comes from the AMM-replay signals —
     /// so this signal only votes Fail (or Informational) per the
     /// `InvariantResidual` precedent.
-    ReservesMatchPostState {
-        divergence_bps: u32,
-        passed: bool,
-    },
+    ReservesMatchPostState { divergence_bps: u32, passed: bool },
 }
 
 /// Replay step where an [`Signal::InvariantResidual`] was measured.

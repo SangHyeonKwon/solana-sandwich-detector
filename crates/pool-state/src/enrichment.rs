@@ -201,10 +201,7 @@ pub async fn enrich_attack(
         (ReplayStep::Backrun, loss.residual_bps_backrun),
     ] {
         if let Some(residual_bps) = residual {
-            amm_signals.push(Signal::InvariantResidual {
-                step,
-                residual_bps,
-            });
+            amm_signals.push(Signal::InvariantResidual { step, residual_bps });
         }
     }
 
@@ -771,8 +768,7 @@ mod tests {
             dynamic_state: None,
         };
 
-        let result =
-            enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
+        let result = enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
 
         let ev = attack.evidence.as_ref().expect("evidence");

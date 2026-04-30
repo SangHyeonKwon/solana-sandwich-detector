@@ -121,8 +121,7 @@ impl WhirlpoolPool {
         fee_num: u128,
         fee_den: u128,
     ) -> Option<(WhirlpoolPool, u128, u128)> {
-        let tick_lower =
-            floor_to_spacing(self.tick_current_index, self.tick_spacing as i32);
+        let tick_lower = floor_to_spacing(self.tick_current_index, self.tick_spacing as i32);
         let tick_upper = tick_lower + self.tick_spacing as i32;
         let target_sqrt_price = if a_to_b {
             tick_math::sqrt_price_at_tick(tick_lower)
@@ -563,8 +562,7 @@ pub mod swap_math {
         let zero_for_one = sqrt_price_current >= sqrt_price_target;
         // Strip the LP fee off `amount_remaining` so the curve-traversal
         // math sees only the net amount that actually moves sqrt_price.
-        let amount_less_fee =
-            mul_div_floor(amount_remaining, fee_den - fee_num, fee_den)?;
+        let amount_less_fee = mul_div_floor(amount_remaining, fee_den - fee_num, fee_den)?;
 
         // Amount needed to walk all the way to `target`. Round *up* — LP-
         // protective: we'd rather slightly under-advance than over-advance.
@@ -841,7 +839,10 @@ mod tests {
     fn sqrt_price_at_tick_clamps_at_extremes() {
         assert_eq!(tick_math::sqrt_price_at_tick(i32::MIN), 0);
         assert_eq!(tick_math::sqrt_price_at_tick(tick_math::MIN_TICK), 0);
-        assert_eq!(tick_math::sqrt_price_at_tick(tick_math::MAX_TICK), u128::MAX);
+        assert_eq!(
+            tick_math::sqrt_price_at_tick(tick_math::MAX_TICK),
+            u128::MAX
+        );
         assert_eq!(tick_math::sqrt_price_at_tick(i32::MAX), u128::MAX);
     }
 
@@ -871,10 +872,7 @@ mod tests {
         let l = 1_000_000_000u128;
         let amount = 1_000_000u128;
         let new_sp = swap_math::next_sqrt_price_a_in(sp, l, amount).unwrap();
-        assert!(
-            new_sp < sp,
-            "expected drop, got new={new_sp} >= old={sp}",
-        );
+        assert!(new_sp < sp, "expected drop, got new={new_sp} >= old={sp}",);
     }
 
     #[test]
@@ -901,10 +899,7 @@ mod tests {
     fn b_in_overflow_returns_none() {
         // sqrt_price near u128::MAX; with L=1, amount=1, delta = Q64, and
         // sp + delta wraps past u128::MAX → must be None.
-        assert_eq!(
-            swap_math::next_sqrt_price_b_in(u128::MAX - 1, 1, 1),
-            None,
-        );
+        assert_eq!(swap_math::next_sqrt_price_b_in(u128::MAX - 1, 1, 1), None,);
     }
 
     /// f64 oracle for a→b. Precision-bounded — only valid inside the
@@ -1024,7 +1019,10 @@ mod tests {
         // sp_lower > sp_upper is a caller error.
         let sp_lo = 2 * swap_math::Q64;
         let sp_hi = swap_math::Q64;
-        assert_eq!(swap_math::delta_amount_a(sp_lo, sp_hi, 1_000_000, true), None);
+        assert_eq!(
+            swap_math::delta_amount_a(sp_lo, sp_hi, 1_000_000, true),
+            None
+        );
     }
 
     #[test]
@@ -1073,7 +1071,10 @@ mod tests {
         )
         .unwrap();
         assert!(r.sqrt_price_next < sp_current);
-        assert!(r.sqrt_price_next > sp_target, "shouldn't have reached target");
+        assert!(
+            r.sqrt_price_next > sp_target,
+            "shouldn't have reached target"
+        );
         assert_eq!(r.amount_in + r.fee_amount, amount);
         assert!(r.amount_out > 0);
     }
