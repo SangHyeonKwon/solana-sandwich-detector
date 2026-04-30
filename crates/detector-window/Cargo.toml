@@ -8,3 +8,6 @@ description = "Cross-slot window-based sandwich detection"
 [dependencies]
 swap-events = { path = "../swap-events" }
 serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
