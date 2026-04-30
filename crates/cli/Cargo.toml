@@ -10,9 +10,16 @@ path = "src/main.rs"
 
 [dependencies]
 sandwich-detector = { workspace = true }
+sandwich-eval = { workspace = true }
+pool-state = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+dotenvy = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

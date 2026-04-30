@@ -27,3 +27,4 @@ solana-sdk = { workspace = true }
 solana-transaction-status = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+dotenvy = { workspace = true }
