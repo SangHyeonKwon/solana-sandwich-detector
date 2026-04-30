@@ -174,6 +174,47 @@ export interface AmmReplayTrace {
   fee_den: number;
 }
 
+/**
+ * Whirlpool (concentrated-liquidity) replay trace — the analogue of
+ * {@link AmmReplayTrace} for the V3-style swap math.
+ *
+ * `sqrt_price_*` and `liquidity_*` are **base-10 decimal strings**
+ * (`u128` on the wire). JS `number` rounds past `2^53`, but Q64.64
+ * sqrt-prices sit at ~`2^64`. Parse with `BigInt(value)` to keep full
+ * precision.
+ *
+ * `tick_current_*` are signed 32-bit integers (Whirlpool tick range
+ * `[-443_636, 443_636]`); they fit in `number` losslessly.
+ */
+export interface WhirlpoolReplayTrace {
+  /** Q64.64 sqrt(price) immediately before the frontrun. */
+  sqrt_price_pre: string;
+  sqrt_price_post_front: string;
+  sqrt_price_post_victim: string;
+  sqrt_price_post_back: string;
+
+  /** Active liquidity at each step. Constant within one tick band but
+   *  changes when a leg's swap walks past an initialised tick boundary. */
+  liquidity_pre: string;
+  liquidity_post_front: string;
+  liquidity_post_victim: string;
+  liquidity_post_back: string;
+
+  /** Tick (price bucket) at each step. `floor(log_{1.0001}(price))`. */
+  tick_current_pre: number;
+  tick_current_post_front: number;
+  tick_current_post_victim: number;
+  tick_current_post_back: number;
+
+  counterfactual_victim_out: number;
+  actual_victim_out: number;
+
+  /** Whirlpool fee fraction. Pools use `fee_num` in hundredths-of-bps
+   *  against `fee_den = 1_000_000` (e.g. `3000 / 1_000_000` = 30 bps). */
+  fee_num: number;
+  fee_den: number;
+}
+
 // ---------------------------------------------------------------------------
 // Per-tx swap event (frontrun / victim / backrun)
 // ---------------------------------------------------------------------------
@@ -271,6 +312,11 @@ export interface SandwichAttack {
 
   evidence?: DetectionEvidence | null;
   amm_replay?: AmmReplayTrace | null;
+  /** Whirlpool-specific replay trace — populated only when `dex` is
+   *  `orca_whirlpool` and pool-state enrichment ran successfully.
+   *  Mutually exclusive with `amm_replay`: dispatch by `dex` to pick
+   *  the right view of the swap arithmetic. */
+  whirlpool_replay?: WhirlpoolReplayTrace | null;
 
   // -- Vigil v1 — populated by `finalize_for_vigil()` --
   /** Canonical attack id (= victim signature today). FK target for receipts. */
