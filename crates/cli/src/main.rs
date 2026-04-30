@@ -1,14 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
 use pool_state::{
-    enrich_attack, NoPoolLookup, NoSlotLeaderLookup, PoolStateLookup, RpcPoolLookup,
-    RpcSlotLeaderLookup, SlotLeaderLookup,
+    enrich_attack, EnrichmentResult, NoPoolLookup, NoSlotLeaderLookup, PoolStateLookup,
+    RpcPoolLookup, RpcSlotLeaderLookup, SlotLeaderLookup,
 };
 use sandwich_detector::{
     authority_hop::{index_by_wallet_pair, scan_block, AuthorityHop},
@@ -20,6 +21,7 @@ use sandwich_detector::{
     SCHEMA_VERSION,
 };
 use sandwich_eval::economics;
+use serde::Serialize;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
@@ -711,9 +713,78 @@ fn emit_heartbeat() -> Result<()> {
 }
 
 fn write_heartbeat<W: Write>(out: &mut W, ts_ms: i64) -> Result<()> {
-    let line = serde_json::json!({ "_heartbeat": ts_ms });
+    let line = serde_json::json!({
+        "_heartbeat": ts_ms,
+        "metrics": enrichment_metrics().snapshot(),
+    });
     writeln!(out, "{}", serde_json::to_string(&line)?)?;
     Ok(())
+}
+
+/// Process-lifetime counter for enrichment outcomes. Updated inside
+/// [`enrich_from_cache`] every time `enrich_attack` returns; emitted in
+/// the JSONL heartbeat under `metrics`. Lets ops monitor when the
+/// 5-array TickArray fetch window starts under-fetching in production
+/// (`cross_tick_unsupported` climbing relative to `enriched`).
+#[derive(Debug, Default)]
+struct EnrichmentMetrics {
+    enriched: AtomicU64,
+    unsupported_dex: AtomicU64,
+    config_unavailable: AtomicU64,
+    reserves_missing: AtomicU64,
+    replay_failed: AtomicU64,
+    cross_tick_unsupported: AtomicU64,
+}
+
+impl EnrichmentMetrics {
+    /// Bump the counter matching `result`. `Ordering::Relaxed` is fine —
+    /// we don't synchronise reads against any other state, just want
+    /// monotonic per-thread increments visible in the heartbeat
+    /// snapshot.
+    fn record(&self, result: EnrichmentResult) {
+        let counter = match result {
+            EnrichmentResult::Enriched => &self.enriched,
+            EnrichmentResult::UnsupportedDex => &self.unsupported_dex,
+            EnrichmentResult::ConfigUnavailable => &self.config_unavailable,
+            EnrichmentResult::ReservesMissing => &self.reserves_missing,
+            EnrichmentResult::ReplayFailed => &self.replay_failed,
+            EnrichmentResult::CrossTickUnsupported => &self.cross_tick_unsupported,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> EnrichmentMetricsSnapshot {
+        EnrichmentMetricsSnapshot {
+            enriched: self.enriched.load(Ordering::Relaxed),
+            unsupported_dex: self.unsupported_dex.load(Ordering::Relaxed),
+            config_unavailable: self.config_unavailable.load(Ordering::Relaxed),
+            reserves_missing: self.reserves_missing.load(Ordering::Relaxed),
+            replay_failed: self.replay_failed.load(Ordering::Relaxed),
+            cross_tick_unsupported: self.cross_tick_unsupported.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Wire shape of the enrichment metrics field on the JSONL heartbeat.
+/// Mirrored into `contrib/vigil-types.ts` so Vigil's BE can `.metrics`
+/// off a heartbeat line without guessing field names.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct EnrichmentMetricsSnapshot {
+    enriched: u64,
+    unsupported_dex: u64,
+    config_unavailable: u64,
+    reserves_missing: u64,
+    replay_failed: u64,
+    cross_tick_unsupported: u64,
+}
+
+/// Global metrics accessor — process-lifetime singleton, lazy-init.
+/// Tests share it across calls (counters accumulate across the
+/// process); fixture-level isolation isn't needed because the snapshot
+/// is just non-decreasing counters.
+fn enrichment_metrics() -> &'static EnrichmentMetrics {
+    static METRICS: OnceLock<EnrichmentMetrics> = OnceLock::new();
+    METRICS.get_or_init(EnrichmentMetrics::default)
 }
 
 /// Fetch a block, retrying transient RPC failures with exponential backoff.
@@ -886,7 +957,8 @@ async fn enrich_from_cache(
     // enrichment still runs unmodified.
     let backrun_tx = cache.get(&attack.backrun.signature);
     let result = enrich_attack(attack, tx, backrun_tx, lookup).await;
-    if !matches!(result, pool_state::EnrichmentResult::Enriched) {
+    enrichment_metrics().record(result);
+    if !matches!(result, EnrichmentResult::Enriched) {
         tracing::debug!(
             "enrich {:?} {}: {:?}",
             attack.dex,
@@ -1042,6 +1114,61 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         let v: Value = serde_json::from_str(s.trim_end()).unwrap();
         assert_eq!(v["_heartbeat"], Value::from(1_735_000_000_000i64));
+        // metrics field always present (default-zero before any
+        // enrichment) — Vigil's BE shouldn't have to handle a missing
+        // key.
+        let metrics = v
+            .get("metrics")
+            .expect("heartbeat carries a metrics snapshot");
+        for key in [
+            "enriched",
+            "unsupported_dex",
+            "config_unavailable",
+            "reserves_missing",
+            "replay_failed",
+            "cross_tick_unsupported",
+        ] {
+            assert!(
+                metrics.get(key).is_some(),
+                "heartbeat metrics missing key {key}: {metrics:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn enrichment_metrics_record_increments_matching_counter() {
+        // Counter mapping is what downstream ops keys off of — pin
+        // each variant lands in the right field of the snapshot.
+        let metrics = EnrichmentMetrics::default();
+        metrics.record(EnrichmentResult::Enriched);
+        metrics.record(EnrichmentResult::Enriched);
+        metrics.record(EnrichmentResult::CrossTickUnsupported);
+        metrics.record(EnrichmentResult::UnsupportedDex);
+        metrics.record(EnrichmentResult::ReservesMissing);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.enriched, 2);
+        assert_eq!(snap.cross_tick_unsupported, 1);
+        assert_eq!(snap.unsupported_dex, 1);
+        assert_eq!(snap.reserves_missing, 1);
+        assert_eq!(snap.config_unavailable, 0);
+        assert_eq!(snap.replay_failed, 0);
+    }
+
+    #[test]
+    fn enrichment_metrics_snapshot_serializes_with_snake_case_keys() {
+        // Vigil's TS types expect snake_case keys; the auto-derived
+        // Serialize impl on EnrichmentMetricsSnapshot uses the field
+        // names directly. Pin that the JSON shape matches the
+        // contract.
+        let snap = EnrichmentMetricsSnapshot {
+            enriched: 7,
+            cross_tick_unsupported: 3,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(snap).unwrap();
+        assert_eq!(json["enriched"], 7);
+        assert_eq!(json["cross_tick_unsupported"], 3);
+        assert_eq!(json["unsupported_dex"], 0);
     }
 
     #[test]
