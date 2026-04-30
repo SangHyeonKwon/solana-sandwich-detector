@@ -78,6 +78,9 @@ export type SignalCategory =
 
 export type SignalVerdict = "pass" | "fail" | "informational";
 
+/** Replay step where an `invariant_residual` signal was measured. */
+export type ReplayStep = "frontrun" | "victim" | "backrun";
+
 export type DetectionMethod =
   | { same_block: Record<string, never> } // `"same_block"` in serde — see below
   | { cross_slot_window: { window_size: number } }
@@ -108,7 +111,26 @@ export type Signal =
    * frontrun by `from` to a backrun by `to`. `authority_tx` is the audit
    * pointer back to the SetAuthority tx.
    */
-  | { kind: "authority_chain"; from: string; to: string; authority_tx: string };
+  | { kind: "authority_chain"; from: string; to: string; authority_tx: string }
+  /**
+   * Per-step model fidelity (Tier 3.2). `residual_bps` is signed:
+   * `(predicted_amount_out − observed_amount_out) / observed_amount_out × 10_000`.
+   * Near-zero ⇒ our AMM math agrees with chain logs at this step;
+   * |residual| ≥ 100 ⇒ Fail (distrust replay-derived numbers for this attack).
+   */
+  | { kind: "invariant_residual"; step: ReplayStep; residual_bps: number }
+  /**
+   * Sandwich shape check (Tier 3.5). `with_victim` is the attacker's actual
+   * profit; `without_victim` is what they'd have netted if the victim hadn't
+   * traded. Pure sandwiches show `with_victim > 0` and `without_victim ≤ 0`;
+   * a strongly-positive `without_victim` indicates arbitrage that happened to
+   * bracket an unrelated tx.
+   */
+  | {
+      kind: "counterfactual_attacker_profit";
+      with_victim: number;
+      without_victim: number;
+    };
 
 export interface DetectionEvidence {
   passing: Signal[];

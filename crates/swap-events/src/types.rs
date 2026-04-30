@@ -140,9 +140,12 @@ pub enum ConfidenceLevel {
 }
 
 impl ConfidenceLevel {
-    /// Bucket the composite confidence score `[0.0, 1.0]`. The 0.8 threshold
-    /// matches the `FilteredWindowDetector` default emission gate, so a `High`
-    /// receipt is one the production detector would already keep.
+    /// Bucket the composite confidence score `[0.0, 1.0]` for surface display.
+    /// `High` (≥0.8) is the conventional "trustworthy" tier; `Low` (<0.5)
+    /// flags edge cases the BE can warn on. These tiers sit *above* whatever
+    /// survives the `FilteredWindowDetector` emission gate (default
+    /// `min_confidence: 0.30` in `detector-window/src/filters.rs`) — they
+    /// classify already-emitted detections, they don't gate emission.
     pub fn from_score(score: f64) -> Self {
         if score >= 0.8 {
             Self::High
@@ -564,6 +567,50 @@ pub enum Signal {
         to: String,
         authority_tx: String,
     },
+
+    /// Per-step model fidelity check (Tier 3.2). Compares what our AMM
+    /// `apply_swap` would predict for `step`'s output, given the reserves
+    /// we used at that point in the replay, against `SwapEvent.amount_out`
+    /// extracted from chain logs. `residual_bps = (predicted - observed) /
+    /// observed × 10_000`, signed.
+    ///
+    /// Near-zero residual means our reserve reconstruction and constant-
+    /// product math agree with the chain's outcome — downstream replay
+    /// numbers (`AmmProfit`, `VictimLoss`, `ReplayConfidence`) are trust-
+    /// worthy. Large |residual| means we missed something (wrong pre-state,
+    /// non-AMM CPI inside the tx, or a DEX whose math we don't model
+    /// correctly) and the replay-derived figures should be discounted.
+    /// Routed to the Economic category so a Fail here weighs against the
+    /// other replay signals.
+    InvariantResidual {
+        step: ReplayStep,
+        residual_bps: i32,
+    },
+
+    /// Counterfactual attacker outcome (Tier 3.5): what the attacker would
+    /// have netted if the victim's tx had not happened. Computed by replaying
+    /// `frontrun → backrun` directly on the post-frontrun pool, skipping the
+    /// victim. Both values are in quote-token smallest units, normalised the
+    /// same way as `attacker_profit`.
+    ///
+    /// A pure sandwich *needs* the victim to extract value, so the canonical
+    /// shape is `with_victim > 0` and `without_victim ≤ 0`. When
+    /// `without_victim` is also strongly positive, the candidate is more
+    /// likely an arbitrage that happened to bracket an unrelated swap — the
+    /// signal Fails so the ensemble downweights it.
+    CounterfactualAttackerProfit {
+        with_victim: i64,
+        without_victim: i64,
+    },
+}
+
+/// Replay step where an [`Signal::InvariantResidual`] was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayStep {
+    Frontrun,
+    Victim,
+    Backrun,
 }
 
 /// Grouping used for ensemble-agreement counting. A detection "fires" in a
@@ -607,10 +654,12 @@ impl Signal {
             Signal::NaiveProfit { .. }
             | Signal::AmmProfit { .. }
             | Signal::VictimLoss { .. }
-            | Signal::ReplayConfidence { .. } => SignalCategory::Economic,
+            | Signal::ReplayConfidence { .. }
+            | Signal::InvariantResidual { .. } => SignalCategory::Economic,
             Signal::VictimSize { .. }
             | Signal::KnownAttackerVictim { .. }
-            | Signal::AuthorityChain { .. } => SignalCategory::Plausibility,
+            | Signal::AuthorityChain { .. }
+            | Signal::CounterfactualAttackerProfit { .. } => SignalCategory::Plausibility,
         }
     }
 
@@ -700,6 +749,43 @@ impl Signal {
             // detector wouldn't emit this signal unless the hop ties the
             // frontrun to the backrun, so it's always a positive vote.
             Signal::AuthorityChain { .. } => SignalVerdict::Pass,
+
+            // Model fidelity: small residual is just context (replay is
+            // trustworthy); large residual is a Fail because the AMM-replay
+            // numbers downstream may be wrong. Faithful math on its own
+            // isn't evidence *for* a sandwich, so Pass isn't an outcome
+            // here — Pass on a sandwich call comes from the AMM-replay
+            // signals themselves (AmmProfit, VictimLoss).
+            Signal::InvariantResidual { residual_bps, .. } => {
+                if residual_bps.unsigned_abs() < 100 {
+                    SignalVerdict::Informational
+                } else {
+                    SignalVerdict::Fail
+                }
+            }
+
+            // Sandwich shape check.
+            //   - Profitable only with the victim → Pass (clean MEV).
+            //   - Profitable even without the victim by ≥ 50% of the with-
+            //     victim haul → Fail (arbitrage masquerading as a sandwich,
+            //     victim was incidental).
+            //   - Anything else (e.g. unprofitable both ways, or a marginal
+            //     mix) → Informational; the rest of the ensemble decides.
+            Signal::CounterfactualAttackerProfit {
+                with_victim,
+                without_victim,
+            } => {
+                if with_victim > 0 && without_victim <= 0 {
+                    SignalVerdict::Pass
+                } else if without_victim > 0
+                    && with_victim > 0
+                    && without_victim.saturating_mul(2) >= with_victim
+                {
+                    SignalVerdict::Fail
+                } else {
+                    SignalVerdict::Informational
+                }
+            }
         }
     }
 }
@@ -1158,8 +1244,9 @@ mod vigil_schema_tests {
     }
 
     #[test]
-    fn confidence_level_buckets_match_detector_gate() {
-        // 0.8 is the production emission gate; anything ≥ 0.8 is High.
+    fn confidence_level_buckets_match_display_tiers() {
+        // Display tiers: <0.5 Low, [0.5, 0.8) Medium, ≥0.8 High. Independent
+        // of the emission gate; this is a UX bucket on already-emitted rows.
         assert_eq!(ConfidenceLevel::from_score(0.0), ConfidenceLevel::Low);
         assert_eq!(ConfidenceLevel::from_score(0.49), ConfidenceLevel::Low);
         assert_eq!(ConfidenceLevel::from_score(0.5), ConfidenceLevel::Medium);
@@ -1399,5 +1486,173 @@ mod vigil_schema_tests {
         assert!(attack.attack_type.is_none());
         assert!(attack.receipts.is_empty());
         assert!(!attack.is_wide_sandwich);
+    }
+
+    // ----- Tier 3.2 — InvariantResidual -----------------------------------
+
+    #[test]
+    fn invariant_residual_verdict_thresholds() {
+        // |residual_bps| < 100 (1%) → Informational (model agrees with chain).
+        // |residual_bps| >= 100 → Fail (don't trust the AMM-replay numbers).
+        // Pass is intentionally not an outcome — a faithful model alone is
+        // not evidence *for* a sandwich, it's just context for the other
+        // replay signals.
+        for residual_bps in [-99, -1, 0, 1, 99] {
+            let s = Signal::InvariantResidual {
+                step: ReplayStep::Frontrun,
+                residual_bps,
+            };
+            assert_eq!(
+                s.verdict(),
+                SignalVerdict::Informational,
+                "small residual {residual_bps} should be informational",
+            );
+        }
+        for residual_bps in [-101, -10_000, 100, 10_000] {
+            let s = Signal::InvariantResidual {
+                step: ReplayStep::Victim,
+                residual_bps,
+            };
+            assert_eq!(
+                s.verdict(),
+                SignalVerdict::Fail,
+                "large residual {residual_bps} should fail",
+            );
+        }
+    }
+
+    #[test]
+    fn invariant_residual_category_is_economic() {
+        let s = Signal::InvariantResidual {
+            step: ReplayStep::Backrun,
+            residual_bps: 0,
+        };
+        assert_eq!(s.category(), SignalCategory::Economic);
+    }
+
+    // ----- Tier 3.5 — CounterfactualAttackerProfit ------------------------
+
+    #[test]
+    fn counterfactual_attacker_clean_sandwich_passes() {
+        // Profitable only with the victim — canonical sandwich shape.
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: 1_000,
+            without_victim: -50,
+        };
+        assert_eq!(s.verdict(), SignalVerdict::Pass);
+        // Boundary: zero counterfactual (no profit, no loss) is still clean.
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: 1_000,
+            without_victim: 0,
+        };
+        assert_eq!(s.verdict(), SignalVerdict::Pass);
+    }
+
+    #[test]
+    fn counterfactual_attacker_arbitrage_fails() {
+        // Without-victim profit is at least half of with-victim → the victim
+        // tx was incidental, this is arbitrage masquerading as a sandwich.
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: 1_000,
+            without_victim: 600,
+        };
+        assert_eq!(s.verdict(), SignalVerdict::Fail);
+        // Boundary: exactly half qualifies as Fail.
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: 1_000,
+            without_victim: 500,
+        };
+        assert_eq!(s.verdict(), SignalVerdict::Fail);
+    }
+
+    #[test]
+    fn counterfactual_attacker_marginal_is_informational() {
+        // Less than half of with-victim — keeps quiet, lets the rest of the
+        // ensemble decide. The signal is still emitted so a downstream
+        // viewer can see the counterfactual numbers.
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: 1_000,
+            without_victim: 100,
+        };
+        assert_eq!(s.verdict(), SignalVerdict::Informational);
+        // Both unprofitable — degenerate, no Pass evidence here either.
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: -100,
+            without_victim: -200,
+        };
+        assert_eq!(s.verdict(), SignalVerdict::Informational);
+    }
+
+    #[test]
+    fn counterfactual_attacker_category_is_plausibility() {
+        let s = Signal::CounterfactualAttackerProfit {
+            with_victim: 0,
+            without_victim: 0,
+        };
+        assert_eq!(s.category(), SignalCategory::Plausibility);
+    }
+
+    #[test]
+    fn new_signal_variants_round_trip_through_json() {
+        // Round-trip both new variants together as part of a flat Vec<Signal>
+        // so we exercise the serde tagged-enum encoding the JSONL stream uses.
+        let inputs = vec![
+            Signal::InvariantResidual {
+                step: ReplayStep::Frontrun,
+                residual_bps: -42,
+            },
+            Signal::InvariantResidual {
+                step: ReplayStep::Victim,
+                residual_bps: 0,
+            },
+            Signal::InvariantResidual {
+                step: ReplayStep::Backrun,
+                residual_bps: 500,
+            },
+            Signal::CounterfactualAttackerProfit {
+                with_victim: 1_234,
+                without_victim: -7,
+            },
+        ];
+        let json = serde_json::to_string(&inputs).expect("serialize");
+        let back: Vec<Signal> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.len(), 4);
+        // Spot-check by matching on each variant — `PartialEq` isn't derived
+        // on `Signal` so equality is structural via match arms.
+        match &back[0] {
+            Signal::InvariantResidual {
+                step: ReplayStep::Frontrun,
+                residual_bps: -42,
+            } => {}
+            other => panic!("expected Frontrun residual -42, got {other:?}"),
+        }
+        match &back[3] {
+            Signal::CounterfactualAttackerProfit {
+                with_victim: 1_234,
+                without_victim: -7,
+            } => {}
+            other => panic!("expected CounterfactualAttackerProfit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensemble_routes_new_signals_through_economic_and_plausibility() {
+        // Build a minimal evidence set and check categories_fired increments
+        // appropriately when only the new signals are present.
+        let ev = DetectionEvidence::from_signals(vec![
+            Signal::InvariantResidual {
+                step: ReplayStep::Frontrun,
+                residual_bps: 5,
+            }, // Informational — does not bump categories_fired
+            Signal::CounterfactualAttackerProfit {
+                with_victim: 100,
+                without_victim: -10,
+            }, // Pass → Plausibility fires
+        ]);
+        // Plausibility category should fire from the clean-sandwich Pass;
+        // Economic does NOT fire because InvariantResidual is Informational.
+        assert_eq!(ev.categories_fired, 1);
+        assert_eq!(ev.passing.len(), 1);
+        assert_eq!(ev.informational.len(), 1);
     }
 }

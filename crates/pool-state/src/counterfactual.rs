@@ -31,6 +31,36 @@ pub struct LossEstimate {
     pub counterfactual_victim_out: u64,
     /// What the victim actually received.
     pub actual_victim_out: u64,
+    /// Per-step model fidelity (Tier 3.2): signed bps gap between what our
+    /// `apply_swap` predicts the swap output should be (given the reserves
+    /// we used) and the parser-observed `SwapEvent.amount_out`. Near-zero
+    /// = our reserves and AMM math match the chain. Far from zero =
+    /// distrust the rest of this `LossEstimate`. `None` when the parser-
+    /// extracted output was 0 (no usable observation to compare against).
+    /// Fed into [`Signal::InvariantResidual`].
+    pub residual_bps_frontrun: Option<i32>,
+    pub residual_bps_victim: Option<i32>,
+    pub residual_bps_backrun: Option<i32>,
+    /// What the attacker would have netted if the victim had not traded
+    /// (Tier 3.5). Computed by replaying `frontrun → backrun` on the
+    /// post-frontrun pool, skipping the victim. Same quote-token unit and
+    /// Buy/Sell normalisation as `attacker_profit_real`. Fed into
+    /// [`Signal::CounterfactualAttackerProfit`].
+    pub counterfactual_attacker_profit_no_victim: i64,
+}
+
+/// Compute a signed basis-point residual between an AMM-predicted output
+/// and what chain logs reported. Returns `None` when `observed` is zero
+/// (parser failure or empty swap), in which case no useful comparison
+/// exists. The result is clamped to `i32` so a runaway pool doesn't
+/// overflow downstream signal payloads.
+fn residual_bps(predicted: u64, observed: u64) -> Option<i32> {
+    if observed == 0 {
+        return None;
+    }
+    let delta = predicted as i128 - observed as i128;
+    let scaled = delta.saturating_mul(10_000) / observed as i128;
+    Some(scaled.clamp(i32::MIN as i128, i32::MAX as i128) as i32)
 }
 
 /// Replay a detected sandwich through the pool's pre-frontrun state.
@@ -60,7 +90,7 @@ pub fn compute_loss_with_trace(
     let spot_0 = pool_0.spot_price()?;
 
     // 1. Frontrun applied to pool_0 → pool_1
-    let (_fr_out, pool_1) = pool_0.apply_swap(attack.frontrun.amount_in, attack.frontrun.direction);
+    let (fr_out, pool_1) = pool_0.apply_swap(attack.frontrun.amount_in, attack.frontrun.direction);
 
     // 2. Victim in pool_1 (actual)
     let (actual_victim_out, pool_2) =
@@ -103,12 +133,37 @@ pub fn compute_loss_with_trace(
     let spot_1 = pool_1.spot_price()?;
     let price_impact_bps = (((spot_1 - spot_0) / spot_0).abs() * 10_000.0) as u32;
 
+    // Counterfactual attacker (Tier 3.5): replay the backrun on pool_1 (post-
+    // frontrun, no victim) and see what the attacker would have netted if
+    // the victim's tx hadn't happened. A "true" sandwich shows
+    // counterfactual_attacker_profit_no_victim ≤ 0 — extraction depends on
+    // the victim. Strongly-positive counterfactual = arbitrage that
+    // happened to bracket an unrelated tx.
+    let (backrun_out_no_victim, _pool_no_victim) =
+        pool_1.apply_swap(attack.backrun.amount_in, attack.backrun.direction);
+    let raw_profit_no_victim =
+        backrun_out_no_victim as i64 - attack.frontrun.amount_in as i64;
+    let counterfactual_attacker_profit_no_victim = match attack.frontrun.direction {
+        SwapDirection::Buy => raw_profit_no_victim,
+        SwapDirection::Sell => (raw_profit_no_victim as f64 * spot_0) as i64,
+    };
+
+    // Per-step residuals (Tier 3.2): predicted (our AMM math) vs. observed
+    // (what the parser pulled from token-balance changes on chain).
+    let residual_bps_frontrun = residual_bps(fr_out, attack.frontrun.amount_out);
+    let residual_bps_victim = residual_bps(actual_victim_out, attack.victim.amount_out);
+    let residual_bps_backrun = residual_bps(backrun_out, attack.backrun.amount_out);
+
     let loss = LossEstimate {
         victim_loss,
         attacker_profit_real,
         price_impact_bps,
         counterfactual_victim_out,
         actual_victim_out,
+        residual_bps_frontrun,
+        residual_bps_victim,
+        residual_bps_backrun,
+        counterfactual_attacker_profit_no_victim,
     };
 
     let trace = AmmReplayTrace {
@@ -258,5 +313,98 @@ mod tests {
             swap("b", "atk", SwapDirection::Buy, 100_000, 0), // wrong direction
         );
         assert!(compute_loss(&attack, pool).is_none());
+    }
+
+    // ----- Tier 3.2 / 3.5 — residuals + counterfactual attacker ----------
+
+    /// When the parser-observed `amount_out` matches our AMM math (i.e. we
+    /// pre-computed it via `apply_swap` on the same pool), every per-step
+    /// residual_bps is exactly zero. This is the self-consistency check —
+    /// if the model and the observation come from the same place, gap is
+    /// nil; non-zero residual in production therefore means the chain
+    /// disagreed with our model.
+    #[test]
+    fn residuals_zero_when_observations_match_model() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        // Pre-compute every step's output via the same pool math, then plant
+        // those values as the parser-observed `amount_out`s.
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _pool_3) = pool_2.apply_swap(fr_out, SwapDirection::Sell);
+
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, fr_out),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, victim_out),
+            swap("b", "atk", SwapDirection::Sell, fr_out, back_out),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+
+        assert_eq!(loss.residual_bps_frontrun, Some(0));
+        assert_eq!(loss.residual_bps_victim, Some(0));
+        assert_eq!(loss.residual_bps_backrun, Some(0));
+    }
+
+    /// `amount_out = 0` on a SwapEvent means the parser didn't extract a
+    /// usable observation. The residual for that step is `None` so callers
+    /// can choose not to emit a misleading zero.
+    #[test]
+    fn residuals_none_when_observation_is_zero() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 100_000_000, 0),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        assert!(loss.residual_bps_frontrun.is_none());
+        assert!(loss.residual_bps_victim.is_none());
+        assert!(loss.residual_bps_backrun.is_none());
+    }
+
+    /// When the parser observation differs from our model output by exactly
+    /// 5%, the residual_bps comes back as 500. Sanity check on the bps
+    /// arithmetic and sign convention (predicted > observed → positive).
+    #[test]
+    fn residuals_signed_and_in_basis_points() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, _) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        // Observed = predicted × 0.95 → predicted is ~5.26% higher than
+        // observed → residual_bps ≈ +526.
+        let observed_smaller = (fr_out as f64 * 0.95) as u64;
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, observed_smaller),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, 1), // any nonzero
+            swap("b", "atk", SwapDirection::Sell, 1, 1),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        let residual = loss.residual_bps_frontrun.unwrap();
+        // Predicted > observed → positive. Magnitude in the right ballpark.
+        assert!(residual > 400 && residual < 700, "residual {residual}");
+    }
+
+    /// Pure sandwich: replaying the backrun on the post-frontrun pool with
+    /// the victim *removed* leaves the attacker at a loss. Without the
+    /// victim's price impact pushing the pool further, the backrun unwinds
+    /// the frontrun against fees only — no extraction.
+    #[test]
+    fn counterfactual_attacker_negative_without_victim() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, _) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, fr_out, 0),
+        );
+
+        let loss = compute_loss(&attack, pool).unwrap();
+        assert!(
+            loss.attacker_profit_real > 0,
+            "with-victim profit should be positive for a sandwich",
+        );
+        assert!(
+            loss.counterfactual_attacker_profit_no_victim <= 0,
+            "without-victim profit should be ≤ 0 — extraction needs the victim, got {}",
+            loss.counterfactual_attacker_profit_no_victim,
+        );
     }
 }

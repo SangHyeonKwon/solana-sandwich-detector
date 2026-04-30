@@ -772,7 +772,65 @@
               "type": "string"
             }
           }
+        },
+        {
+          "description": "Per-step model fidelity check (Tier 3.2). Compares what our AMM `apply_swap` would predict for `step`'s output, given the reserves we used at that point in the replay, against `SwapEvent.amount_out` extracted from chain logs. `residual_bps = (predicted - observed) / observed × 10_000`, signed.\n\nNear-zero residual means our reserve reconstruction and constant- product math agree with the chain's outcome — downstream replay numbers (`AmmProfit`, `VictimLoss`, `ReplayConfidence`) are trust- worthy. Large |residual| means we missed something (wrong pre-state, non-AMM CPI inside the tx, or a DEX whose math we don't model correctly) and the replay-derived figures should be discounted. Routed to the Economic category so a Fail here weighs against the other replay signals.",
+          "type": "object",
+          "required": [
+            "kind",
+            "residual_bps",
+            "step"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "invariant_residual"
+              ]
+            },
+            "step": {
+              "$ref": "#/definitions/ReplayStep"
+            },
+            "residual_bps": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        },
+        {
+          "description": "Counterfactual attacker outcome (Tier 3.5): what the attacker would have netted if the victim's tx had not happened. Computed by replaying `frontrun → backrun` directly on the post-frontrun pool, skipping the victim. Both values are in quote-token smallest units, normalised the same way as `attacker_profit`.\n\nA pure sandwich *needs* the victim to extract value, so the canonical shape is `with_victim > 0` and `without_victim ≤ 0`. When `without_victim` is also strongly positive, the candidate is more likely an arbitrage that happened to bracket an unrelated swap — the signal Fails so the ensemble downweights it.",
+          "type": "object",
+          "required": [
+            "kind",
+            "with_victim",
+            "without_victim"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "counterfactual_attacker_profit"
+              ]
+            },
+            "with_victim": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "without_victim": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
         }
+      ]
+    },
+    "ReplayStep": {
+      "description": "Replay step where an [`Signal::InvariantResidual`] was measured.",
+      "type": "string",
+      "enum": [
+        "frontrun",
+        "victim",
+        "backrun"
       ]
     },
     "AmmReplayTrace": {

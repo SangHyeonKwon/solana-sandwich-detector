@@ -10,7 +10,9 @@
 //!   3. Caller invokes [`enrich_attack`] with the attack, the frontrun's tx
 //!      data, and a [`PoolStateLookup`]. Fields are filled in place.
 
-use swap_events::types::{DetectionEvidence, SandwichAttack, Severity, Signal, TransactionData};
+use swap_events::types::{
+    DetectionEvidence, ReplayStep, SandwichAttack, Severity, Signal, TransactionData,
+};
 
 use crate::{compute_loss_with_trace, reserves, ConstantProduct, PoolStateLookup};
 
@@ -104,7 +106,7 @@ pub async fn enrich_attack(
         0.0
     };
 
-    let amm_signals = vec![
+    let mut amm_signals = vec![
         Signal::AmmProfit {
             attacker_profit_real: loss.attacker_profit_real,
         },
@@ -116,6 +118,32 @@ pub async fn enrich_attack(
             value: replay_confidence,
         },
     ];
+
+    // Per-step model fidelity (Tier 3.2). Emit only the steps where we have
+    // a usable observation; missing parser data is silent rather than a
+    // misleading zero.
+    for (step, residual) in [
+        (ReplayStep::Frontrun, loss.residual_bps_frontrun),
+        (ReplayStep::Victim, loss.residual_bps_victim),
+        (ReplayStep::Backrun, loss.residual_bps_backrun),
+    ] {
+        if let Some(residual_bps) = residual {
+            amm_signals.push(Signal::InvariantResidual {
+                step,
+                residual_bps,
+            });
+        }
+    }
+
+    // Sandwich shape (Tier 3.5): the with-victim profit is what the attacker
+    // actually netted; the without-victim profit is what they would have
+    // netted if the victim had not traded. Emit unconditionally so the
+    // ensemble can downweight arbitrage profiles where the victim was
+    // incidental.
+    amm_signals.push(Signal::CounterfactualAttackerProfit {
+        with_victim: loss.attacker_profit_real,
+        without_victim: loss.counterfactual_attacker_profit_no_victim,
+    });
 
     match attack.evidence.as_mut() {
         Some(ev) => ev.extend(amm_signals),
@@ -349,6 +377,107 @@ mod tests {
         assert!(has_victim_loss, "VictimLoss signal missing");
         // Counterfactual > actual victim out when frontrun moved price away.
         assert!(trace.counterfactual_victim_out > trace.actual_victim_out);
+    }
+
+    #[tokio::test]
+    async fn enrichment_emits_invariant_residual_and_counterfactual_signals() {
+        // After enrich_attack runs on a successful happy-path replay, the
+        // evidence set must include both Tier 3 signals so downstream
+        // consumers can see model fidelity and the sandwich-shape check.
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+
+        let ev = attack
+            .evidence
+            .as_ref()
+            .expect("evidence present after enrichment");
+        let all_signals = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .chain(ev.informational.iter());
+
+        // The synthetic make_attack uses amount_out = 0 on every leg, so
+        // residuals come back None and InvariantResidual signals are *not*
+        // emitted — that's the contract: silent on missing observations.
+        assert!(
+            !all_signals
+                .clone()
+                .any(|s| matches!(s, Signal::InvariantResidual { .. })),
+            "InvariantResidual should be silent when amount_out is 0 on every leg",
+        );
+
+        // CounterfactualAttackerProfit is always emitted regardless of
+        // observation availability, since it's computed entirely from our
+        // own AMM math (no parser dependency). Sign assertions on the
+        // counterfactual live in `counterfactual.rs` where we control the
+        // backrun amount precisely; the enrichment fixture intentionally
+        // uses an oversized backrun (the attacker has extra inventory) so
+        // we only check that the signal is present and well-formed.
+        let counterfactual = all_signals
+            .clone()
+            .find(|s| matches!(s, Signal::CounterfactualAttackerProfit { .. }));
+        let Some(Signal::CounterfactualAttackerProfit {
+            with_victim: _,
+            without_victim: _,
+        }) = counterfactual
+        else {
+            panic!("CounterfactualAttackerProfit signal missing from evidence");
+        };
+    }
+
+    #[tokio::test]
+    async fn enrichment_emits_invariant_residual_when_observations_present() {
+        // Same as above but with non-zero amount_out on every leg, so the
+        // residual signals fire (and should land in `informational` because
+        // observations match our model exactly — see counterfactual.rs's
+        // `residuals_zero_when_observations_match_model`).
+        let mut attack = make_attack();
+
+        // Replay the chain ourselves, then plant the same outputs back as
+        // parser-observed amount_outs so residuals are exactly zero.
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        attack.frontrun.amount_out = fr_out;
+        attack.victim.amount_out = victim_out;
+        attack.backrun.amount_out = back_out;
+
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+
+        let ev = attack.evidence.as_ref().expect("evidence");
+        // All three steps should have emitted residual signals.
+        let residual_count = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .chain(ev.informational.iter())
+            .filter(|s| matches!(s, Signal::InvariantResidual { .. }))
+            .count();
+        assert_eq!(
+            residual_count, 3,
+            "expected one InvariantResidual per step, got {residual_count}",
+        );
+        // Zero residuals are Informational, not Pass or Fail.
+        assert_eq!(
+            ev.informational
+                .iter()
+                .filter(|s| matches!(s, Signal::InvariantResidual { .. }))
+                .count(),
+            3,
+        );
     }
 
     #[tokio::test]
