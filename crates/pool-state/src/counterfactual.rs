@@ -16,6 +16,7 @@
 
 use swap_events::types::{AmmReplayTrace, SandwichAttack, SwapDirection};
 
+use crate::orca_whirlpool::WhirlpoolPool;
 use crate::ConstantProduct;
 
 /// Result of replaying a sandwich through AMM math.
@@ -231,6 +232,192 @@ fn reserves_to_u64(pool: &ConstantProduct) -> (u64, u64) {
         base.min(u64::MAX as u128) as u64,
         quote.min(u64::MAX as u128) as u64,
     )
+}
+
+/// Replay a detected sandwich through a Whirlpool pool, *within-tick only*.
+///
+/// Returns `None` when:
+///   * direction invariants break (same as [`compute_loss`]),
+///   * any of the three swap legs (frontrun / victim / counterfactual /
+///     backrun / counterfactual-no-victim) crosses a tick boundary —
+///     within-tick replay can't compute the post-cross sqrt_price without
+///     the next initialised TickArray's `liquidity_net`, so we bail. The
+///     cross-tick path lands in step 3-γ/δ.
+///
+/// Output shape mirrors [`compute_loss`] (same `LossEstimate` fields), so
+/// callers can hand both DEX kinds through the same downstream pipeline
+/// (severity derivation, signal emission). `AmmReplayTrace` isn't returned
+/// because Whirlpool replay doesn't yet have a trace shape — vault
+/// reserves don't represent active-liquidity reserves under concentrated
+/// liquidity, and a meaningful trace would need sqrt_price + tick state
+/// per step. Surfacing that lives in a follow-up.
+pub fn compute_loss_whirlpool(
+    attack: &SandwichAttack,
+    pool_0: WhirlpoolPool,
+    fee_num: u128,
+    fee_den: u128,
+    base_is_token_a: bool,
+) -> Option<LossEstimate> {
+    // Direction sanity (mirrors compute_loss_with_trace).
+    if attack.victim.direction != attack.frontrun.direction {
+        return None;
+    }
+    if attack.backrun.direction == attack.frontrun.direction {
+        return None;
+    }
+
+    // Map SwapDirection (Buy/Sell, in *quote* terms) to Whirlpool's
+    // `a_to_b` flag (token_a in vs token_b in). The on-chain a/b axis
+    // doesn't line up with our base/quote axis universally — the parser
+    // records the orientation in `base_is_token_a`, and we flip
+    // accordingly:
+    //   * Sell = base in. base = token_a ⇒ a_to_b = true.
+    //                     base = token_b ⇒ a_to_b = false.
+    //   * Buy  = quote in. base = token_a ⇒ a_to_b = false.
+    //                      base = token_b ⇒ a_to_b = true.
+    let frontrun_a_to_b = match attack.frontrun.direction {
+        SwapDirection::Sell => base_is_token_a,
+        SwapDirection::Buy => !base_is_token_a,
+    };
+    let victim_a_to_b = frontrun_a_to_b; // detector ensures same direction
+    let backrun_a_to_b = !frontrun_a_to_b;
+
+    // Whirlpool spot is denominated `token_b / token_a`; flip when base
+    // sits on token_b so the rest of the loss math runs in quote/base
+    // units (the same axis as ConstantProduct's spot_price).
+    let spot_b_per_a_0 = whirlpool_spot_price_b_per_a(pool_0);
+    let quote_per_base_0 = if base_is_token_a {
+        spot_b_per_a_0
+    } else {
+        1.0 / spot_b_per_a_0
+    };
+
+    // 1. Frontrun on pool_0.
+    let (pool_1, fr_out, _fr_fee) = pool_0.apply_swap_within_tick(
+        attack.frontrun.amount_in as u128,
+        frontrun_a_to_b,
+        fee_num,
+        fee_den,
+    )?;
+
+    // 2. Victim on pool_1 (actual outcome).
+    let (pool_2, actual_victim_out, _v_fee) = pool_1.apply_swap_within_tick(
+        attack.victim.amount_in as u128,
+        victim_a_to_b,
+        fee_num,
+        fee_den,
+    )?;
+
+    // 3. Counterfactual: victim on pool_0 (no frontrun).
+    let (_pool_no_frontrun, counterfactual_victim_out, _) = pool_0.apply_swap_within_tick(
+        attack.victim.amount_in as u128,
+        victim_a_to_b,
+        fee_num,
+        fee_den,
+    )?;
+
+    // Loss in quote-token smallest units (same normalisation as
+    // ConstantProduct path).
+    let raw_victim_delta = (counterfactual_victim_out as i64 - actual_victim_out as i64).max(0);
+    let victim_loss = match attack.victim.direction {
+        SwapDirection::Buy => (raw_victim_delta as f64 * quote_per_base_0) as i64,
+        SwapDirection::Sell => raw_victim_delta,
+    };
+
+    // 4. Backrun on pool_2.
+    let (_pool_3, backrun_out, _b_fee) = pool_2.apply_swap_within_tick(
+        attack.backrun.amount_in as u128,
+        backrun_a_to_b,
+        fee_num,
+        fee_den,
+    )?;
+
+    let raw_profit = (backrun_out as i64) - (attack.frontrun.amount_in as i64);
+    let attacker_profit_real = match attack.frontrun.direction {
+        SwapDirection::Buy => raw_profit,
+        SwapDirection::Sell => (raw_profit as f64 * quote_per_base_0) as i64,
+    };
+
+    let spot_b_per_a_1 = whirlpool_spot_price_b_per_a(pool_1);
+    let quote_per_base_1 = if base_is_token_a {
+        spot_b_per_a_1
+    } else {
+        1.0 / spot_b_per_a_1
+    };
+    let price_impact_bps =
+        (((quote_per_base_1 - quote_per_base_0) / quote_per_base_0).abs() * 10_000.0) as u32;
+
+    // Counterfactual attacker (Tier 3.5): backrun on pool_1 (no victim).
+    let (_pool_no_victim, backrun_out_no_victim, _) = pool_1.apply_swap_within_tick(
+        attack.backrun.amount_in as u128,
+        backrun_a_to_b,
+        fee_num,
+        fee_den,
+    )?;
+    let raw_profit_no_victim = backrun_out_no_victim as i64 - attack.frontrun.amount_in as i64;
+    let counterfactual_attacker_profit_no_victim = match attack.frontrun.direction {
+        SwapDirection::Buy => raw_profit_no_victim,
+        SwapDirection::Sell => (raw_profit_no_victim as f64 * quote_per_base_0) as i64,
+    };
+
+    // Per-step residuals (Tier 3.2). apply_swap_within_tick returns u128
+    // amounts but parser observations are u64; saturate-narrow before
+    // diffing.
+    let residual_bps_frontrun = residual_bps(narrow_u64(fr_out), attack.frontrun.amount_out);
+    let residual_bps_victim =
+        residual_bps(narrow_u64(actual_victim_out), attack.victim.amount_out);
+    let residual_bps_backrun = residual_bps(narrow_u64(backrun_out), attack.backrun.amount_out);
+
+    // CI on victim_loss (Tier 3.3) — same envelope rule as ConstantProduct
+    // path so vigil-v1 receipts come out shaped identically across DEX
+    // kinds.
+    let max_abs_residual_bps = [
+        residual_bps_frontrun,
+        residual_bps_victim,
+        residual_bps_backrun,
+    ]
+    .iter()
+    .filter_map(|x| x.map(|v| v.unsigned_abs()))
+    .max();
+    let (victim_loss_lower, victim_loss_upper) = match max_abs_residual_bps {
+        Some(max_abs) if victim_loss > 0 && max_abs < 10_000 => {
+            let half_width = max_abs as f64 / 10_000.0;
+            let lower = ((victim_loss as f64) * (1.0 - half_width)).max(0.0) as i64;
+            let upper = ((victim_loss as f64) * (1.0 + half_width)) as i64;
+            (Some(lower), Some(upper))
+        }
+        _ => (None, None),
+    };
+
+    Some(LossEstimate {
+        victim_loss,
+        attacker_profit_real,
+        price_impact_bps,
+        counterfactual_victim_out: narrow_u64(counterfactual_victim_out),
+        actual_victim_out: narrow_u64(actual_victim_out),
+        residual_bps_frontrun,
+        residual_bps_victim,
+        residual_bps_backrun,
+        counterfactual_attacker_profit_no_victim,
+        victim_loss_lower,
+        victim_loss_upper,
+    })
+}
+
+/// Whirlpool spot price (token_b per token_a) from a Q64.64 sqrt_price.
+/// `f64` precision is fine for the bps-level downstream uses (severity,
+/// price_impact_bps, sandwich-direction normalisation); exact rational
+/// arithmetic isn't justified.
+fn whirlpool_spot_price_b_per_a(pool: WhirlpoolPool) -> f64 {
+    let sp = pool.sqrt_price_q64 as f64 / (1u128 << 64) as f64;
+    sp * sp
+}
+
+/// Saturating-narrow a u128 swap-leg amount to u64. Real Whirlpool swap
+/// outputs always fit in u64 (SPL token amounts), but the math layer
+/// returns u128 and we want a deterministic floor on malformed inputs.
+fn narrow_u64(amount: u128) -> u64 {
+    amount.min(u64::MAX as u128) as u64
 }
 
 #[cfg(test)]
@@ -551,5 +738,123 @@ mod tests {
         assert!(loss.victim_loss <= 0);
         assert!(loss.victim_loss_lower.is_none());
         assert!(loss.victim_loss_upper.is_none());
+    }
+
+    // ----- Tier 3.4 — Whirlpool within-tick replay -----------------------
+
+    fn make_whirlpool(liquidity: u128, tick: i32, spacing: u16) -> WhirlpoolPool {
+        let sp = crate::orca_whirlpool::tick_math::sqrt_price_at_tick(tick);
+        WhirlpoolPool {
+            liquidity,
+            sqrt_price_q64: sp,
+            tick_current_index: tick,
+            tick_spacing: spacing,
+            fee_rate_hundredths_bps: 3_000,
+        }
+    }
+
+    /// Happy-path within-tick sandwich: large pool, modest swap amounts
+    /// that don't approach the next tick boundary. `base_is_token_a=true`
+    /// means the parser oriented base = mint_a — Buy maps to b→a.
+    #[test]
+    fn whirlpool_within_tick_sandwich_produces_loss() {
+        let pool_0 = make_whirlpool(1_000_000_000_000, 10, 64);
+
+        // Pre-simulate the frontrun so the backrun's amount_in matches
+        // what the attacker actually got out (same shape as
+        // sandwich_produces_positive_victim_loss_and_profit above).
+        // base=token_a, Buy ⇒ a_to_b=false.
+        let (_, fr_out, _) = pool_0
+            .apply_swap_within_tick(100_000_000, false, 3_000, 1_000_000)
+            .expect("frontrun within-tick");
+
+        let mut attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 100_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 10_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 0, 0),
+        );
+        attack.backrun.amount_in = fr_out as u64;
+
+        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true)
+            .expect("within-tick replay should succeed on this fixture");
+        assert!(
+            loss.victim_loss > 0,
+            "expected positive victim loss, got {}",
+            loss.victim_loss,
+        );
+        assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
+        assert!(loss.price_impact_bps > 0);
+    }
+
+    /// Cross-tick attempt: tiny liquidity + huge frontrun ⇒
+    /// apply_swap_within_tick bails on the very first leg, and
+    /// compute_loss_whirlpool propagates None. Caller (enrich_attack)
+    /// uses this to route the attack to CrossTickUnsupported.
+    #[test]
+    fn whirlpool_cross_tick_returns_none() {
+        let pool_0 = make_whirlpool(1_000, 10, 64);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 1_000_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 1, 0),
+            swap("b", "atk", SwapDirection::Sell, 1, 0),
+        );
+        assert!(
+            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),
+        );
+    }
+
+    /// Direction mismatch (victim opposite frontrun) — same invariant
+    /// the ConstantProduct path enforces, mirrored here.
+    #[test]
+    fn whirlpool_rejects_direction_mismatch() {
+        let pool_0 = make_whirlpool(1_000_000_000_000, 10, 64);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 100_000, 0),
+            swap("v", "vic", SwapDirection::Sell, 100_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 100_000, 0),
+        );
+        assert!(
+            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),
+        );
+    }
+
+    #[test]
+    fn whirlpool_rejects_same_direction_backrun() {
+        let pool_0 = make_whirlpool(1_000_000_000_000, 10, 64);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 100_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 100_000, 0),
+            swap("b", "atk", SwapDirection::Buy, 100_000, 0),
+        );
+        assert!(
+            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true).is_none(),
+        );
+    }
+
+    /// `base_is_token_a=false` (base sits on token_b — happens when
+    /// mint_a is the recognised quote, e.g. a SOL-quoted pool with SOL
+    /// on the a-side and the memecoin on the b-side). The a/b swap
+    /// direction flips relative to the base_is_token_a=true case, but
+    /// the loss accounting compensates via `quote_per_base = 1/spot`,
+    /// so the same-shape sandwich still produces a positive victim
+    /// loss.
+    #[test]
+    fn whirlpool_base_on_token_b_produces_loss_too() {
+        let pool_0 = make_whirlpool(1_000_000_000_000, 10, 64);
+        // base=token_b, Buy ⇒ a_to_b=true.
+        let (_, fr_out, _) = pool_0
+            .apply_swap_within_tick(100_000_000, true, 3_000, 1_000_000)
+            .expect("frontrun within-tick");
+        let mut attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 100_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 10_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 0, 0),
+        );
+        attack.backrun.amount_in = fr_out as u64;
+
+        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, false)
+            .expect("within-tick replay should succeed (base on token_b)");
+        assert!(loss.victim_loss > 0);
+        assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
     }
 }
