@@ -67,7 +67,7 @@ fn parse_transaction(
 
     let instructions = parse_compiled_instructions(&raw_message.instructions, &account_keys);
     let inner_instructions = parse_inner_instructions(&meta, &account_keys);
-    let token_balance_changes = parse_token_balance_changes(&meta);
+    let token_balance_changes = parse_token_balance_changes(&meta, &account_keys);
     let sol_balance_changes = parse_sol_balance_changes(&meta, &account_keys);
     let fee = meta.fee;
 
@@ -180,7 +180,10 @@ fn parse_sol_balance_changes(
         .collect()
 }
 
-fn parse_token_balance_changes(meta: &UiTransactionStatusMeta) -> Vec<TokenBalanceChange> {
+fn parse_token_balance_changes(
+    meta: &UiTransactionStatusMeta,
+    account_keys: &[String],
+) -> Vec<TokenBalanceChange> {
     let pre_balances = match &meta.pre_token_balances {
         OptionSerializer::Some(b) => b,
         _ => return Vec::new(),
@@ -210,8 +213,13 @@ fn parse_token_balance_changes(meta: &UiTransactionStatusMeta) -> Vec<TokenBalan
             _ => continue,
         };
 
+        let Some(account) = account_keys.get(post_bal.account_index as usize).cloned() else {
+            continue;
+        };
+
         changes.push(TokenBalanceChange {
             mint: post_bal.mint.clone(),
+            account,
             owner,
             pre_amount,
             post_amount,

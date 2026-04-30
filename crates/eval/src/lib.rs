@@ -1,3 +1,4 @@
+pub mod economics;
 pub mod helius;
 pub mod jito;
 pub mod labels;

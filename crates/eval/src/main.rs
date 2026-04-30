@@ -1,13 +1,15 @@
 use std::io::{self, BufRead, Write};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use swap_events::source::BlockSource as _;
+use swap_events::types::SandwichAttack;
 
 use sandwich_eval::{
+    economics,
     helius::{self, HeliusClient},
     jito::JitoBundleClient,
     labels::{DatasetMetadata, LabelDataset, LabelProvenance, LabeledExample, SandwichTxSigs},
@@ -79,6 +81,24 @@ enum Command {
         output: String,
     },
 
+    /// Aggregate a JSONL stream of `SandwichAttack`s into an economics report.
+    ///
+    /// Pairs with `sandwich-detect --range A-B > detections.jsonl`: the scan
+    /// writes one detection per line, this command reads the file (or stdin)
+    /// and prints the headline numbers without holding the full dataset in
+    /// the scanner's memory.
+    Summarize {
+        /// Path to a JSONL file of `SandwichAttack` records. Use `-` for stdin.
+        #[arg(long, default_value = "-")]
+        input: String,
+        /// Cap on the top-attackers list in the report.
+        #[arg(long, default_value = "10")]
+        top_n: usize,
+        /// Emit the report as JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Interactively label sandwich candidates.
     Label {
         /// Path to sampled slots file
@@ -107,6 +127,8 @@ enum DetectorChoice {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -132,6 +154,8 @@ async fn main() -> Result<()> {
         } => measure(&labels, &rpc, &detector, window_slots, output.as_deref()).await?,
 
         Command::Report { results } => report(&results)?,
+
+        Command::Summarize { input, top_n, json } => summarize(&input, top_n, json)?,
 
         Command::Sample {
             count,
@@ -243,6 +267,46 @@ fn report(results_path: &str) -> Result<()> {
     Ok(())
 }
 
+fn summarize(input: &str, top_n: usize, as_json: bool) -> Result<()> {
+    let reader: Box<dyn BufRead> = if input == "-" {
+        Box::new(io::BufReader::new(io::stdin()))
+    } else {
+        let file = std::fs::File::open(input)
+            .with_context(|| format!("opening JSONL input at {}", input))?;
+        Box::new(io::BufReader::new(file))
+    };
+
+    let mut attacks: Vec<SandwichAttack> = Vec::new();
+    let mut skipped = 0usize;
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading line {}", line_no + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SandwichAttack>(trimmed) {
+            Ok(a) => attacks.push(a),
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!("line {}: {}", line_no + 1, e);
+            }
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!("skipped {} unparseable line(s)", skipped);
+    }
+    tracing::info!("aggregating {} attacks", attacks.len());
+
+    let report = economics::aggregate(&attacks, top_n);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report);
+    }
+    Ok(())
+}
+
 async fn sample(
     count: usize,
     start_slot: u64,
@@ -327,7 +391,7 @@ async fn label(
         .iter()
         .filter(|s| s.has_block && !already_labeled.contains(&s.slot))
         .collect();
-    slots_to_label.sort_by(|a, b| b.sameblock_candidates.cmp(&a.sameblock_candidates));
+    slots_to_label.sort_by_key(|s| std::cmp::Reverse(s.sameblock_candidates));
 
     let source = swap_events::source::rpc::RpcBlockSource::new(rpc_url);
     let parsers = swap_events::dex::all_parsers();

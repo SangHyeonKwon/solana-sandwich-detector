@@ -1,0 +1,8 @@
+{
+  "slot": 285000037,
+  "fixture": "fixtures/slot_285000037.json",
+  "description": "Mainnet block with multiple bot operators running wide-spread same-block sandwiches. Used as the seed regression case for Tier 4 — 86 detections at the time of seeding, 458 txs, 82 swaps.",
+  "min_total": 80,
+  "max_total": 110,
+  "min_wide_sandwich": 70
+}

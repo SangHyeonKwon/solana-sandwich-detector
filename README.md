@@ -107,9 +107,14 @@ sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4
 
 # Pretty-print for humans
 sandwich-detect --rpc $RPC_URL --follow --format pretty
+
+# Scan a range and print an aggregate economics summary at the end
+# (enrichment is on by default; pass --no-enrich to disable, --summary to
+# emit the aggregate to stderr)
+sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4 --summary
 ```
 
-`RPC_URL` can be passed via `--rpc` flag or as an environment variable.
+`RPC_URL` can be passed via `--rpc` flag or as an environment variable. Pool-state enrichment also uses that RPC by default; set `--pool-state $OTHER_URL` (or `POOL_STATE_RPC`) to route config fetches elsewhere.
 
 ---
 
@@ -159,6 +164,29 @@ Each detection gets a composite **confidence score** (0.0-1.0) weighted across t
 | Same slot (same-block) or within W slots (window) | Temporal proximity |
 
 The detector uses a **hybrid parsing approach**: instruction discriminators identify the DEX program and pool address, while pre/post token balance changes determine swap direction and amounts. This is more robust than pure instruction decoding since it works even when instruction formats change.
+
+### Victim loss measurement (AMM replay)
+
+Rule-based detection answers *"was this a sandwich?"* but not *"how much did the victim lose?"* — the naive `backrun.amount_out - frontrun.amount_in` heuristic breaks for multi-token pairs and doesn't account for price-impact dynamics. The `pool-state` crate fixes both by replaying each swap through the AMM's math:
+
+```
+state_0  = pool reserves just before the frontrun  (from tx meta)
+state_1  = state_0 after frontrun
+state_2  = state_1 after victim
+victim_actual_out   = what the victim received (via state_1)
+victim_expected_out = what they would have received without the frontrun (via state_0)
+victim_loss         = victim_expected_out - victim_actual_out
+```
+
+Reserves at each step come from the transaction's own `pre_token_balances` / `post_token_balances` — no historical RPC needed. Pool config (vault addresses, fee rate) is fetched once per pool via `getAccountInfo` and cached. Currently supported: **Raydium V4** and **Raydium CPMM** (constant-product). CLMM/Whirlpool tick math is a follow-up.
+
+When enrichment succeeds, each `SandwichAttack` gets:
+
+- `victim_loss_lamports` — AMM-correct, in the quote token's smallest unit (Vigil ERD `mev_attack.victim_loss_lamports`)
+- `attacker_profit` — counterfactual attacker gross profit (Vigil ERD `mev_attack.attacker_profit`); differs from the naive `estimated_attacker_profit` when rule-based logic over-attributes
+- `price_impact_bps` — frontrun-induced price shift in basis points
+
+Attacks on unsupported DEXes pass through with these fields set to `None`.
 
 ---
 
@@ -228,9 +256,10 @@ crates/
   swap-events/           Swap event types, DEX parsers, block sources
   detector-sameblock/    Same-block sandwich detection
   detector-window/       Cross-slot window detector + precision filters
+  pool-state/            AMM math + pool-state enrichment (victim loss, real profit)
   detector/              Facade crate (re-exports for backward compatibility)
   cli/                   CLI binary (sandwich-detect)
-  eval/                  Evaluation framework (labels, metrics, Jito integration)
+  eval/                  Evaluation framework + economic aggregates
 ```
 
 ---
@@ -247,6 +276,7 @@ This library covers **detection over a stream of blocks** -- both same-block and
 - Confidence scoring and filter tuning
 - Jito bundle integration improvements
 - Eval framework improvements (metrics, labeling tools)
+- Pool-state coverage for more AMMs (Orca Whirlpool CLMM, Raydium CLMM, Meteora DLMM)
 - Mainnet test fixtures
 - Performance: allocation reduction, parallelism, batching
 - API ergonomics, documentation, examples
@@ -255,7 +285,6 @@ This library covers **detection over a stream of blocks** -- both same-block and
 **Out of scope** (these belong in a downstream consumer like Vigil):
 
 - Validator-aware or leader-aware analysis
-- Pool reserve reconstruction for precise victim loss
 - Multi-hop Jupiter route resolution
 - Wash-trading false-positive filters
 - ML-based confidence scoring
@@ -286,6 +315,33 @@ cargo test --workspace
 # Check everything compiles
 cargo check --workspace
 ```
+
+---
+
+## Reproduce the numbers
+
+The measurement flow is deterministic — given a slot range and RPC endpoint, anyone gets the same output. To reproduce a run:
+
+```bash
+# Raw detections as JSONL (one per line). Use this for any multi-day run —
+# the scanner doesn't buffer, it just streams to disk.
+sandwich-detect \
+    --rpc $RPC_URL \
+    --range <START>-<END> \
+    --window 4 \
+    --pool-state $RPC_URL \
+  > detections.jsonl
+
+# Aggregate the JSONL into the headline report (human-readable or JSON).
+sandwich-eval summarize --input detections.jsonl > report.txt
+sandwich-eval summarize --input detections.jsonl --json > report.json
+```
+
+For short runs the scanner can also emit the report itself by passing `--summary`; the aggregation is done in-memory, which is fine up to a few hundred MB of detections but not for multi-day scans.
+
+The summary includes total victim loss (quote-token smallest unit), unique attackers/victims/pools, per-DEX breakdown, top attackers by extracted value, and a *reclassification rate* — the share of sandwiches the naive rule-based profit flags as profitable but AMM replay shows to be losing money. That reclassification is the signal that makes pool-state enrichment worth running.
+
+Results for specific slot ranges (and the raw JSONL used to produce them) will be published alongside write-ups; see [Vigil](https://github.com/EarthIsMine/Vigil-RPC) for ongoing runs.
 
 ---
 

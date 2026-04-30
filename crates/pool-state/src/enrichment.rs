@@ -1,0 +1,380 @@
+//! Post-processor that attaches AMM-correct victim loss and attacker profit to
+//! a detected [`SandwichAttack`].
+//!
+//! Kept separate from the detector because detectors work on streams of
+//! [`SwapEvent`] and don't retain the full [`TransactionData`] — pool-state
+//! enrichment needs the tx meta to read vault reserves. So the flow is:
+//!
+//!   1. Detector produces a [`SandwichAttack`] from [`SwapEvent`]s.
+//!   2. Caller (CLI, eval harness) keeps a slot → [`TransactionData`] cache.
+//!   3. Caller invokes [`enrich_attack`] with the attack, the frontrun's tx
+//!      data, and a [`PoolStateLookup`]. Fields are filled in place.
+
+use swap_events::types::{DetectionEvidence, SandwichAttack, Severity, Signal, TransactionData};
+
+use crate::{compute_loss_with_trace, reserves, ConstantProduct, PoolStateLookup};
+
+/// Outcome of an enrichment attempt. Signals *why* it failed so callers can
+/// distinguish transient issues (unsupported DEX) from real problems
+/// (pool config resolved but reserves missing — likely a parser bug).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentResult {
+    /// Fields filled in.
+    Enriched,
+    /// DEX not supported by pool-state (e.g. Jupiter, CLMM).
+    UnsupportedDex,
+    /// Pool config couldn't be fetched (bad pubkey, RPC error, unknown layout).
+    ConfigUnavailable,
+    /// Pool config resolved but the frontrun tx didn't contain vault balances —
+    /// shouldn't happen for a real sandwich in the attacked pool.
+    ReservesMissing,
+    /// Replay returned `None` (direction mismatch or zero reserves).
+    ReplayFailed,
+}
+
+/// Attempt to fill `victim_loss_lamports`, `attacker_profit`, and
+/// `price_impact_bps` on `attack` using AMM replay.
+pub async fn enrich_attack(
+    attack: &mut SandwichAttack,
+    frontrun_tx: &TransactionData,
+    lookup: &dyn PoolStateLookup,
+) -> EnrichmentResult {
+    // Short-circuit DEXes we don't yet replay.
+    if crate::lookup::AmmKind::from_dex(attack.dex).is_none() {
+        return EnrichmentResult::UnsupportedDex;
+    }
+
+    let Some(config) = lookup.pool_config(&attack.pool, attack.dex).await else {
+        return EnrichmentResult::ConfigUnavailable;
+    };
+
+    let Some(tx_reserves) = reserves::extract(frontrun_tx, &config) else {
+        let accounts: Vec<&str> = frontrun_tx
+            .token_balance_changes
+            .iter()
+            .map(|b| b.account.as_str())
+            .collect();
+        tracing::debug!(
+            "ReservesMissing: pool={} vault_base={} vault_quote={} tx_accounts={:?}",
+            config.pool,
+            config.vault_base,
+            config.vault_quote,
+            accounts,
+        );
+        return EnrichmentResult::ReservesMissing;
+    };
+
+    let pool_0 = ConstantProduct::new(
+        tx_reserves.pre.0,
+        tx_reserves.pre.1,
+        config.fee_num,
+        config.fee_den,
+    );
+
+    let Some((loss, trace)) = compute_loss_with_trace(attack, pool_0) else {
+        return EnrichmentResult::ReplayFailed;
+    };
+
+    attack.victim_loss_lamports = Some(loss.victim_loss);
+    attack.attacker_profit = Some(loss.attacker_profit_real);
+    attack.price_impact_bps = Some(loss.price_impact_bps);
+
+    // Derive severity from victim_loss vs pool quote-side TVL. Both values are
+    // already normalized to quote-token smallest units (see counterfactual.rs),
+    // so the ratio is dimensionless. We deliberately use the *pre-frontrun*
+    // quote reserve as the depth reference — the severity is "how much of the
+    // pool's standing depth did this attack consume", not a post-state metric.
+    // A degenerate pool (zero quote reserve) leaves severity unset rather than
+    // forcing a divide-by-zero into Critical.
+    if attack.severity.is_none() {
+        let pool_quote_tvl = tx_reserves.pre.1;
+        if pool_quote_tvl > 0 {
+            let loss_ratio = (loss.victim_loss.max(0) as f64) / (pool_quote_tvl as f64);
+            attack.severity = Some(Severity::from_loss_ratio(loss_ratio));
+        }
+    }
+
+    // ReplayConfidence = 1 - (actual / counterfactual), clamped to [0, 1].
+    // A counterfactual of zero means the victim wouldn't have gotten anything
+    // even without the frontrun (malformed swap); treat that as no signal.
+    let replay_confidence: f64 = if trace.counterfactual_victim_out > 0 {
+        let ratio = trace.actual_victim_out as f64 / trace.counterfactual_victim_out as f64;
+        (1.0f64 - ratio).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let amm_signals = vec![
+        Signal::AmmProfit {
+            attacker_profit_real: loss.attacker_profit_real,
+        },
+        Signal::VictimLoss {
+            lamports: loss.victim_loss,
+            impact_bps: loss.price_impact_bps,
+        },
+        Signal::ReplayConfidence {
+            value: replay_confidence,
+        },
+    ];
+
+    match attack.evidence.as_mut() {
+        Some(ev) => ev.extend(amm_signals),
+        None => attack.evidence = Some(DetectionEvidence::from_signals(amm_signals)),
+    }
+    attack.amm_replay = Some(trace);
+
+    EnrichmentResult::Enriched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lookup::{AmmKind, PoolConfig};
+    use async_trait::async_trait;
+    use swap_events::types::{
+        DexType, SwapDirection, SwapEvent, TokenBalanceChange, TransactionData,
+    };
+
+    struct MockLookup {
+        config: PoolConfig,
+    }
+
+    #[async_trait]
+    impl PoolStateLookup for MockLookup {
+        async fn pool_config(&self, _pool: &str, _dex: DexType) -> Option<PoolConfig> {
+            Some(self.config.clone())
+        }
+    }
+
+    fn make_swap(
+        sig: &str,
+        signer: &str,
+        dir: SwapDirection,
+        amount_in: u64,
+        amount_out: u64,
+    ) -> SwapEvent {
+        SwapEvent {
+            signature: sig.into(),
+            signer: signer.into(),
+            dex: DexType::RaydiumV4,
+            pool: "POOL".into(),
+            direction: dir,
+            token_mint: "MINT".into(),
+            amount_in,
+            amount_out,
+            tx_index: 0,
+            slot: None,
+            fee: Some(5000),
+        }
+    }
+
+    fn make_attack() -> SandwichAttack {
+        let frontrun = make_swap("f", "atk", SwapDirection::Buy, 500_000_000, 0);
+        let victim = make_swap("v", "vic", SwapDirection::Buy, 100_000_000, 0);
+        let backrun = make_swap("b", "atk", SwapDirection::Sell, 499_000_000, 0);
+        SandwichAttack {
+            slot: 100,
+            attacker: "atk".into(),
+            pool: "POOL".into(),
+            dex: DexType::RaydiumV4,
+            frontrun,
+            victim,
+            backrun,
+            estimated_attacker_profit: None,
+            victim_loss_lamports: None,
+            frontrun_slot: None,
+            backrun_slot: None,
+            detection_method: None,
+            bundle_provenance: None,
+            confidence: None,
+            net_profit: None,
+            attacker_profit: None,
+            price_impact_bps: None,
+            evidence: None,
+            amm_replay: None,
+            attack_signature: None,
+            timestamp_ms: None,
+            attack_type: None,
+            severity: None,
+            confidence_level: None,
+            slot_leader: None,
+            is_wide_sandwich: false,
+            receipts: vec![],
+            victim_signer: None,
+            victim_amount_in: None,
+            victim_amount_out: None,
+            victim_amount_out_expected: None,
+        }
+    }
+
+    fn make_frontrun_tx() -> TransactionData {
+        TransactionData {
+            signature: "f".into(),
+            signer: "atk".into(),
+            success: true,
+            tx_index: 0,
+            account_keys: vec![],
+            instructions: vec![],
+            inner_instructions: vec![],
+            // Vault pre_amount are what compute_loss sees as pool reserves just
+            // before the frontrun executed.
+            token_balance_changes: vec![
+                TokenBalanceChange {
+                    mint: "BASE_MINT".into(),
+                    account: "VAULT_BASE".into(),
+                    owner: "POOL_AUTHORITY".into(),
+                    pre_amount: 1_000_000_000,
+                    post_amount: 999_000_000,
+                },
+                TokenBalanceChange {
+                    mint: "QUOTE_MINT".into(),
+                    account: "VAULT_QUOTE".into(),
+                    owner: "POOL_AUTHORITY".into(),
+                    pre_amount: 1_000_000_000,
+                    post_amount: 1_500_000_000,
+                },
+            ],
+            sol_balance_changes: vec![],
+            fee: 5000,
+            log_messages: vec![],
+        }
+    }
+
+    fn make_config() -> PoolConfig {
+        PoolConfig {
+            kind: AmmKind::RaydiumV4,
+            pool: "POOL".into(),
+            vault_base: "VAULT_BASE".into(),
+            vault_quote: "VAULT_QUOTE".into(),
+            base_mint: "BASE_MINT".into(),
+            quote_mint: "QUOTE_MINT".into(),
+            fee_num: 25,
+            fee_den: 10_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn enriches_fields_on_happy_path() {
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.unwrap() > 0);
+        assert!(attack.price_impact_bps.unwrap() > 0);
+        assert!(attack.attacker_profit.is_some());
+        // Severity should be populated alongside the loss number; the exact
+        // bucket depends on the loss/TVL ratio, just assert it's set so a
+        // future TVL change doesn't silently regress to None.
+        assert!(
+            attack.severity.is_some(),
+            "severity should be derived from victim_loss / pool_quote_tvl"
+        );
+    }
+
+    #[tokio::test]
+    async fn severity_matches_loss_to_tvl_ratio() {
+        use swap_events::types::Severity;
+
+        // 500M frontrun against 1B/1B reserves is enough movement that the
+        // 100M victim loses a meaningful fraction of pool depth — well above
+        // the 0.01% Medium threshold but typically below the 1% Critical mark.
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        enrich_attack(&mut attack, &tx, &lookup).await;
+        let loss = attack.victim_loss_lamports.unwrap();
+        // tx_reserves.pre.1 (quote vault pre_amount) is 1_000_000_000.
+        let expected = Severity::from_loss_ratio((loss.max(0) as f64) / 1_000_000_000.0);
+        assert_eq!(attack.severity, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn severity_caller_set_value_is_preserved() {
+        use swap_events::types::Severity;
+
+        let mut attack = make_attack();
+        attack.severity = Some(Severity::Critical);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        enrich_attack(&mut attack, &tx, &lookup).await;
+        // Pre-existing severity must not be overwritten — keeps callers
+        // free to inject a domain-specific severity (e.g. Authority-Hop).
+        assert_eq!(attack.severity, Some(Severity::Critical));
+    }
+
+    #[tokio::test]
+    async fn amm_replay_trace_attached_and_consistent() {
+        use swap_events::types::Signal;
+
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        enrich_attack(&mut attack, &tx, &lookup).await;
+
+        // Replay trace present and matches the tx's pre-balances.
+        let trace = attack.amm_replay.as_ref().expect("replay trace attached");
+        assert_eq!(trace.reserves_pre, (1_000_000_000, 1_000_000_000));
+        // After frontrun (Buy, quote→base), base reserve drops and quote rises.
+        assert!(trace.reserves_post_front.0 < trace.reserves_pre.0);
+        assert!(trace.reserves_post_front.1 > trace.reserves_pre.1);
+        // AMM signals appended to evidence.
+        let ev = attack
+            .evidence
+            .as_ref()
+            .expect("evidence present after enrichment");
+        let has_amm_profit = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .any(|s| matches!(s, Signal::AmmProfit { .. }));
+        let has_victim_loss = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .any(|s| matches!(s, Signal::VictimLoss { .. }));
+        assert!(has_amm_profit, "AmmProfit signal missing");
+        assert!(has_victim_loss, "VictimLoss signal missing");
+        // Counterfactual > actual victim out when frontrun moved price away.
+        assert!(trace.counterfactual_victim_out > trace.actual_victim_out);
+    }
+
+    #[tokio::test]
+    async fn reports_unsupported_dex_without_rpc() {
+        let mut attack = make_attack();
+        attack.dex = DexType::Phoenix;
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        assert_eq!(result, EnrichmentResult::UnsupportedDex);
+        assert!(attack.victim_loss_lamports.is_none());
+    }
+
+    #[tokio::test]
+    async fn reports_reserves_missing_when_vault_absent() {
+        let mut attack = make_attack();
+        let mut tx = make_frontrun_tx();
+        tx.token_balance_changes.clear();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+
+        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        assert_eq!(result, EnrichmentResult::ReservesMissing);
+    }
+}

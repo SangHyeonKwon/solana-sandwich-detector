@@ -52,22 +52,37 @@ fn is_swap_ix(data: &[u8]) -> bool {
             || data[..8] == SWAP_BASE_OUTPUT_DISCRIMINATOR)
 }
 
-/// Pool state is at accounts[2] in Raydium CPMM swap
-/// (after payer, authority).
+/// Pool state is at accounts[3] in Raydium CPMM swap.
+///
+/// Swap account layout (from raydium-io/raydium-cp-swap):
+///   0: payer (signer)
+///   1: authority (PDA)
+///   2: amm_config
+///   3: pool_state              ← the pool whose reserves we care about
+///   4: input_token_account
+///   5: output_token_account
+///   6: input_vault
+///   7: output_vault
+///   8+: programs, mints, observation_state
+///
+/// Earlier versions of this parser used index 2, which returned the
+/// `amm_config` PDA — a 236-byte shared config account, not the pool.
+/// Downstream pool-state enrichment then failed with `ReservesMissing`
+/// because the parsed "vault" offsets pointed to unrelated bytes.
 fn find_pool(tx: &TransactionData) -> Option<String> {
     for ix in &tx.instructions {
-        if ix.program_id == RAYDIUM_CPMM_PROGRAM_ID && is_swap_ix(&ix.data) && ix.accounts.len() > 2
+        if ix.program_id == RAYDIUM_CPMM_PROGRAM_ID && is_swap_ix(&ix.data) && ix.accounts.len() > 3
         {
-            return Some(ix.accounts[2].clone());
+            return Some(ix.accounts[3].clone());
         }
     }
     for group in &tx.inner_instructions {
         for ix in &group.instructions {
             if ix.program_id == RAYDIUM_CPMM_PROGRAM_ID
                 && is_swap_ix(&ix.data)
-                && ix.accounts.len() > 2
+                && ix.accounts.len() > 3
             {
-                return Some(ix.accounts[2].clone());
+                return Some(ix.accounts[3].clone());
             }
         }
     }

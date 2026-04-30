@@ -6,6 +6,7 @@ members = [
     "crates/detector",
     "crates/cli",
     "crates/eval",
+    "crates/pool-state",
 ]
 resolver = "2"
 
@@ -16,9 +17,11 @@ license = "MIT"
 
 [workspace.dependencies]
 sandwich-detector = { path = "crates/detector" }
+sandwich-eval = { path = "crates/eval" }
 swap-events = { path = "crates/swap-events" }
 detector-sameblock = { path = "crates/detector-sameblock" }
 detector-window = { path = "crates/detector-window" }
+pool-state = { path = "crates/pool-state" }
 solana-sdk = "2"
 solana-client = "2"
 solana-transaction-status = "2"
@@ -35,3 +38,6 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+dotenvy = "0.15"
+schemars = { version = "0.8", features = ["preserve_order"] }
+proptest = "1"
