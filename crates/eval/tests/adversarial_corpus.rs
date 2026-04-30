@@ -23,6 +23,7 @@
 //! accidentally pass through a guard relaxation.
 
 use sandwich_detector::{
+    authority_hop::{index_by_wallet_pair, AuthorityHop, AuthorityType},
     detector,
     types::{DexType, SwapDirection, SwapEvent},
 };
@@ -142,6 +143,83 @@ fn jit_lp_provider_swap_alone_is_not_a_sandwich() {
         1,
     )];
     assert_no_detections("jit_lp_provider_swap_alone", swaps);
+}
+
+// ---------------------------------------------------------------------
+// Authority-Hop variants — same shape as above but exercising the
+// detect_authority_hop_sandwiches path. The Authority-Hop detector keys
+// on (frontrun_signer, backrun_signer) wallet pairs that appear in a
+// hop index; these scenarios make sure the detector stays quiet when
+// the index doesn't actually link the two wallets.
+// ---------------------------------------------------------------------
+
+fn assert_no_authority_hop_detections(label: &str, swaps: Vec<SwapEvent>, hops: Vec<AuthorityHop>) {
+    let idx = index_by_wallet_pair(hops);
+    let detections = detector::detect_authority_hop_sandwiches(100, &swaps, &idx);
+    assert!(
+        detections.is_empty(),
+        "{label}: expected no authority-hop detections, got {}",
+        detections.len(),
+    );
+}
+
+/// Wallet-mismatch sandwich shape with no SetAuthority observed. The
+/// wallets simply happen to share a pool in the same slot — there's no
+/// custody chain. detector must stay quiet.
+#[test]
+fn wallet_mismatch_without_hop_is_not_an_authority_hop() {
+    let swaps = vec![
+        swap("front", "WALLET_A", "POOL_X", SwapDirection::Buy, 0),
+        swap("victim", "VICTIM", "POOL_X", SwapDirection::Buy, 1),
+        swap("back", "WALLET_B", "POOL_X", SwapDirection::Sell, 2),
+    ];
+    assert_no_authority_hop_detections("wallet_mismatch_without_hop", swaps, vec![]);
+}
+
+/// Mint authority change A → B between two unrelated swaps. The
+/// instruction does land in the slot but it doesn't move trading
+/// capability — `MintTokens` authority controls minting, not the SPL
+/// account's owner. index_by_wallet_pair must not index it, so the
+/// detector can't promote the unrelated triplet into AuthorityHop.
+#[test]
+fn mint_authority_change_does_not_link_unrelated_swaps() {
+    let swaps = vec![
+        swap("front", "WALLET_A", "POOL_X", SwapDirection::Buy, 0),
+        swap("victim", "VICTIM", "POOL_X", SwapDirection::Buy, 1),
+        swap("back", "WALLET_B", "POOL_X", SwapDirection::Sell, 3),
+    ];
+    let hops = vec![AuthorityHop {
+        account: "MINT_X".into(),
+        authority_type: AuthorityType::MintTokens, // not AccountOwner
+        from: "WALLET_A".into(),
+        to: Some("WALLET_B".into()),
+        tx_signature: "tx_mint".into(),
+        slot: 100,
+        tx_index: 2,
+    }];
+    assert_no_authority_hop_detections("mint_authority_change", swaps, hops);
+}
+
+/// Close-account authority change A → B between unrelated swaps. Same
+/// principle as the mint variant — `CloseAccount` authority controls
+/// rent reclamation, not trading. Must not link.
+#[test]
+fn close_authority_change_does_not_link_unrelated_swaps() {
+    let swaps = vec![
+        swap("front", "WALLET_A", "POOL_X", SwapDirection::Buy, 0),
+        swap("victim", "VICTIM", "POOL_X", SwapDirection::Buy, 1),
+        swap("back", "WALLET_B", "POOL_X", SwapDirection::Sell, 3),
+    ];
+    let hops = vec![AuthorityHop {
+        account: "ACCT".into(),
+        authority_type: AuthorityType::CloseAccount,
+        from: "WALLET_A".into(),
+        to: Some("WALLET_B".into()),
+        tx_signature: "tx_close".into(),
+        slot: 100,
+        tx_index: 2,
+    }];
+    assert_no_authority_hop_detections("close_authority_change", swaps, hops);
 }
 
 /// Multi-bot dense block: two unrelated bots open positions in the same

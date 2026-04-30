@@ -137,11 +137,20 @@ pub fn scan_block(block: &BlockData) -> Vec<AuthorityHop> {
 /// backrun_signer B)` can be checked in O(1). Multiple hops may share the
 /// same wallet pair (e.g. an operator rotates several accounts at once); the
 /// detector picks the first by tx_index when constructing evidence.
+///
+/// Only `AuthorityType::AccountOwner` hops are indexed — mint, freeze, and
+/// close authority changes don't transfer trading capability between
+/// wallets, so they can't link a sandwich. Filtering at index time keeps
+/// detector code simple and prevents an irrelevant authority change from
+/// accidentally fusing two unrelated swaps into a false-positive triplet.
 pub fn index_by_wallet_pair(
     hops: Vec<AuthorityHop>,
 ) -> HashMap<(String, String), Vec<AuthorityHop>> {
     let mut idx: HashMap<(String, String), Vec<AuthorityHop>> = HashMap::new();
     for hop in hops {
+        if hop.authority_type != AuthorityType::AccountOwner {
+            continue;
+        }
         if let Some(to) = hop.to.clone() {
             idx.entry((hop.from.clone(), to)).or_default().push(hop);
         }
