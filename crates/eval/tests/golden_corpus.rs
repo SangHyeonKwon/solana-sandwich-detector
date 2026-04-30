@@ -9,7 +9,9 @@
 //! Adding a case is a two-step:
 //!   1. Drop a block JSON under `fixtures/`.
 //!   2. Add a `<name>.json` manifest pointing at it with `min_total` /
-//!      `max_total` based on a baseline run.
+//!      `max_total` based on a baseline run, plus optional breakdowns
+//!      (`min_wide_sandwich`) for tighter regression coverage on the
+//!      attack-type distribution.
 //!
 //! Fixture paths in the manifest are repo-root-relative. The test
 //! resolves them against `CARGO_MANIFEST_DIR/../..` so the suite works
@@ -42,6 +44,13 @@ struct GoldenManifest {
     /// Detection-count ceiling — more than this means the detector
     /// regressed on precision (probably a new false-positive class).
     max_total: usize,
+    /// Optional: minimum number of detections that must classify as
+    /// wide-sandwich (front/back tx_index gap > 1, or cross-slot).
+    /// Pinning the breakdown catches a regression that flips wide
+    /// detections back to narrow without changing the total — invisible
+    /// to `min_total` / `max_total` alone.
+    #[serde(default)]
+    min_wide_sandwich: Option<usize>,
 }
 
 fn repo_root() -> PathBuf {
@@ -116,18 +125,24 @@ fn golden_corpus_within_count_bounds() {
         }
         let detections = run_detector_on_fixture(&fixture_path, manifest.slot);
         let count = detections.len();
+        let manifest_label = manifest_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| manifest_path.display().to_string());
         if count < manifest.min_total || count > manifest.max_total {
             failures.push(format!(
                 "{}: slot {} produced {} detections, expected [{}, {}]",
-                manifest_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| manifest_path.display().to_string()),
-                manifest.slot,
-                count,
-                manifest.min_total,
-                manifest.max_total,
+                manifest_label, manifest.slot, count, manifest.min_total, manifest.max_total,
             ));
+        }
+        if let Some(min_wide) = manifest.min_wide_sandwich {
+            let wide_count = detections.iter().filter(|d| d.compute_is_wide()).count();
+            if wide_count < min_wide {
+                failures.push(format!(
+                    "{}: slot {} produced {} wide-sandwich detections, expected >= {}",
+                    manifest_label, manifest.slot, wide_count, min_wide,
+                ));
+            }
         }
     }
 
