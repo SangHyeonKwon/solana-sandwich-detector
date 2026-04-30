@@ -248,9 +248,105 @@ pub mod tick_math {
     }
 }
 
+/// Within-tick swap math: how `sqrt_price` updates when an exact-input
+/// trade hits a Whirlpool position at constant `liquidity`.
+///
+/// Two helpers, one per direction:
+///   * [`swap_math::next_sqrt_price_a_in`] — token_a in, sqrt_price drops,
+///     rounded *up*.
+///   * [`swap_math::next_sqrt_price_b_in`] — token_b in, sqrt_price rises,
+///     rounded *down*.
+///
+/// Both rounding choices are LP-protective: the trader receives marginally
+/// less of the output asset than continuous math would predict. Mirroring
+/// the on-chain rule lets our replay match the settled outcome exactly
+/// (modulo the f64 oracle's own precision in the property tests).
+///
+/// Reference:
+///   * Uniswap V3 `sqrt_price_math::get_next_sqrt_price_from_amount_in`
+///   * `orca-so/whirlpools` `programs/whirlpool/src/math/sqrt_price_math.rs`
+pub mod swap_math {
+    use crate::fixed_point::mul_div_floor;
+    use primitive_types::U256;
+
+    /// Q64.64 scaling factor (`1 << 64`).
+    pub const Q64: u128 = 1u128 << 64;
+
+    /// Token-a swap-in direction: trader deposits `amount_a` of token A,
+    /// `sqrt_price` drops. Rounded *up* — LP-protective.
+    ///
+    /// Closed form (full precision, computed in U256 throughout):
+    /// ```text
+    ///   new_sqrt = ceil( (L << 64) * sqrt_price /
+    ///                    ((L << 64) + amount_a * sqrt_price) )
+    /// ```
+    /// equivalent to `L * sqrt_price / (L + amount_a * sqrt_price / Q64)`.
+    /// We always run the precise path; V3's lower-precision fallback
+    /// exists only because Solidity's `mulmod` constraints would otherwise
+    /// trip — `checked_mul` on `U256` lets us skip it.
+    ///
+    /// Returns `None` when:
+    ///   * `liquidity == 0` (no curve to slide along),
+    ///   * `sqrt_price == 0` (degenerate — would div-by-zero downstream),
+    ///   * any U256 intermediate saturates,
+    ///   * the rounded quotient exceeds `u128`.
+    pub fn next_sqrt_price_a_in(
+        sqrt_price_q64: u128,
+        liquidity: u128,
+        amount_a: u128,
+    ) -> Option<u128> {
+        if amount_a == 0 {
+            return Some(sqrt_price_q64);
+        }
+        if liquidity == 0 || sqrt_price_q64 == 0 {
+            return None;
+        }
+        // `liquidity << 64` ≤ 2^192, always fits in U256 — no overflow check.
+        let numerator_1 = U256::from(liquidity) << 64;
+        let product = U256::from(amount_a).checked_mul(U256::from(sqrt_price_q64))?;
+        let denominator = numerator_1.checked_add(product)?;
+        let dividend = numerator_1.checked_mul(U256::from(sqrt_price_q64))?;
+        let quotient = dividend / denominator;
+        let remainder = dividend % denominator;
+        let rounded = if remainder.is_zero() {
+            quotient
+        } else {
+            quotient.checked_add(U256::one())?
+        };
+        if rounded.bits() > 128 {
+            None
+        } else {
+            Some(rounded.low_u128())
+        }
+    }
+
+    /// Token-b swap-in direction: trader deposits `amount_b` of token B,
+    /// `sqrt_price` rises. Rounded *down* — same LP-protective intent.
+    ///
+    /// Closed form: `new_sqrt = sqrt_price + floor(amount_b * Q64 / L)`.
+    ///
+    /// Returns `None` when `liquidity == 0`, `mul_div_floor` saturates, or
+    /// the post-add result overflows `u128`.
+    pub fn next_sqrt_price_b_in(
+        sqrt_price_q64: u128,
+        liquidity: u128,
+        amount_b: u128,
+    ) -> Option<u128> {
+        if amount_b == 0 {
+            return Some(sqrt_price_q64);
+        }
+        if liquidity == 0 {
+            return None;
+        }
+        let delta = mul_div_floor(amount_b, Q64, liquidity)?;
+        sqrt_price_q64.checked_add(delta)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::str::FromStr;
 
     const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -453,5 +549,170 @@ mod tests {
         assert_eq!(tick_math::sqrt_price_at_tick(tick_math::MIN_TICK), 0);
         assert_eq!(tick_math::sqrt_price_at_tick(tick_math::MAX_TICK), u128::MAX);
         assert_eq!(tick_math::sqrt_price_at_tick(i32::MAX), u128::MAX);
+    }
+
+    // ----- swap_math ----------------------------------------------------
+
+    #[test]
+    fn a_in_zero_amount_is_identity() {
+        let sp = swap_math::Q64;
+        assert_eq!(swap_math::next_sqrt_price_a_in(sp, 1_000_000, 0), Some(sp));
+    }
+
+    #[test]
+    fn a_in_zero_liquidity_returns_none() {
+        assert_eq!(swap_math::next_sqrt_price_a_in(swap_math::Q64, 0, 1), None);
+    }
+
+    #[test]
+    fn a_in_zero_sqrt_price_returns_none() {
+        // Degenerate pool — V3 fallback would divide by zero; we bail.
+        assert_eq!(swap_math::next_sqrt_price_a_in(0, 1_000_000, 1), None);
+    }
+
+    #[test]
+    fn a_in_drops_sqrt_price() {
+        // Modest swap into a healthy pool — sqrt_price must strictly drop.
+        let sp = swap_math::Q64; // price = 1
+        let l = 1_000_000_000u128;
+        let amount = 1_000_000u128;
+        let new_sp = swap_math::next_sqrt_price_a_in(sp, l, amount).unwrap();
+        assert!(
+            new_sp < sp,
+            "expected drop, got new={new_sp} >= old={sp}",
+        );
+    }
+
+    #[test]
+    fn b_in_zero_amount_is_identity() {
+        let sp = swap_math::Q64;
+        assert_eq!(swap_math::next_sqrt_price_b_in(sp, 1_000_000, 0), Some(sp));
+    }
+
+    #[test]
+    fn b_in_zero_liquidity_returns_none() {
+        assert_eq!(swap_math::next_sqrt_price_b_in(swap_math::Q64, 0, 1), None);
+    }
+
+    #[test]
+    fn b_in_raises_sqrt_price() {
+        let sp = swap_math::Q64;
+        let l = 1_000_000_000u128;
+        let amount = 1_000_000u128;
+        let new_sp = swap_math::next_sqrt_price_b_in(sp, l, amount).unwrap();
+        assert!(new_sp > sp);
+    }
+
+    #[test]
+    fn b_in_overflow_returns_none() {
+        // sqrt_price near u128::MAX; with L=1, amount=1, delta = Q64, and
+        // sp + delta wraps past u128::MAX → must be None.
+        assert_eq!(
+            swap_math::next_sqrt_price_b_in(u128::MAX - 1, 1, 1),
+            None,
+        );
+    }
+
+    /// f64 oracle for a→b. Precision-bounded — only valid inside the
+    /// healthy-pool input range used by the property tests below.
+    fn oracle_a_in(sp_q64: u128, l: u128, amount: u128) -> u128 {
+        let sp = sp_q64 as f64 / swap_math::Q64 as f64;
+        let new_sp = (l as f64 * sp) / (l as f64 + amount as f64 * sp);
+        (new_sp * swap_math::Q64 as f64) as u128
+    }
+
+    /// f64 oracle for b→a.
+    fn oracle_b_in(sp_q64: u128, l: u128, amount: u128) -> u128 {
+        let sp = sp_q64 as f64 / swap_math::Q64 as f64;
+        let new_sp = sp + (amount as f64 / l as f64);
+        (new_sp * swap_math::Q64 as f64) as u128
+    }
+
+    /// `|actual - expected| / max(expected, 1) ≤ tolerance_bps × 1e-4`,
+    /// computed in u128 to dodge f64 rounding in the comparison itself.
+    fn close_in_bps(actual: u128, expected: u128, tolerance_bps: u128) -> bool {
+        let diff = actual.abs_diff(expected);
+        let scale = expected.max(1);
+        diff.saturating_mul(10_000) <= scale.saturating_mul(tolerance_bps)
+    }
+
+    proptest! {
+        /// Doubling `amount_a` must never raise `sqrt_price` (more token_a
+        /// in ⇒ price drops at least as far). Also pins the strict-drop
+        /// property at the smaller amount.
+        #[test]
+        fn prop_a_in_monotone_in_amount(
+            l in 1_000_000u128..1_000_000_000_000u128,
+            sp_int in 1u128..(1u128 << 16),
+            amount in 1u128..1_000_000u128,
+        ) {
+            let sp = sp_int * swap_math::Q64;
+            let r1 = swap_math::next_sqrt_price_a_in(sp, l, amount);
+            let r2 = swap_math::next_sqrt_price_a_in(sp, l, amount * 2);
+            if let (Some(s1), Some(s2)) = (r1, r2) {
+                prop_assert!(
+                    s2 <= s1,
+                    "doubled amount raised sqrt_price: {} -> {}",
+                    s1,
+                    s2,
+                );
+                prop_assert!(s1 < sp);
+            }
+        }
+
+        /// Doubling `amount_b` must never lower `sqrt_price`. Strict-rise
+        /// at the smaller amount.
+        #[test]
+        fn prop_b_in_monotone_in_amount(
+            l in 1_000_000u128..1_000_000_000_000u128,
+            sp_int in 1u128..(1u128 << 16),
+            amount in 1u128..1_000_000u128,
+        ) {
+            let sp = sp_int * swap_math::Q64;
+            let r1 = swap_math::next_sqrt_price_b_in(sp, l, amount);
+            let r2 = swap_math::next_sqrt_price_b_in(sp, l, amount * 2);
+            if let (Some(s1), Some(s2)) = (r1, r2) {
+                prop_assert!(s2 >= s1);
+                prop_assert!(s1 > sp);
+            }
+        }
+
+        /// a→b agrees with the f64 oracle to within 10 bps in a healthy-
+        /// pool band. Range deliberately constrained so f64's 53-bit
+        /// mantissa covers the U256 answer to better than tolerance —
+        /// outside it the oracle, not the implementation, is the loose
+        /// side.
+        #[test]
+        fn prop_a_in_matches_f64_oracle(
+            l in 1_000_000_000u128..1_000_000_000_000u128,
+            sp_int in 1u128..1024u128,
+            amount in 1u128..1_000_000u128,
+        ) {
+            let sp = sp_int * swap_math::Q64;
+            let actual = swap_math::next_sqrt_price_a_in(sp, l, amount).unwrap();
+            let expected = oracle_a_in(sp, l, amount);
+            prop_assert!(
+                close_in_bps(actual, expected, 10),
+                "a_in drift: l={}, sp={}, amount={}, actual={}, oracle={}",
+                l, sp, amount, actual, expected,
+            );
+        }
+
+        /// b→a agrees with the f64 oracle to within 10 bps in same band.
+        #[test]
+        fn prop_b_in_matches_f64_oracle(
+            l in 1_000_000_000u128..1_000_000_000_000u128,
+            sp_int in 1u128..1024u128,
+            amount in 1u128..1_000_000u128,
+        ) {
+            let sp = sp_int * swap_math::Q64;
+            let actual = swap_math::next_sqrt_price_b_in(sp, l, amount).unwrap();
+            let expected = oracle_b_in(sp, l, amount);
+            prop_assert!(
+                close_in_bps(actual, expected, 10),
+                "b_in drift: l={}, sp={}, amount={}, actual={}, oracle={}",
+                l, sp, amount, actual, expected,
+            );
+        }
     }
 }
