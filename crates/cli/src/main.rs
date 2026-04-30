@@ -880,7 +880,12 @@ async fn enrich_from_cache(
         );
         return;
     };
-    let result = enrich_attack(attack, tx, lookup).await;
+    // Backrun tx is optional: when present, enrichment will emit the Tier 3.1
+    // ReservesMatchPostState diff signal. When absent (cross-slot detection
+    // where the backrun fell out of the rolling cache), the rest of the
+    // enrichment still runs unmodified.
+    let backrun_tx = cache.get(&attack.backrun.signature);
+    let result = enrich_attack(attack, tx, backrun_tx, lookup).await;
     if !matches!(result, pool_state::EnrichmentResult::Enriched) {
         tracing::debug!(
             "enrich {:?} {}: {:?}",
@@ -975,6 +980,8 @@ mod tests {
             dex: DexType::RaydiumV4,
             estimated_attacker_profit: Some(100),
             victim_loss_lamports: Some(50),
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             attacker_profit: Some(80),
             price_impact_bps: Some(42),
             frontrun_slot: Some(42),

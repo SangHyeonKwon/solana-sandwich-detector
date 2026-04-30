@@ -328,6 +328,8 @@ mod tests {
             dex,
             estimated_attacker_profit: naive,
             victim_loss_lamports: loss,
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             attacker_profit: real,
             price_impact_bps: None,
             frontrun_slot: None,

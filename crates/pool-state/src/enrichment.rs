@@ -8,11 +8,18 @@
 //!   1. Detector produces a [`SandwichAttack`] from [`SwapEvent`]s.
 //!   2. Caller (CLI, eval harness) keeps a slot → [`TransactionData`] cache.
 //!   3. Caller invokes [`enrich_attack`] with the attack, the frontrun's tx
-//!      data, and a [`PoolStateLookup`]. Fields are filled in place.
+//!      data, an optional backrun tx (used for the Tier 3.1 post-state
+//!      diff check), and a [`PoolStateLookup`]. Fields are filled in place.
 
-use swap_events::types::{DetectionEvidence, SandwichAttack, Severity, Signal, TransactionData};
+use swap_events::types::{
+    DetectionEvidence, ReplayStep, SandwichAttack, Severity, Signal, TransactionData,
+};
 
-use crate::{compute_loss_with_trace, reserves, ConstantProduct, PoolStateLookup};
+use crate::lookup::{AmmKind, DynamicPoolState};
+use crate::{
+    compute_loss_whirlpool, compute_loss_with_trace, diff_test, reserves, ConstantProduct,
+    PoolStateLookup,
+};
 
 /// Outcome of an enrichment attempt. Signals *why* it failed so callers can
 /// distinguish transient issues (unsupported DEX) from real problems
@@ -30,13 +37,25 @@ pub enum EnrichmentResult {
     ReservesMissing,
     /// Replay returned `None` (direction mismatch or zero reserves).
     ReplayFailed,
+    /// Whirlpool sandwich crossed a tick boundary — within-tick replay
+    /// can't compute valid victim_loss / attacker_profit without
+    /// `liquidity_net` from the next initialised TickArray (cross-tick
+    /// walk lands in step 3-γ/δ). Caller treats this like
+    /// [`EnrichmentResult::UnsupportedDex`] (replay-derived fields aren't
+    /// populated) but the variant is distinct so cross-tick rate can be
+    /// tracked.
+    CrossTickUnsupported,
 }
 
 /// Attempt to fill `victim_loss_lamports`, `attacker_profit`, and
-/// `price_impact_bps` on `attack` using AMM replay.
+/// `price_impact_bps` on `attack` using AMM replay. When `backrun_tx` is
+/// supplied, also emit the Tier 3.1 [`Signal::ReservesMatchPostState`]
+/// signal by comparing the replay's `reserves_post_back` against the
+/// backrun tx's actual post-vault balances.
 pub async fn enrich_attack(
     attack: &mut SandwichAttack,
     frontrun_tx: &TransactionData,
+    backrun_tx: Option<&TransactionData>,
     lookup: &dyn PoolStateLookup,
 ) -> EnrichmentResult {
     // Short-circuit DEXes we don't yet replay.
@@ -48,63 +67,119 @@ pub async fn enrich_attack(
         return EnrichmentResult::ConfigUnavailable;
     };
 
-    let Some(tx_reserves) = reserves::extract(frontrun_tx, &config) else {
-        let accounts: Vec<&str> = frontrun_tx
-            .token_balance_changes
-            .iter()
-            .map(|b| b.account.as_str())
-            .collect();
-        tracing::debug!(
-            "ReservesMissing: pool={} vault_base={} vault_quote={} tx_accounts={:?}",
-            config.pool,
-            config.vault_base,
-            config.vault_quote,
-            accounts,
-        );
-        return EnrichmentResult::ReservesMissing;
-    };
-
-    let pool_0 = ConstantProduct::new(
-        tx_reserves.pre.0,
-        tx_reserves.pre.1,
-        config.fee_num,
-        config.fee_den,
-    );
-
-    let Some((loss, trace)) = compute_loss_with_trace(attack, pool_0) else {
-        return EnrichmentResult::ReplayFailed;
+    // Dispatch by AMM kind. Each path produces (loss, trace_opt,
+    // pool_quote_tvl) — `trace_opt` is `Some` only for the constant-
+    // product path because Whirlpool's "trace" needs sqrt_price + tick
+    // state per step, which doesn't fit AmmReplayTrace's reserves-tuple
+    // shape (follow-up). Common attack-field / signal wiring runs after
+    // the match.
+    let (loss, trace_opt, pool_quote_tvl) = match config.kind {
+        AmmKind::RaydiumV4 | AmmKind::RaydiumCpmm => {
+            let Some(tx_reserves) = reserves::extract(frontrun_tx, &config) else {
+                let accounts: Vec<&str> = frontrun_tx
+                    .token_balance_changes
+                    .iter()
+                    .map(|b| b.account.as_str())
+                    .collect();
+                tracing::debug!(
+                    "ReservesMissing: pool={} vault_base={} vault_quote={} tx_accounts={:?}",
+                    config.pool,
+                    config.vault_base,
+                    config.vault_quote,
+                    accounts,
+                );
+                return EnrichmentResult::ReservesMissing;
+            };
+            let pool_0 = ConstantProduct::new(
+                tx_reserves.pre.0,
+                tx_reserves.pre.1,
+                config.fee_num,
+                config.fee_den,
+            );
+            let Some((loss, trace)) = compute_loss_with_trace(attack, pool_0) else {
+                return EnrichmentResult::ReplayFailed;
+            };
+            (loss, Some(trace), tx_reserves.pre.1)
+        }
+        AmmKind::OrcaWhirlpool => {
+            // Within-tick Whirlpool replay (Tier 3.4 step 4-α). Needs
+            // slot-anchored dynamic state — sqrt_price / liquidity / tick —
+            // that the parser can't recover from logs. ReplayFailed when
+            // the lookup can't serve it (RPC error, unsupported provider).
+            let Some(state) = lookup
+                .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
+                .await
+            else {
+                return EnrichmentResult::ReplayFailed;
+            };
+            let pool_0 = match state {
+                DynamicPoolState::Whirlpool {
+                    sqrt_price_q64,
+                    liquidity,
+                    tick_current_index,
+                    tick_spacing,
+                } => crate::orca_whirlpool::WhirlpoolPool {
+                    liquidity,
+                    sqrt_price_q64,
+                    tick_current_index,
+                    tick_spacing,
+                    // apply_swap_within_tick reads fee from the explicit
+                    // fee_num / fee_den arguments below, not from this
+                    // field — leave it at 0.
+                    fee_rate_hundredths_bps: 0,
+                },
+            };
+            let Some(loss) = compute_loss_whirlpool(
+                attack,
+                pool_0,
+                config.fee_num as u128,
+                config.fee_den as u128,
+                config.base_is_token_a,
+            ) else {
+                return EnrichmentResult::CrossTickUnsupported;
+            };
+            // Severity TVL: the frontrun tx's quote-vault balance, when
+            // extractable. Whirlpool vaults hold tokens from out-of-range
+            // positions too, so this overstates active-liquidity depth —
+            // but it's a depth proxy not a precise measure, and the
+            // alternative is leaving severity unset.
+            let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
+                .map(|r| r.pre.1)
+                .unwrap_or(0);
+            (loss, None, pool_quote_tvl)
+        }
     };
 
     attack.victim_loss_lamports = Some(loss.victim_loss);
+    attack.victim_loss_lamports_lower = loss.victim_loss_lower;
+    attack.victim_loss_lamports_upper = loss.victim_loss_upper;
     attack.attacker_profit = Some(loss.attacker_profit_real);
     attack.price_impact_bps = Some(loss.price_impact_bps);
 
-    // Derive severity from victim_loss vs pool quote-side TVL. Both values are
-    // already normalized to quote-token smallest units (see counterfactual.rs),
-    // so the ratio is dimensionless. We deliberately use the *pre-frontrun*
-    // quote reserve as the depth reference — the severity is "how much of the
-    // pool's standing depth did this attack consume", not a post-state metric.
-    // A degenerate pool (zero quote reserve) leaves severity unset rather than
-    // forcing a divide-by-zero into Critical.
-    if attack.severity.is_none() {
-        let pool_quote_tvl = tx_reserves.pre.1;
-        if pool_quote_tvl > 0 {
-            let loss_ratio = (loss.victim_loss.max(0) as f64) / (pool_quote_tvl as f64);
-            attack.severity = Some(Severity::from_loss_ratio(loss_ratio));
-        }
+    // Derive severity from victim_loss vs pool quote-side TVL. The ratio is
+    // dimensionless (both values in quote-token smallest units), so it
+    // aggregates across pools cleanly. We deliberately use the *pre-
+    // frontrun* quote reserve as the depth reference — severity is "how
+    // much of the pool's standing depth did this attack consume", not a
+    // post-state metric. Zero quote reserve leaves severity unset rather
+    // than forcing a divide-by-zero into Critical.
+    if attack.severity.is_none() && pool_quote_tvl > 0 {
+        let loss_ratio = (loss.victim_loss.max(0) as f64) / (pool_quote_tvl as f64);
+        attack.severity = Some(Severity::from_loss_ratio(loss_ratio));
     }
 
     // ReplayConfidence = 1 - (actual / counterfactual), clamped to [0, 1].
-    // A counterfactual of zero means the victim wouldn't have gotten anything
-    // even without the frontrun (malformed swap); treat that as no signal.
-    let replay_confidence: f64 = if trace.counterfactual_victim_out > 0 {
-        let ratio = trace.actual_victim_out as f64 / trace.counterfactual_victim_out as f64;
+    // A counterfactual of zero means the victim wouldn't have gotten
+    // anything even without the frontrun (malformed swap); treat as no
+    // signal.
+    let replay_confidence: f64 = if loss.counterfactual_victim_out > 0 {
+        let ratio = loss.actual_victim_out as f64 / loss.counterfactual_victim_out as f64;
         (1.0f64 - ratio).clamp(0.0, 1.0)
     } else {
         0.0
     };
 
-    let amm_signals = vec![
+    let mut amm_signals = vec![
         Signal::AmmProfit {
             attacker_profit_real: loss.attacker_profit_real,
         },
@@ -117,11 +192,57 @@ pub async fn enrich_attack(
         },
     ];
 
+    // Per-step model fidelity (Tier 3.2). Emit only the steps where we
+    // have a usable observation; missing parser data is silent rather
+    // than a misleading zero.
+    for (step, residual) in [
+        (ReplayStep::Frontrun, loss.residual_bps_frontrun),
+        (ReplayStep::Victim, loss.residual_bps_victim),
+        (ReplayStep::Backrun, loss.residual_bps_backrun),
+    ] {
+        if let Some(residual_bps) = residual {
+            amm_signals.push(Signal::InvariantResidual { step, residual_bps });
+        }
+    }
+
+    // Sandwich shape (Tier 3.5): with-victim profit vs without-victim
+    // profit. Emit unconditionally so the ensemble can downweight
+    // arbitrage profiles where the victim was incidental.
+    amm_signals.push(Signal::CounterfactualAttackerProfit {
+        with_victim: loss.attacker_profit_real,
+        without_victim: loss.counterfactual_attacker_profit_no_victim,
+    });
+
+    // Post-state diff (Tier 3.1): constant-product only. Whirlpool's
+    // post-state can't be cross-checked with reserves yet — needs the
+    // sqrt_price+tick trace surface added in a follow-up.
+    if let Some(trace) = trace_opt.as_ref() {
+        if let Some(backrun_tx) = backrun_tx {
+            if let Some(backrun_reserves) = reserves::extract(backrun_tx, &config) {
+                let observed_post_back = (
+                    backrun_reserves.post.0.min(u64::MAX as u128) as u64,
+                    backrun_reserves.post.1.min(u64::MAX as u128) as u64,
+                );
+                let divergence_bps = diff_test::reserves_divergence_bps(
+                    trace.reserves_post_back,
+                    observed_post_back,
+                );
+                let passed = divergence_bps < diff_test::PASS_THRESHOLD_BPS;
+                amm_signals.push(Signal::ReservesMatchPostState {
+                    divergence_bps,
+                    passed,
+                });
+            }
+        }
+    }
+
     match attack.evidence.as_mut() {
         Some(ev) => ev.extend(amm_signals),
         None => attack.evidence = Some(DetectionEvidence::from_signals(amm_signals)),
     }
-    attack.amm_replay = Some(trace);
+    if let Some(trace) = trace_opt {
+        attack.amm_replay = Some(trace);
+    }
 
     EnrichmentResult::Enriched
 }
@@ -137,12 +258,25 @@ mod tests {
 
     struct MockLookup {
         config: PoolConfig,
+        /// `Some` lets tests exercise the Whirlpool dispatch path; the
+        /// constant-product tests leave it at `None` and never call
+        /// `pool_dynamic_state`.
+        dynamic_state: Option<DynamicPoolState>,
     }
 
     #[async_trait]
     impl PoolStateLookup for MockLookup {
         async fn pool_config(&self, _pool: &str, _dex: DexType) -> Option<PoolConfig> {
             Some(self.config.clone())
+        }
+
+        async fn pool_dynamic_state(
+            &self,
+            _pool: &str,
+            _dex: DexType,
+            _slot: u64,
+        ) -> Option<DynamicPoolState> {
+            self.dynamic_state
         }
     }
 
@@ -182,6 +316,8 @@ mod tests {
             backrun,
             estimated_attacker_profit: None,
             victim_loss_lamports: None,
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             frontrun_slot: None,
             backrun_slot: None,
             detection_method: None,
@@ -250,6 +386,7 @@ mod tests {
             quote_mint: "QUOTE_MINT".into(),
             fee_num: 25,
             fee_den: 10_000,
+            base_is_token_a: false,
         }
     }
 
@@ -259,9 +396,10 @@ mod tests {
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
             config: make_config(),
+            dynamic_state: None,
         };
 
-        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
         assert!(attack.victim_loss_lamports.unwrap() > 0);
         assert!(attack.price_impact_bps.unwrap() > 0);
@@ -286,9 +424,10 @@ mod tests {
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
             config: make_config(),
+            dynamic_state: None,
         };
 
-        enrich_attack(&mut attack, &tx, &lookup).await;
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
         let loss = attack.victim_loss_lamports.unwrap();
         // tx_reserves.pre.1 (quote vault pre_amount) is 1_000_000_000.
         let expected = Severity::from_loss_ratio((loss.max(0) as f64) / 1_000_000_000.0);
@@ -304,9 +443,10 @@ mod tests {
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
             config: make_config(),
+            dynamic_state: None,
         };
 
-        enrich_attack(&mut attack, &tx, &lookup).await;
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
         // Pre-existing severity must not be overwritten — keeps callers
         // free to inject a domain-specific severity (e.g. Authority-Hop).
         assert_eq!(attack.severity, Some(Severity::Critical));
@@ -320,9 +460,10 @@ mod tests {
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
             config: make_config(),
+            dynamic_state: None,
         };
 
-        enrich_attack(&mut attack, &tx, &lookup).await;
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
 
         // Replay trace present and matches the tx's pre-balances.
         let trace = attack.amm_replay.as_ref().expect("replay trace attached");
@@ -352,16 +493,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enrichment_emits_invariant_residual_and_counterfactual_signals() {
+        // After enrich_attack runs on a successful happy-path replay, the
+        // evidence set must include both Tier 3 signals so downstream
+        // consumers can see model fidelity and the sandwich-shape check.
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+
+        let ev = attack
+            .evidence
+            .as_ref()
+            .expect("evidence present after enrichment");
+        let all_signals = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .chain(ev.informational.iter());
+
+        // The synthetic make_attack uses amount_out = 0 on every leg, so
+        // residuals come back None and InvariantResidual signals are *not*
+        // emitted — that's the contract: silent on missing observations.
+        assert!(
+            !all_signals
+                .clone()
+                .any(|s| matches!(s, Signal::InvariantResidual { .. })),
+            "InvariantResidual should be silent when amount_out is 0 on every leg",
+        );
+
+        // CounterfactualAttackerProfit is always emitted regardless of
+        // observation availability, since it's computed entirely from our
+        // own AMM math (no parser dependency). Sign assertions on the
+        // counterfactual live in `counterfactual.rs` where we control the
+        // backrun amount precisely; the enrichment fixture intentionally
+        // uses an oversized backrun (the attacker has extra inventory) so
+        // we only check that the signal is present and well-formed.
+        let counterfactual = all_signals
+            .clone()
+            .find(|s| matches!(s, Signal::CounterfactualAttackerProfit { .. }));
+        let Some(Signal::CounterfactualAttackerProfit {
+            with_victim: _,
+            without_victim: _,
+        }) = counterfactual
+        else {
+            panic!("CounterfactualAttackerProfit signal missing from evidence");
+        };
+    }
+
+    #[tokio::test]
+    async fn enrichment_emits_invariant_residual_when_observations_present() {
+        // Same as above but with non-zero amount_out on every leg, so the
+        // residual signals fire (and should land in `informational` because
+        // observations match our model exactly — see counterfactual.rs's
+        // `residuals_zero_when_observations_match_model`).
+        let mut attack = make_attack();
+
+        // Replay the chain ourselves, then plant the same outputs back as
+        // parser-observed amount_outs so residuals are exactly zero.
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        attack.frontrun.amount_out = fr_out;
+        attack.victim.amount_out = victim_out;
+        attack.backrun.amount_out = back_out;
+
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+
+        let ev = attack.evidence.as_ref().expect("evidence");
+        // All three steps should have emitted residual signals.
+        let residual_count = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .chain(ev.informational.iter())
+            .filter(|s| matches!(s, Signal::InvariantResidual { .. }))
+            .count();
+        assert_eq!(
+            residual_count, 3,
+            "expected one InvariantResidual per step, got {residual_count}",
+        );
+        // Zero residuals are Informational, not Pass or Fail.
+        assert_eq!(
+            ev.informational
+                .iter()
+                .filter(|s| matches!(s, Signal::InvariantResidual { .. }))
+                .count(),
+            3,
+        );
+    }
+
+    #[tokio::test]
     async fn reports_unsupported_dex_without_rpc() {
         let mut attack = make_attack();
         attack.dex = DexType::Phoenix;
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
             config: make_config(),
+            dynamic_state: None,
         };
 
-        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::UnsupportedDex);
+        assert!(attack.victim_loss_lamports.is_none());
+    }
+
+    #[tokio::test]
+    async fn whirlpool_dispatch_fails_when_dynamic_state_missing() {
+        // Whirlpool config parses fine, but pool_dynamic_state has no
+        // state to return (RPC outage, unsupported provider). Within-
+        // tick replay can't run without sqrt_price/liquidity, so the
+        // result is ReplayFailed — distinct from UnsupportedDex, which
+        // is for DEXes we don't speak at all.
+        let mut attack = make_attack();
+        attack.dex = DexType::OrcaWhirlpool;
+        let mut config = make_config();
+        config.kind = AmmKind::OrcaWhirlpool;
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config,
+            dynamic_state: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::ReplayFailed);
+        assert!(attack.victim_loss_lamports.is_none());
+    }
+
+    #[tokio::test]
+    async fn whirlpool_within_tick_enriches() {
+        // Dynamic state in hand, modest swap amounts ⇒ within-tick replay
+        // succeeds, attack picks up victim_loss / attacker_profit and
+        // the standard signal set. amm_replay stays None on this path
+        // (no trace shape yet for sqrt_price + tick state).
+        let mut attack = make_attack();
+        attack.dex = DexType::OrcaWhirlpool;
+        let mut config = make_config();
+        config.kind = AmmKind::OrcaWhirlpool;
+        config.base_is_token_a = true;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(10),
+            liquidity: 1_000_000_000_000,
+            tick_current_index: 10,
+            tick_spacing: 64,
+        };
+        let lookup = MockLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.is_some());
+        assert!(attack.attacker_profit.is_some());
+        assert!(attack.amm_replay.is_none());
+    }
+
+    #[tokio::test]
+    async fn whirlpool_cross_tick_returns_cross_tick_variant() {
+        // Tiny liquidity + large frontrun walks past the next tick
+        // boundary on the very first leg. apply_swap_within_tick bails,
+        // and enrich_attack maps that to CrossTickUnsupported — distinct
+        // from ReplayFailed because the failure is a known model
+        // limitation, not a parser bug.
+        let mut attack = make_attack();
+        attack.dex = DexType::OrcaWhirlpool;
+        attack.frontrun.amount_in = 1_000_000_000;
+        let mut config = make_config();
+        config.kind = AmmKind::OrcaWhirlpool;
+        config.base_is_token_a = true;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(10),
+            liquidity: 1_000,
+            tick_current_index: 10,
+            tick_spacing: 64,
+        };
+        let lookup = MockLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::CrossTickUnsupported);
         assert!(attack.victim_loss_lamports.is_none());
     }
 
@@ -372,9 +699,265 @@ mod tests {
         tx.token_balance_changes.clear();
         let lookup = MockLookup {
             config: make_config(),
+            dynamic_state: None,
         };
 
-        let result = enrich_attack(&mut attack, &tx, &lookup).await;
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::ReservesMissing);
+    }
+
+    // ----- Tier 3.1 — ReservesMatchPostState diff signal -----------------
+
+    /// Compute what the AMM replay would predict for `reserves_post_back`
+    /// given the standard fixture (1B/1B reserves, 25 bps fee, the same
+    /// frontrun/victim/backrun amounts as `make_attack`). Used by the
+    /// Tier 3.1 tests to plant matching or mismatching post-balances on a
+    /// synthetic backrun tx.
+    fn predicted_post_back_reserves() -> (u64, u64) {
+        let pool_0 = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (_fr_out, pool_1) = pool_0.apply_swap(500_000_000, SwapDirection::Buy);
+        let (_v_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (_b_out, pool_3) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        let (b, q) = pool_3.reserves();
+        (b as u64, q as u64)
+    }
+
+    fn make_backrun_tx(post_base: u64, post_quote: u64) -> TransactionData {
+        TransactionData {
+            signature: "b".into(),
+            signer: "atk".into(),
+            success: true,
+            tx_index: 0,
+            account_keys: vec![],
+            instructions: vec![],
+            inner_instructions: vec![],
+            token_balance_changes: vec![
+                TokenBalanceChange {
+                    mint: "BASE_MINT".into(),
+                    account: "VAULT_BASE".into(),
+                    owner: "POOL_AUTHORITY".into(),
+                    pre_amount: 0,
+                    post_amount: post_base,
+                },
+                TokenBalanceChange {
+                    mint: "QUOTE_MINT".into(),
+                    account: "VAULT_QUOTE".into(),
+                    owner: "POOL_AUTHORITY".into(),
+                    pre_amount: 0,
+                    post_amount: post_quote,
+                },
+            ],
+            sol_balance_changes: vec![],
+            fee: 5000,
+            log_messages: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn reserves_match_post_state_passes_when_backrun_balances_match_replay() {
+        // Plant the replay's predicted post-back reserves verbatim onto the
+        // backrun tx's post-balances. divergence_bps must be exactly 0,
+        // passed=true, and the signal lands in `informational` (not Pass —
+        // model fidelity isn't itself evidence for a sandwich call).
+        let mut attack = make_attack();
+        let frontrun_tx = make_frontrun_tx();
+        let (post_base, post_quote) = predicted_post_back_reserves();
+        let backrun_tx = make_backrun_tx(post_base, post_quote);
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+
+        let result = enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+
+        let ev = attack.evidence.as_ref().expect("evidence");
+        let signal = ev
+            .informational
+            .iter()
+            .find_map(|s| match s {
+                Signal::ReservesMatchPostState {
+                    divergence_bps,
+                    passed,
+                } => Some((*divergence_bps, *passed)),
+                _ => None,
+            })
+            .expect("ReservesMatchPostState should land in informational at zero divergence");
+        assert_eq!(signal.0, 0);
+        assert!(signal.1);
+    }
+
+    #[tokio::test]
+    async fn reserves_match_post_state_fails_when_backrun_balances_diverge() {
+        // Perturb the base side by ~5% — well past the 100 bps pass
+        // threshold — so the signal flips to Fail.
+        let mut attack = make_attack();
+        let frontrun_tx = make_frontrun_tx();
+        let (post_base, post_quote) = predicted_post_back_reserves();
+        let perturbed_base = (post_base as f64 * 0.95) as u64;
+        let backrun_tx = make_backrun_tx(perturbed_base, post_quote);
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+
+        enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
+
+        let ev = attack.evidence.as_ref().expect("evidence");
+        let signal = ev
+            .failing
+            .iter()
+            .find_map(|s| match s {
+                Signal::ReservesMatchPostState {
+                    divergence_bps,
+                    passed,
+                } => Some((*divergence_bps, *passed)),
+                _ => None,
+            })
+            .expect("ReservesMatchPostState should land in failing past threshold");
+        assert!(
+            signal.0 >= crate::diff_test::PASS_THRESHOLD_BPS,
+            "expected divergence_bps ≥ threshold, got {}",
+            signal.0,
+        );
+        assert!(!signal.1);
+    }
+
+    #[tokio::test]
+    async fn reserves_match_post_state_silent_when_backrun_tx_absent() {
+        // Backwards-compat path: existing callers that pass `None` get the
+        // same evidence shape as before — no Tier 3.1 signal at all.
+        let mut attack = make_attack();
+        let frontrun_tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+
+        enrich_attack(&mut attack, &frontrun_tx, None, &lookup).await;
+        let ev = attack.evidence.as_ref().expect("evidence");
+        let any = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .chain(ev.informational.iter())
+            .any(|s| matches!(s, Signal::ReservesMatchPostState { .. }));
+        assert!(!any, "should be silent when backrun_tx is None");
+    }
+
+    // ----- Tier 3.3 — victim_loss CI propagation -------------------------
+
+    #[tokio::test]
+    async fn victim_loss_ci_propagates_when_observations_match_model() {
+        // All three legs' amount_outs are pre-computed from the same pool
+        // math the replay uses, so every residual is exactly zero ⇒ CI
+        // collapses to `[point, point]`. Both bounds equal the point
+        // estimate exactly.
+        let mut attack = make_attack();
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        attack.frontrun.amount_out = fr_out;
+        attack.victim.amount_out = victim_out;
+        attack.backrun.amount_out = back_out;
+
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        let point = attack.victim_loss_lamports.unwrap();
+        assert!(point > 0);
+        assert_eq!(attack.victim_loss_lamports_lower, Some(point));
+        assert_eq!(attack.victim_loss_lamports_upper, Some(point));
+    }
+
+    #[tokio::test]
+    async fn victim_loss_ci_none_when_observations_missing() {
+        // make_attack/make_frontrun_tx leave every amount_out = 0 ⇒ all
+        // residuals come back None ⇒ no CI is derivable. The point
+        // estimate is still emitted; only the bounds stay None.
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        assert!(attack.victim_loss_lamports.unwrap() > 0);
+        assert!(attack.victim_loss_lamports_lower.is_none());
+        assert!(attack.victim_loss_lamports_upper.is_none());
+    }
+
+    #[tokio::test]
+    async fn mev_receipt_inherits_victim_loss_ci() {
+        // Tier 3.3 CI fields must round-trip into MevReceipt::from_attack
+        // so Vigil's per-receipt rendering can show the band without
+        // recomputing.
+        let mut attack = make_attack();
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        attack.frontrun.amount_out = fr_out;
+        attack.victim.amount_out = victim_out;
+        attack.backrun.amount_out = back_out;
+
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        let receipt = swap_events::types::MevReceipt::from_attack(&attack);
+        assert_eq!(receipt.loss_amount, attack.victim_loss_lamports);
+        assert_eq!(receipt.loss_amount_lower, attack.victim_loss_lamports_lower);
+        assert_eq!(receipt.loss_amount_upper, attack.victim_loss_lamports_upper);
+        assert!(receipt.loss_amount_lower.is_some());
+    }
+
+    #[tokio::test]
+    async fn reserves_match_post_state_silent_when_backrun_lacks_vault_meta() {
+        // Backrun tx supplied but its token-balance meta doesn't include
+        // the pool's vault accounts (e.g. multi-program routing tx). We
+        // can't read the actual post-state, so we stay silent rather than
+        // emit a misleading saturating value.
+        let mut attack = make_attack();
+        let frontrun_tx = make_frontrun_tx();
+        let backrun_tx = TransactionData {
+            signature: "b".into(),
+            signer: "atk".into(),
+            success: true,
+            tx_index: 0,
+            account_keys: vec![],
+            instructions: vec![],
+            inner_instructions: vec![],
+            token_balance_changes: vec![],
+            sol_balance_changes: vec![],
+            fee: 5000,
+            log_messages: vec![],
+        };
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+        };
+
+        enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
+        let ev = attack.evidence.as_ref().expect("evidence");
+        let any = ev
+            .passing
+            .iter()
+            .chain(ev.failing.iter())
+            .chain(ev.informational.iter())
+            .any(|s| matches!(s, Signal::ReservesMatchPostState { .. }));
+        assert!(
+            !any,
+            "should be silent when backrun tx has no vault balances",
+        );
     }
 }

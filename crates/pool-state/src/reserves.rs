@@ -59,6 +59,7 @@ mod tests {
             quote_mint: "quote_mint".into(),
             fee_num: 25,
             fee_den: 10_000,
+            base_is_token_a: false,
         }
     }
 

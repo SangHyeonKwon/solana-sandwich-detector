@@ -113,6 +113,10 @@ pub fn parse_config(pool_address: &str, account_data: &[u8]) -> Option<PoolConfi
         quote_mint,
         fee_num,
         fee_den,
+        // Constant-product math reads everything from vault_base/quote;
+        // the a/b axis flag is meaningful for concentrated-liquidity
+        // DEXes only.
+        base_is_token_a: false,
     })
 }
 

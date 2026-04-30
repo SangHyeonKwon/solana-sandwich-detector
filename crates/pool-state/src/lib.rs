@@ -16,17 +16,23 @@
 
 pub mod constant_product;
 pub mod counterfactual;
+pub mod diff_test;
 pub mod enrichment;
+pub mod fixed_point;
 pub mod lookup;
+pub mod orca_whirlpool;
 pub mod raydium_cpmm;
 pub mod raydium_v4;
 pub mod reserves;
 pub mod rpc;
 
 pub use constant_product::ConstantProduct;
-pub use counterfactual::{compute_loss, compute_loss_with_trace, LossEstimate};
+pub use counterfactual::{
+    compute_loss, compute_loss_whirlpool, compute_loss_with_trace, LossEstimate,
+};
 pub use enrichment::{enrich_attack, EnrichmentResult};
 pub use lookup::{
-    AmmKind, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup, SlotLeaderLookup,
+    AmmKind, DynamicPoolState, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup,
+    SlotLeaderLookup,
 };
 pub use rpc::{RpcPoolLookup, RpcSlotLeaderLookup, SLOT_LEADER_PAGE_SIZE};

@@ -112,6 +112,8 @@ impl NaiveWindowDetector {
                             dex: frontrun.dex,
                             estimated_attacker_profit: Some(gross),
                             victim_loss_lamports: None,
+                            victim_loss_lamports_lower: None,
+                            victim_loss_lamports_upper: None,
                             frontrun_slot: Some(*front_slot),
                             backrun_slot: Some(*back_slot),
                             detection_method: Some(DetectionMethod::CrossSlotWindow {

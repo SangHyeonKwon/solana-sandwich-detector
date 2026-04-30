@@ -12,15 +12,23 @@ use swap_events::types::DexType;
 pub enum AmmKind {
     RaydiumV4,
     RaydiumCpmm,
+    /// Orca Whirlpool concentrated-liquidity AMM. Config (vault / mint /
+    /// fee) and pool-state (sqrt_price / liquidity / tick) parsing are
+    /// in [`crate::orca_whirlpool`]; replay support lands in a follow-up
+    /// — `enrich_attack` currently routes this kind to
+    /// [`EnrichmentResult::UnsupportedDex`](crate::EnrichmentResult).
+    OrcaWhirlpool,
 }
 
 impl AmmKind {
-    /// Map a [`DexType`] to an AMM kind this crate can replay. Returns `None`
-    /// for DEXes we don't yet support (CLMM, Orca, Meteora, Pump.fun, Phoenix, Jupiter).
+    /// Map a [`DexType`] to an AMM kind this crate can recognise. Returns
+    /// `None` for DEXes we have neither config parsing nor replay for
+    /// (Pump.fun, Phoenix, Jupiter, Meteora DLMM, Raydium CLMM).
     pub fn from_dex(dex: DexType) -> Option<Self> {
         match dex {
             DexType::RaydiumV4 => Some(AmmKind::RaydiumV4),
             DexType::RaydiumCpmm => Some(AmmKind::RaydiumCpmm),
+            DexType::OrcaWhirlpool => Some(AmmKind::OrcaWhirlpool),
             _ => None,
         }
     }
@@ -41,6 +49,37 @@ pub struct PoolConfig {
     pub quote_mint: String,
     pub fee_num: u64,
     pub fee_den: u64,
+    /// Whether `base_mint` corresponds to `token_a` in the on-chain pool's
+    /// (a, b) ordering. Concentrated-liquidity DEXes whose math is keyed
+    /// on the a/b axis (Whirlpool's `sqrt(b/a)` price, V3-style swap
+    /// formulas) need this to map a SwapDirection (Buy/Sell, in
+    /// quote-terms) to the math layer's `a_to_b` flag. Constant-product
+    /// DEXes don't care: they read everything from `vault_base` /
+    /// `vault_quote` directly, so leave this at the default `false`.
+    pub base_is_token_a: bool,
+}
+
+/// Slot-anchored *dynamic* pool state — the swap-relevant fields that
+/// evolve with every trade and which Whirlpool replay needs but
+/// `getAccountInfo` log scraping can't recover (Whirlpool doesn't emit
+/// sqrt_price into instruction logs).
+///
+/// Constant-product AMMs aren't represented here: their dynamic state
+/// (vault reserves) is already extractable from the tx's
+/// `pre_token_balances` via [`crate::reserves`], so they don't need a
+/// separate slot-anchored fetch path. New variants land alongside new
+/// concentrated-liquidity DEXes (e.g. DLMM bin price math).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicPoolState {
+    /// Whirlpool concentrated-liquidity snapshot. Mirrors the subset of
+    /// [`crate::orca_whirlpool::WhirlpoolPool`] that within-tick replay
+    /// needs.
+    Whirlpool {
+        sqrt_price_q64: u128,
+        liquidity: u128,
+        tick_current_index: i32,
+        tick_spacing: u16,
+    },
 }
 
 /// Resolve pool configuration. Typically backed by a cached RPC client.
@@ -50,6 +89,26 @@ pub struct PoolConfig {
 #[async_trait]
 pub trait PoolStateLookup: Send + Sync {
     async fn pool_config(&self, pool: &str, dex: DexType) -> Option<PoolConfig>;
+
+    /// Fetch slot-anchored dynamic pool state for AMMs whose replay needs
+    /// state beyond vault reserves (Whirlpool sqrt_price / liquidity /
+    /// tick). Default returns `None`, so implementations that don't speak
+    /// the dynamic-state protocol stay opt-in and the caller falls back
+    /// to whatever short-circuit the dispatch layer prefers.
+    ///
+    /// `slot` is currently passed through but unused — `getAccountInfo`
+    /// returns latest-confirmed state, which is good enough for streamed
+    /// detection but not for backfill from archival data. Plumbing the
+    /// argument now lets archival-aware implementations land later
+    /// without breaking the trait shape.
+    async fn pool_dynamic_state(
+        &self,
+        _pool: &str,
+        _dex: DexType,
+        _slot: u64,
+    ) -> Option<DynamicPoolState> {
+        None
+    }
 }
 
 /// No-op lookup: returns `None` for every pool. Used when pool-state
@@ -99,5 +158,17 @@ mod tests {
         let lookup = NoSlotLeaderLookup;
         assert_eq!(lookup.slot_leader(0).await, None);
         assert_eq!(lookup.slot_leader(123_456_789).await, None);
+    }
+
+    /// `NoPoolLookup` doesn't override `pool_dynamic_state`, so it must
+    /// inherit the default `None`. Pins the contract that disabling
+    /// enrichment also disables dynamic-state fetches.
+    #[tokio::test]
+    async fn no_pool_lookup_dynamic_state_returns_none() {
+        let lookup = NoPoolLookup;
+        assert!(lookup
+            .pool_dynamic_state("any-pool", DexType::OrcaWhirlpool, 0)
+            .await
+            .is_none());
     }
 }

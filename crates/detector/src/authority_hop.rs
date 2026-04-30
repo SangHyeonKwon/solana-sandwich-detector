@@ -288,6 +288,8 @@ pub fn detect_authority_hop_sandwiches(
                         dex: frontrun.dex,
                         estimated_attacker_profit: Some(gross),
                         victim_loss_lamports: None,
+                        victim_loss_lamports_lower: None,
+                        victim_loss_lamports_upper: None,
                         frontrun_slot: None,
                         backrun_slot: None,
                         detection_method: Some(DetectionMethod::SameBlock),

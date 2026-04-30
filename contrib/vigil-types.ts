@@ -78,6 +78,9 @@ export type SignalCategory =
 
 export type SignalVerdict = "pass" | "fail" | "informational";
 
+/** Replay step where an `invariant_residual` signal was measured. */
+export type ReplayStep = "frontrun" | "victim" | "backrun";
+
 export type DetectionMethod =
   | { same_block: Record<string, never> } // `"same_block"` in serde — see below
   | { cross_slot_window: { window_size: number } }
@@ -108,7 +111,40 @@ export type Signal =
    * frontrun by `from` to a backrun by `to`. `authority_tx` is the audit
    * pointer back to the SetAuthority tx.
    */
-  | { kind: "authority_chain"; from: string; to: string; authority_tx: string };
+  | { kind: "authority_chain"; from: string; to: string; authority_tx: string }
+  /**
+   * Per-step model fidelity (Tier 3.2). `residual_bps` is signed:
+   * `(predicted_amount_out − observed_amount_out) / observed_amount_out × 10_000`.
+   * Near-zero ⇒ our AMM math agrees with chain logs at this step;
+   * |residual| ≥ 100 ⇒ Fail (distrust replay-derived numbers for this attack).
+   */
+  | { kind: "invariant_residual"; step: ReplayStep; residual_bps: number }
+  /**
+   * Sandwich shape check (Tier 3.5). `with_victim` is the attacker's actual
+   * profit; `without_victim` is what they'd have netted if the victim hadn't
+   * traded. Pure sandwiches show `with_victim > 0` and `without_victim ≤ 0`;
+   * a strongly-positive `without_victim` indicates arbitrage that happened to
+   * bracket an unrelated tx.
+   */
+  | {
+      kind: "counterfactual_attacker_profit";
+      with_victim: number;
+      without_victim: number;
+    }
+  /**
+   * End-state model-vs-chain reconciliation (Tier 3.1). `divergence_bps` is
+   * the larger of the side-wise relative gaps between `amm_replay.reserves_post_back`
+   * and the actual post-backrun vault balances pulled from the backrun tx's
+   * `post_token_balances`. `passed = divergence_bps < 100`. A passing signal
+   * is positive proof that the replay's reserves trajectory matches chain
+   * reality — the strongest single guarantee that `victim_loss` /
+   * `attacker_profit_real` are trustworthy.
+   */
+  | {
+      kind: "reserves_match_post_state";
+      divergence_bps: number;
+      passed: boolean;
+    };
 
 export interface DetectionEvidence {
   passing: Signal[];
@@ -183,6 +219,13 @@ export interface MevReceipt {
   severity: Severity;
   /** Quote-token smallest units. `null` when AMM replay didn't run. */
   loss_amount?: number | null;
+  /**
+   * Lower / upper bounds of the victim-loss confidence interval (Tier 3.3),
+   * mirrored from `SandwichAttack.victim_loss_lamports_{lower,upper}`. Both
+   * `null` when observations were insufficient to derive a CI.
+   */
+  loss_amount_lower?: number | null;
+  loss_amount_upper?: number | null;
   loss_percent?: number | null;
   loss_confidence: ConfidenceLevel;
   /** Vigil `validator_identity` — slot leader at the victim's slot. */
@@ -207,6 +250,14 @@ export interface SandwichAttack {
 
   // -- AMM-replay numbers (Vigil ERD `mev_attack.*`) --
   victim_loss_lamports?: number | null;
+  /**
+   * Confidence interval on `victim_loss_lamports` (Tier 3.3). Width is
+   * derived from the worst per-step `InvariantResidual`; both bounds are
+   * `null` when no usable observation exists on any leg or the residual
+   * is pathological (≥100%).
+   */
+  victim_loss_lamports_lower?: number | null;
+  victim_loss_lamports_upper?: number | null;
   attacker_profit?: number | null;
   price_impact_bps?: number | null;
 
