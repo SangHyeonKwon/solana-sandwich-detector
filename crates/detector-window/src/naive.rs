@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use swap_events::types::{DetectionMethod, SandwichAttack, SwapEvent};
+use swap_events::types::{DetectionEvidence, DetectionMethod, SandwichAttack, Signal, SwapEvent};
 
 use crate::WindowDetector;
 
@@ -93,6 +93,15 @@ impl NaiveWindowDetector {
                             continue;
                         }
 
+                        let gross = backrun.amount_out as i64 - frontrun.amount_in as i64;
+                        let cost = frontrun.fee.map(|f| f as i64).unwrap_or(0)
+                            + backrun.fee.map(|f| f as i64).unwrap_or(0);
+                        let net = gross - cost;
+                        let slot_distance = back_slot.saturating_sub(*front_slot);
+                        let evidence = DetectionEvidence::from_signals(vec![
+                            Signal::CrossSlot { slot_distance },
+                            Signal::NaiveProfit { gross, cost, net },
+                        ]);
                         let attack = SandwichAttack {
                             slot: *victim_slot,
                             attacker: frontrun.signer.clone(),
@@ -101,10 +110,8 @@ impl NaiveWindowDetector {
                             backrun: (*backrun).clone(),
                             pool: frontrun.pool.clone(),
                             dex: frontrun.dex,
-                            estimated_attacker_profit: Some(
-                                backrun.amount_out as i64 - frontrun.amount_in as i64,
-                            ),
-                            estimated_victim_loss: None,
+                            estimated_attacker_profit: Some(gross),
+                            victim_loss_lamports: None,
                             frontrun_slot: Some(*front_slot),
                             backrun_slot: Some(*back_slot),
                             detection_method: Some(DetectionMethod::CrossSlotWindow {
@@ -112,7 +119,23 @@ impl NaiveWindowDetector {
                             }),
                             bundle_provenance: None,
                             confidence: None,
-                            net_profit: None,
+                            net_profit: Some(net),
+                            attacker_profit: None,
+                            price_impact_bps: None,
+                            evidence: Some(evidence),
+                            amm_replay: None,
+                            attack_signature: None,
+                            timestamp_ms: None,
+                            attack_type: None,
+                            severity: None,
+                            confidence_level: None,
+                            slot_leader: None,
+                            is_wide_sandwich: false,
+                            receipts: vec![],
+                            victim_signer: None,
+                            victim_amount_in: None,
+                            victim_amount_out: None,
+                            victim_amount_out_expected: None,
                         };
 
                         self.emitted.insert(victim.signature.clone());

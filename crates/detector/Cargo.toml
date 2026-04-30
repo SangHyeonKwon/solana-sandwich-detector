@@ -9,9 +9,12 @@ description = "Detect sandwich attacks on Solana DEXes"
 swap-events = { path = "../swap-events" }
 detector-sameblock = { path = "../detector-sameblock" }
 detector-window = { path = "../detector-window" }
+bs58 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 solana-transaction-status = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
+pool-state = { workspace = true }

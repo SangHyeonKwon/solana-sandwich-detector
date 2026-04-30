@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use swap_events::types::{DetectionMethod, SandwichAttack, SwapEvent};
+use swap_events::types::{DetectionEvidence, DetectionMethod, SandwichAttack, Signal, SwapEvent};
 
 use crate::filters::{self, BundleLookup, FilterConfig, NoBundleLookup};
 use crate::WindowDetector;
@@ -189,6 +189,31 @@ impl FilteredWindowDetector {
                         continue;
                     }
 
+                    // Pick the most-informative bundle id for the evidence trace.
+                    // For Atomic/Spanning, front and back share an id; for TipRace
+                    // front has its own id; Organic has none. Using front's id
+                    // (when present) covers all three non-organic cases.
+                    let bundle_id = fb.clone();
+                    let slot_distance = back.slot.saturating_sub(front.slot);
+                    let evidence = DetectionEvidence::from_signals(vec![
+                        Signal::CrossSlot { slot_distance },
+                        Signal::Bundle {
+                            provenance: victim_provenance,
+                            bundle_id,
+                        },
+                        Signal::NaiveProfit {
+                            gross: economic.gross_revenue,
+                            cost: economic.estimated_cost,
+                            net: economic.net_profit,
+                        },
+                        Signal::VictimSize {
+                            ratio: victim_check.size_ratio,
+                        },
+                        Signal::KnownAttackerVictim {
+                            is_known: victim_check.is_known_attacker,
+                        },
+                    ]);
+
                     let attack = SandwichAttack {
                         slot: victim_tagged.slot,
                         attacker: front.swap.signer.clone(),
@@ -198,7 +223,7 @@ impl FilteredWindowDetector {
                         pool: front.swap.pool.clone(),
                         dex: front.swap.dex,
                         estimated_attacker_profit: Some(economic.gross_revenue),
-                        estimated_victim_loss: None,
+                        victim_loss_lamports: None,
                         frontrun_slot: Some(front.slot),
                         backrun_slot: Some(back.slot),
                         detection_method: Some(DetectionMethod::CrossSlotWindow {
@@ -207,6 +232,22 @@ impl FilteredWindowDetector {
                         bundle_provenance: Some(victim_provenance),
                         confidence: Some(confidence),
                         net_profit: Some(economic.net_profit),
+                        attacker_profit: None,
+                        price_impact_bps: None,
+                        evidence: Some(evidence),
+                        amm_replay: None,
+                        attack_signature: None,
+                        timestamp_ms: None,
+                        attack_type: None,
+                        severity: None,
+                        confidence_level: None,
+                        slot_leader: None,
+                        is_wide_sandwich: false,
+                        receipts: vec![],
+                        victim_signer: None,
+                        victim_amount_in: None,
+                        victim_amount_out: None,
+                        victim_amount_out_expected: None,
                     };
 
                     self.emitted.insert(victim_tagged.swap.signature.clone());
@@ -426,6 +467,61 @@ mod tests {
         );
         // Atomic bundle should have high confidence
         assert!(results[0].confidence.unwrap() > 0.6);
+    }
+
+    #[test]
+    fn evidence_structure_cross_slot() {
+        use swap_events::types::Signal;
+
+        let mut det = FilteredWindowDetector::new(4);
+        det.ingest_slot(100, vec![swap("front", "atk", "p1", SwapDirection::Buy, 5)]);
+        det.ingest_slot(
+            101,
+            vec![swap("victim", "vic", "p1", SwapDirection::Buy, 2)],
+        );
+        let results = det.ingest_slot(
+            102,
+            vec![{
+                let mut s = swap("back", "atk", "p1", SwapDirection::Sell, 3);
+                s.amount_out = 1_100_000; // profitable
+                s
+            }],
+        );
+
+        assert_eq!(results.len(), 1);
+        let ev = results[0].evidence.as_ref().expect("evidence attached");
+
+        // Cross-slot path should produce CrossSlot (temporal), NaiveProfit
+        // (economic), VictimSize / KnownAttackerVictim (plausibility), and
+        // Bundle (provenance = Organic → informational).
+        let passing_kinds: Vec<&str> = ev
+            .passing
+            .iter()
+            .map(|s| match s {
+                Signal::CrossSlot { .. } => "CrossSlot",
+                Signal::NaiveProfit { .. } => "NaiveProfit",
+                Signal::VictimSize { .. } => "VictimSize",
+                Signal::KnownAttackerVictim { .. } => "KnownAttackerVictim",
+                Signal::Bundle { .. } => "Bundle",
+                _ => "other",
+            })
+            .collect();
+        assert!(passing_kinds.contains(&"CrossSlot"));
+        assert!(passing_kinds.contains(&"NaiveProfit"));
+        assert!(passing_kinds.contains(&"VictimSize"));
+        // Temporal + Economic + Plausibility categories should all be counted.
+        assert!(
+            ev.categories_fired >= 3,
+            "expected ≥3 categories, got {}",
+            ev.categories_fired
+        );
+
+        // CrossSlot carries slot_distance = 102 - 100 = 2.
+        for s in &ev.passing {
+            if let Signal::CrossSlot { slot_distance } = s {
+                assert_eq!(*slot_distance, 2);
+            }
+        }
     }
 
     #[test]
