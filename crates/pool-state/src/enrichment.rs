@@ -16,6 +16,9 @@ use swap_events::types::{
 };
 
 use crate::lookup::{AmmKind, DynamicPoolState};
+use crate::orca_whirlpool::tick_array::{
+    start_tick_index_for, ticks_per_array_span, ParsedTickArray,
+};
 use crate::{
     compute_loss_whirlpool, compute_loss_with_trace, diff_test, reserves, ConstantProduct,
     PoolStateLookup,
@@ -37,13 +40,13 @@ pub enum EnrichmentResult {
     ReservesMissing,
     /// Replay returned `None` (direction mismatch or zero reserves).
     ReplayFailed,
-    /// Whirlpool sandwich crossed a tick boundary — within-tick replay
-    /// can't compute valid victim_loss / attacker_profit without
-    /// `liquidity_net` from the next initialised TickArray (cross-tick
-    /// walk lands in step 3-γ/δ). Caller treats this like
-    /// [`EnrichmentResult::UnsupportedDex`] (replay-derived fields aren't
-    /// populated) but the variant is distinct so cross-tick rate can be
-    /// tracked.
+    /// Whirlpool replay exhausted both the within-tick fast path and
+    /// the cross-tick fallback without resolving the sandwich — the
+    /// caller's lookup didn't return enough TickArrays, the swap
+    /// walked off the fetched range, or liquidity drained mid-walk.
+    /// Caller treats this like [`EnrichmentResult::UnsupportedDex`]
+    /// (replay-derived fields aren't populated) but the variant is
+    /// distinct so cross-tick rate can be tracked separately.
     CrossTickUnsupported,
 }
 
@@ -129,17 +132,39 @@ pub async fn enrich_attack(
                     fee_rate_hundredths_bps: 0,
                 },
             };
-            // Pass an empty `tick_arrays` slice for now — within-tick
-            // only. Step 3-δ-2-b plumbs the lookup's TickArray fetch
-            // through and narrows CrossTickUnsupported to the case
-            // where even the cross-tick fallback can't resolve.
+            // Fetch a TickArray window centered on the pool's current
+            // tick — 5 arrays (center ±2 spans) covers every realistic
+            // sandwich amount. `compute_loss_whirlpool` sorts per-leg
+            // and falls back to `cross_tick_swap` when the within-tick
+            // fast path can't resolve a leg.
+            //
+            // Implementations that don't speak the TickArray protocol
+            // (`NoPoolLookup`, partial mocks) return `Vec::new()` here;
+            // the per-leg fallback then sees no arrays and stays on the
+            // within-tick path — `CrossTickUnsupported` fires only when
+            // *both* paths fail.
+            let span = ticks_per_array_span(pool_0.tick_spacing);
+            let center = start_tick_index_for(pool_0.tick_current_index, pool_0.tick_spacing);
+            let start_indices: [i32; 5] = [
+                center - 2 * span,
+                center - span,
+                center,
+                center + span,
+                center + 2 * span,
+            ];
+            let tick_arrays: Vec<ParsedTickArray> = lookup
+                .tick_arrays(&attack.pool, attack.dex, &start_indices, attack.slot)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
             let Some(loss) = compute_loss_whirlpool(
                 attack,
                 pool_0,
                 config.fee_num as u128,
                 config.fee_den as u128,
                 config.base_is_token_a,
-                &[],
+                &tick_arrays,
             ) else {
                 return EnrichmentResult::CrossTickUnsupported;
             };
@@ -267,6 +292,11 @@ mod tests {
         /// constant-product tests leave it at `None` and never call
         /// `pool_dynamic_state`.
         dynamic_state: Option<DynamicPoolState>,
+        /// Tests that exercise cross-tick replay populate this; the
+        /// trait impl returns it verbatim, ignoring the start_indices
+        /// the caller asked for. Default is empty — every test that
+        /// doesn't care about cross-tick keeps within-tick behaviour.
+        tick_arrays: Vec<Option<ParsedTickArray>>,
     }
 
     #[async_trait]
@@ -282,6 +312,16 @@ mod tests {
             _slot: u64,
         ) -> Option<DynamicPoolState> {
             self.dynamic_state
+        }
+
+        async fn tick_arrays(
+            &self,
+            _pool: &str,
+            _dex: DexType,
+            _start_indices: &[i32],
+            _slot: u64,
+        ) -> Vec<Option<ParsedTickArray>> {
+            self.tick_arrays.clone()
         }
     }
 
@@ -402,6 +442,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -430,6 +471,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -449,6 +491,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -466,6 +509,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -507,6 +551,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -573,6 +618,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -608,6 +654,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -630,6 +677,7 @@ mod tests {
         let lookup = MockLookup {
             config,
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -658,6 +706,7 @@ mod tests {
         let lookup = MockLookup {
             config,
             dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -665,6 +714,82 @@ mod tests {
         assert!(attack.victim_loss_lamports.is_some());
         assert!(attack.attacker_profit.is_some());
         assert!(attack.amm_replay.is_none());
+    }
+
+    /// TickArray fixture builder: sparse `(slot, liquidity_net)`
+    /// overrides on top of an all-zero, all-uninitialised default.
+    /// Same shape as the helper in `counterfactual.rs` tests; kept
+    /// local because this module's tests don't share that one.
+    fn make_test_tick_array(start_tick_index: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
+        use crate::orca_whirlpool::tick_array::{TickData, TICK_ARRAY_SIZE};
+        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        for (i, net) in slots {
+            ticks[*i] = TickData {
+                initialised: true,
+                liquidity_net: *net,
+            };
+        }
+        ParsedTickArray {
+            start_tick_index,
+            ticks,
+        }
+    }
+
+    #[tokio::test]
+    async fn whirlpool_cross_tick_fallback_via_lookup_enriches() {
+        // Pool sqrt_price sits exactly on the tick=0 boundary ⇒
+        // within-tick a→b bails on the very first leg. lookup serves a
+        // multi-LP TickArray window so the cross-tick fallback (step
+        // 3-δ-2-a) resolves every leg ⇒ Enriched.
+        //
+        // Direction: Sell-first sandwich with `base_is_token_a=true` ⇒
+        // frontrun maps to a→b, exactly the direction the boundary
+        // fixture forces through cross-tick. Buy-first wouldn't trigger
+        // the within-tick failure here.
+        let mut attack = make_attack();
+        attack.dex = DexType::OrcaWhirlpool;
+        attack.frontrun.direction = SwapDirection::Sell;
+        attack.victim.direction = SwapDirection::Sell;
+        attack.backrun.direction = SwapDirection::Buy;
+        // Small amounts so each leg's cross-tick walk caps within the
+        // first segment after the boundary at 1.5B liquidity. The
+        // point of the test is the *fallback path*, not the swap
+        // arithmetic — keep amounts well clear of further crossings.
+        attack.frontrun.amount_in = 100_000;
+        attack.victim.amount_in = 50_000;
+        attack.backrun.amount_in = 100_000;
+        let mut config = make_config();
+        config.kind = AmmKind::OrcaWhirlpool;
+        config.base_is_token_a = true;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(0),
+            liquidity: 1_500_000_000,
+            tick_current_index: 0,
+            tick_spacing: 64,
+        };
+        // LP1 [-128, 128] 1B; LP2 [-2048, 2048] 500M. Exactly the
+        // double-LP fixture the cross_tick_swap unit tests use.
+        let tick_arrays = vec![
+            Some(make_test_tick_array(
+                0,
+                &[(2, -1_000_000_000), (32, -500_000_000)],
+            )),
+            Some(make_test_tick_array(
+                -5632,
+                &[(86, 1_000_000_000), (56, 500_000_000)],
+            )),
+        ];
+        let lookup = MockLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+            tick_arrays,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.is_some());
+        assert!(attack.attacker_profit.is_some());
     }
 
     #[tokio::test]
@@ -690,6 +815,7 @@ mod tests {
         let lookup = MockLookup {
             config,
             dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -705,6 +831,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -771,6 +898,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -804,6 +932,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -837,6 +966,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, None, &lookup).await;
@@ -871,6 +1001,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -890,6 +1021,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -916,6 +1048,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -950,6 +1083,7 @@ mod tests {
         let lookup = MockLookup {
             config: make_config(),
             dynamic_state: None,
+            tick_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
