@@ -18,6 +18,7 @@ pub mod constant_product;
 pub mod counterfactual;
 pub mod diff_test;
 pub mod enrichment;
+pub mod fixed_point;
 pub mod lookup;
 pub mod orca_whirlpool;
 pub mod raydium_cpmm;
