@@ -224,6 +224,8 @@ impl FilteredWindowDetector {
                         dex: front.swap.dex,
                         estimated_attacker_profit: Some(economic.gross_revenue),
                         victim_loss_lamports: None,
+                        victim_loss_lamports_lower: None,
+                        victim_loss_lamports_upper: None,
                         frontrun_slot: Some(front.slot),
                         backrun_slot: Some(back.slot),
                         detection_method: Some(DetectionMethod::CrossSlotWindow {

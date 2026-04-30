@@ -75,6 +75,22 @@
       ],
       "format": "int64"
     },
+    "victim_loss_lamports_lower": {
+      "description": "Lower bound of the victim-loss confidence interval (Tier 3.3), in the same quote-token smallest unit as `victim_loss_lamports`. Width is derived from the worst per-step model/parser disagreement (`Signal::InvariantResidual`); both bounds are `None` when observations are missing on every step or the residual is pathological (≥100%). Pairs with `victim_loss_lamports_upper` — emit either both or neither.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "victim_loss_lamports_upper": {
+      "description": "Upper bound of the victim-loss confidence interval. See `victim_loss_lamports_lower` for the derivation and pairing rules.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
     "attacker_profit": {
       "description": "AMM-correct attacker gross profit via counterfactual replay. Populated alongside `victim_loss_lamports`. Can differ significantly from `estimated_attacker_profit` — the re-classification from \"naive profitable\" to \"AMM unprofitable\" is the signal that distinguishes real extraction from false positives. Mirrors Vigil `mev_attack.attacker_profit`.",
       "type": [
@@ -1104,6 +1120,21 @@
         },
         "loss_amount": {
           "description": "Loss in quote-token smallest units. `None` when AMM replay didn't run.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "loss_amount_lower": {
+          "description": "Lower / upper bounds of the victim-loss confidence interval (Tier 3.3), mirrored from `SandwichAttack.victim_loss_lamports_{lower,upper}`. Same quote-token unit as `loss_amount`. Both `None` when no observation-based CI was derivable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "loss_amount_upper": {
           "type": [
             "integer",
             "null"

@@ -83,6 +83,8 @@ pub async fn enrich_attack(
     };
 
     attack.victim_loss_lamports = Some(loss.victim_loss);
+    attack.victim_loss_lamports_lower = loss.victim_loss_lower;
+    attack.victim_loss_lamports_upper = loss.victim_loss_upper;
     attack.attacker_profit = Some(loss.attacker_profit_real);
     attack.price_impact_bps = Some(loss.price_impact_bps);
 
@@ -238,6 +240,8 @@ mod tests {
             backrun,
             estimated_attacker_profit: None,
             victim_loss_lamports: None,
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             frontrun_slot: None,
             backrun_slot: None,
             detection_method: None,
@@ -670,6 +674,79 @@ mod tests {
             .chain(ev.informational.iter())
             .any(|s| matches!(s, Signal::ReservesMatchPostState { .. }));
         assert!(!any, "should be silent when backrun_tx is None");
+    }
+
+    // ----- Tier 3.3 — victim_loss CI propagation -------------------------
+
+    #[tokio::test]
+    async fn victim_loss_ci_propagates_when_observations_match_model() {
+        // All three legs' amount_outs are pre-computed from the same pool
+        // math the replay uses, so every residual is exactly zero ⇒ CI
+        // collapses to `[point, point]`. Both bounds equal the point
+        // estimate exactly.
+        let mut attack = make_attack();
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        attack.frontrun.amount_out = fr_out;
+        attack.victim.amount_out = victim_out;
+        attack.backrun.amount_out = back_out;
+
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        let point = attack.victim_loss_lamports.unwrap();
+        assert!(point > 0);
+        assert_eq!(attack.victim_loss_lamports_lower, Some(point));
+        assert_eq!(attack.victim_loss_lamports_upper, Some(point));
+    }
+
+    #[tokio::test]
+    async fn victim_loss_ci_none_when_observations_missing() {
+        // make_attack/make_frontrun_tx leave every amount_out = 0 ⇒ all
+        // residuals come back None ⇒ no CI is derivable. The point
+        // estimate is still emitted; only the bounds stay None.
+        let mut attack = make_attack();
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        assert!(attack.victim_loss_lamports.unwrap() > 0);
+        assert!(attack.victim_loss_lamports_lower.is_none());
+        assert!(attack.victim_loss_lamports_upper.is_none());
+    }
+
+    #[tokio::test]
+    async fn mev_receipt_inherits_victim_loss_ci() {
+        // Tier 3.3 CI fields must round-trip into MevReceipt::from_attack
+        // so Vigil's per-receipt rendering can show the band without
+        // recomputing.
+        let mut attack = make_attack();
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(499_000_000, SwapDirection::Sell);
+        attack.frontrun.amount_out = fr_out;
+        attack.victim.amount_out = victim_out;
+        attack.backrun.amount_out = back_out;
+
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: make_config(),
+        };
+        enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        let receipt = swap_events::types::MevReceipt::from_attack(&attack);
+        assert_eq!(receipt.loss_amount, attack.victim_loss_lamports);
+        assert_eq!(receipt.loss_amount_lower, attack.victim_loss_lamports_lower);
+        assert_eq!(receipt.loss_amount_upper, attack.victim_loss_lamports_upper);
+        assert!(receipt.loss_amount_lower.is_some());
     }
 
     #[tokio::test]

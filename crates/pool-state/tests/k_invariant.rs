@@ -164,6 +164,8 @@ fn make_attack(
         backrun,
         estimated_attacker_profit: None,
         victim_loss_lamports: None,
+        victim_loss_lamports_lower: None,
+        victim_loss_lamports_upper: None,
         frontrun_slot: None,
         backrun_slot: None,
         detection_method: None,

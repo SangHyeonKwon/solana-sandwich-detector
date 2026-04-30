@@ -980,6 +980,8 @@ mod tests {
             dex: DexType::RaydiumV4,
             estimated_attacker_profit: Some(100),
             victim_loss_lamports: Some(50),
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             attacker_profit: Some(80),
             price_impact_bps: Some(42),
             frontrun_slot: Some(42),

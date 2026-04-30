@@ -201,6 +201,14 @@ pub struct MevReceipt {
     /// Loss in quote-token smallest units. `None` when AMM replay didn't run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_amount: Option<i64>,
+    /// Lower / upper bounds of the victim-loss confidence interval (Tier 3.3),
+    /// mirrored from `SandwichAttack.victim_loss_lamports_{lower,upper}`.
+    /// Same quote-token unit as `loss_amount`. Both `None` when no
+    /// observation-based CI was derivable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_amount_lower: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_amount_upper: Option<i64>,
     /// `loss_amount / counterfactual_value`, in `[0.0, 1.0]`. `None` when
     /// not derivable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +279,8 @@ impl MevReceipt {
             mev_type,
             severity,
             loss_amount: attack.victim_loss_lamports,
+            loss_amount_lower: attack.victim_loss_lamports_lower,
+            loss_amount_upper: attack.victim_loss_lamports_upper,
             loss_percent,
             loss_confidence,
             validator_identity: attack.slot_leader.clone(),
@@ -334,6 +344,19 @@ pub struct SandwichAttack {
     /// Mirrors Vigil `mev_attack.victim_loss_lamports`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub victim_loss_lamports: Option<i64>,
+    /// Lower bound of the victim-loss confidence interval (Tier 3.3),
+    /// in the same quote-token smallest unit as `victim_loss_lamports`.
+    /// Width is derived from the worst per-step model/parser disagreement
+    /// (`Signal::InvariantResidual`); both bounds are `None` when
+    /// observations are missing on every step or the residual is
+    /// pathological (≥100%). Pairs with `victim_loss_lamports_upper` —
+    /// emit either both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_loss_lamports_lower: Option<i64>,
+    /// Upper bound of the victim-loss confidence interval. See
+    /// `victim_loss_lamports_lower` for the derivation and pairing rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub victim_loss_lamports_upper: Option<i64>,
     /// AMM-correct attacker gross profit via counterfactual replay. Populated alongside
     /// `victim_loss_lamports`. Can differ significantly from `estimated_attacker_profit`
     /// — the re-classification from "naive profitable" to "AMM unprofitable" is the
@@ -1152,6 +1175,8 @@ mod evidence_tests {
             dex: DexType::RaydiumV4,
             estimated_attacker_profit: Some(200),
             victim_loss_lamports: Some(20),
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             attacker_profit: Some(150),
             price_impact_bps: Some(42),
             frontrun_slot: Some(10),
@@ -1230,6 +1255,8 @@ mod vigil_schema_tests {
             dex: DexType::RaydiumV4,
             estimated_attacker_profit: Some(100),
             victim_loss_lamports: Some(50),
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             attacker_profit: Some(80),
             price_impact_bps: Some(42),
             frontrun_slot: Some(10),

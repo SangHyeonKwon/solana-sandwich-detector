@@ -47,6 +47,15 @@ pub struct LossEstimate {
     /// Buy/Sell normalisation as `attacker_profit_real`. Fed into
     /// [`Signal::CounterfactualAttackerProfit`].
     pub counterfactual_attacker_profit_no_victim: i64,
+    /// Confidence interval on `victim_loss` (Tier 3.3). Width is derived
+    /// from the worst per-step parser-vs-model gap (`residual_bps_*`):
+    /// half-width = max(|residual|) / 10_000 applied multiplicatively to
+    /// the point estimate. `None` on both bounds when no step has a usable
+    /// observation (parser silent on every leg) or the point estimate is
+    /// non-positive (no meaningful CI on a contradicted detection).
+    /// Lower is clamped at 0 — `victim_loss` is by construction ≥ 0.
+    pub victim_loss_lower: Option<i64>,
+    pub victim_loss_upper: Option<i64>,
 }
 
 /// Compute a signed basis-point residual between an AMM-predicted output
@@ -154,6 +163,35 @@ pub fn compute_loss_with_trace(
     let residual_bps_victim = residual_bps(actual_victim_out, attack.victim.amount_out);
     let residual_bps_backrun = residual_bps(backrun_out, attack.backrun.amount_out);
 
+    // Victim-loss confidence interval (Tier 3.3): widen the point estimate
+    // by the worst per-step model/parser disagreement. The intuition is
+    // that residual_bps_* directly bounds how far our reservoir-based
+    // victim_out predictions can drift from chain truth, so the loss
+    // (which is a difference of two such predictions) inherits the same
+    // relative uncertainty as a first-order envelope.
+    let max_abs_residual_bps = [
+        residual_bps_frontrun,
+        residual_bps_victim,
+        residual_bps_backrun,
+    ]
+    .iter()
+    .filter_map(|x| x.map(|v| v.unsigned_abs()))
+    .max();
+    let (victim_loss_lower, victim_loss_upper) = match max_abs_residual_bps {
+        // A residual ≥ 100% means the model is so out of step with chain
+        // truth that quoting a numeric CI would imply more precision than
+        // we have. Saturating-large residuals (e.g. parser-observed
+        // amount_out close to zero) push max_abs to i32::MAX.unsigned_abs(),
+        // so this guard is mandatory rather than aesthetic.
+        Some(max_abs) if victim_loss > 0 && max_abs < 10_000 => {
+            let half_width = max_abs as f64 / 10_000.0;
+            let lower = ((victim_loss as f64) * (1.0 - half_width)).max(0.0) as i64;
+            let upper = ((victim_loss as f64) * (1.0 + half_width)) as i64;
+            (Some(lower), Some(upper))
+        }
+        _ => (None, None),
+    };
+
     let loss = LossEstimate {
         victim_loss,
         attacker_profit_real,
@@ -164,6 +202,8 @@ pub fn compute_loss_with_trace(
         residual_bps_victim,
         residual_bps_backrun,
         counterfactual_attacker_profit_no_victim,
+        victim_loss_lower,
+        victim_loss_upper,
     };
 
     let trace = AmmReplayTrace {
@@ -231,6 +271,8 @@ mod tests {
             backrun,
             estimated_attacker_profit: None,
             victim_loss_lamports: None,
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
             frontrun_slot: None,
             backrun_slot: None,
             detection_method: None,
@@ -406,5 +448,108 @@ mod tests {
             "without-victim profit should be ≤ 0 — extraction needs the victim, got {}",
             loss.counterfactual_attacker_profit_no_victim,
         );
+    }
+
+    // ----- Tier 3.3 — victim_loss confidence interval --------------------
+
+    /// All amount_outs zero ⇒ residuals all None ⇒ no CI emitted. Sandwich
+    /// detector still reports a victim_loss point estimate, but without a
+    /// parser-observed reference there's no basis to widen it.
+    #[test]
+    fn victim_loss_ci_none_when_no_residuals_observed() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 100_000_000, 0),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        assert!(loss.victim_loss > 0);
+        assert!(loss.victim_loss_lower.is_none());
+        assert!(loss.victim_loss_upper.is_none());
+    }
+
+    /// Observations match the model exactly ⇒ residuals are all 0 ⇒ CI
+    /// degenerates to `[point, point]`. The CI is *present* (we have
+    /// observations to constrain it with) but zero-width.
+    #[test]
+    fn victim_loss_ci_collapses_when_residuals_zero() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, pool_1) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let (victim_out, pool_2) = pool_1.apply_swap(100_000_000, SwapDirection::Buy);
+        let (back_out, _) = pool_2.apply_swap(fr_out, SwapDirection::Sell);
+
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, fr_out),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, victim_out),
+            swap("b", "atk", SwapDirection::Sell, fr_out, back_out),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        assert!(loss.victim_loss > 0);
+        assert_eq!(loss.victim_loss_lower, Some(loss.victim_loss));
+        assert_eq!(loss.victim_loss_upper, Some(loss.victim_loss));
+    }
+
+    /// Inject a 5% gap (~500 bps) on just the frontrun observation; leave
+    /// victim and backrun observations zero so their residuals stay None.
+    /// The CI half-width should track the single nonzero residual.
+    #[test]
+    fn victim_loss_ci_widens_with_residual_size() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let (fr_out, _) = pool.apply_swap(500_000_000, SwapDirection::Buy);
+        let observed_smaller = (fr_out as f64 * 0.95) as u64;
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, observed_smaller),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 100_000_000, 0),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        let lower = loss.victim_loss_lower.expect("CI lower set");
+        let upper = loss.victim_loss_upper.expect("CI upper set");
+        assert!(lower <= loss.victim_loss && loss.victim_loss <= upper);
+        // Half-width = max(|residual|) / 10000 ≈ 526 / 10000 ≈ 5.26%.
+        let half_width_pct = (upper - lower) as f64 / 2.0 / loss.victim_loss as f64;
+        assert!(
+            (0.04..=0.07).contains(&half_width_pct),
+            "expected ~5% half-width, got {half_width_pct}",
+        );
+    }
+
+    /// Saturating-large residual (parser observed near-zero amount_out)
+    /// triggers the ≥100% guard ⇒ CI suppressed rather than reported as
+    /// a wildly inflated band.
+    #[test]
+    fn victim_loss_ci_suppressed_when_residual_saturates() {
+        let pool = ConstantProduct::new(1_000_000_000, 1_000_000_000, 25, 10_000);
+        let attack = make_attack(
+            // observed=1 forces residual_bps to saturate near i32::MAX —
+            // model says "huge output", chain says "1 unit".
+            swap("f", "atk", SwapDirection::Buy, 500_000_000, 1),
+            swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 100_000_000, 0),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        assert!(loss.victim_loss > 0);
+        assert!(loss.victim_loss_lower.is_none());
+        assert!(loss.victim_loss_upper.is_none());
+    }
+
+    /// Loss point estimate ≤ 0 (e.g. malformed detection) ⇒ no CI. A
+    /// confidence interval on a contradicted detection would invite false
+    /// positives downstream.
+    #[test]
+    fn victim_loss_ci_none_when_loss_non_positive() {
+        // Build a scenario where the victim doesn't actually lose: tiny
+        // frontrun on a deep pool means counterfactual ≈ actual ≈ 0 loss.
+        let pool = ConstantProduct::new(1_000_000_000_000, 1_000_000_000_000, 25, 10_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 1_000, 999),
+            swap("v", "vic", SwapDirection::Buy, 1_000, 999),
+            swap("b", "atk", SwapDirection::Sell, 1_000, 999),
+        );
+        let loss = compute_loss(&attack, pool).unwrap();
+        assert!(loss.victim_loss <= 0);
+        assert!(loss.victim_loss_lower.is_none());
+        assert!(loss.victim_loss_upper.is_none());
     }
 }

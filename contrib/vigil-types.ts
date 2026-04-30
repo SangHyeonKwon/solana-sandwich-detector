@@ -219,6 +219,13 @@ export interface MevReceipt {
   severity: Severity;
   /** Quote-token smallest units. `null` when AMM replay didn't run. */
   loss_amount?: number | null;
+  /**
+   * Lower / upper bounds of the victim-loss confidence interval (Tier 3.3),
+   * mirrored from `SandwichAttack.victim_loss_lamports_{lower,upper}`. Both
+   * `null` when observations were insufficient to derive a CI.
+   */
+  loss_amount_lower?: number | null;
+  loss_amount_upper?: number | null;
   loss_percent?: number | null;
   loss_confidence: ConfidenceLevel;
   /** Vigil `validator_identity` — slot leader at the victim's slot. */
@@ -243,6 +250,14 @@ export interface SandwichAttack {
 
   // -- AMM-replay numbers (Vigil ERD `mev_attack.*`) --
   victim_loss_lamports?: number | null;
+  /**
+   * Confidence interval on `victim_loss_lamports` (Tier 3.3). Width is
+   * derived from the worst per-step `InvariantResidual`; both bounds are
+   * `null` when no usable observation exists on any leg or the residual
+   * is pathological (≥100%).
+   */
+  victim_loss_lamports_lower?: number | null;
+  victim_loss_lamports_upper?: number | null;
   attacker_profit?: number | null;
   price_impact_bps?: number | null;
 

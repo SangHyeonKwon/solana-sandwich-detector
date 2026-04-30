@@ -86,6 +86,8 @@ pub fn detect_sandwiches(slot: u64, swaps: &[SwapEvent]) -> Vec<SandwichAttack> 
                         dex: frontrun.dex,
                         estimated_attacker_profit: estimate_profit(frontrun, backrun),
                         victim_loss_lamports: None,
+                        victim_loss_lamports_lower: None,
+                        victim_loss_lamports_upper: None,
                         frontrun_slot: None,
                         backrun_slot: None,
                         detection_method: Some(DetectionMethod::SameBlock),
