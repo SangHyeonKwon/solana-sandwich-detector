@@ -391,7 +391,7 @@ async fn label(
         .iter()
         .filter(|s| s.has_block && !already_labeled.contains(&s.slot))
         .collect();
-    slots_to_label.sort_by(|a, b| b.sameblock_candidates.cmp(&a.sameblock_candidates));
+    slots_to_label.sort_by_key(|s| std::cmp::Reverse(s.sameblock_candidates));
 
     let source = swap_events::source::rpc::RpcBlockSource::new(rpc_url);
     let parsers = swap_events::dex::all_parsers();
