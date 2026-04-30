@@ -94,6 +94,78 @@ pub struct WhirlpoolPool {
     pub fee_rate_hundredths_bps: u16,
 }
 
+impl WhirlpoolPool {
+    /// Apply an exact-input swap that stays *within* the current
+    /// initialised tick range. The range is `[tick_lower, tick_upper]`
+    /// where both bounds are multiples of `tick_spacing` and bracket
+    /// `tick_current_index`; within that band liquidity is constant, so
+    /// [`swap_math::compute_swap_step_exact_in`] resolves the result in a
+    /// single call.
+    ///
+    /// Returns `None` if the swap would cross a tick boundary — the
+    /// cross-tick path needs `liquidity_net` from the next initialised
+    /// TickArray entry, which lands in step 3-γ/δ. The within-tick
+    /// guard is also why the caller can rely on `liquidity` not
+    /// changing in the returned pool.
+    ///
+    /// `a_to_b = true`  → token_a in, sqrt_price drops.
+    /// `a_to_b = false` → token_b in, sqrt_price rises.
+    ///
+    /// Returns `(new_pool, amount_out, fee_amount)`. `amount_in +
+    /// fee_amount` reflects the full gross input consumed (the
+    /// `compute_swap_step_exact_in` invariant).
+    pub fn apply_swap_within_tick(
+        &self,
+        amount_in: u128,
+        a_to_b: bool,
+        fee_num: u128,
+        fee_den: u128,
+    ) -> Option<(WhirlpoolPool, u128, u128)> {
+        let tick_lower =
+            floor_to_spacing(self.tick_current_index, self.tick_spacing as i32);
+        let tick_upper = tick_lower + self.tick_spacing as i32;
+        let target_sqrt_price = if a_to_b {
+            tick_math::sqrt_price_at_tick(tick_lower)
+        } else {
+            tick_math::sqrt_price_at_tick(tick_upper)
+        };
+        let r = swap_math::compute_swap_step_exact_in(
+            self.sqrt_price_q64,
+            target_sqrt_price,
+            self.liquidity,
+            amount_in,
+            fee_num,
+            fee_den,
+        )?;
+        // Reaching the target means the segment ran out of curve before
+        // amount_remaining did — i.e. the swap crossed the tick boundary.
+        // That's outside this method's contract; bail.
+        if r.sqrt_price_next == target_sqrt_price {
+            return None;
+        }
+        let new_pool = WhirlpoolPool {
+            sqrt_price_q64: r.sqrt_price_next,
+            tick_current_index: tick_math::tick_at_sqrt_price_q64(r.sqrt_price_next),
+            ..*self
+        };
+        Some((new_pool, r.amount_out, r.fee_amount))
+    }
+}
+
+/// Floor `tick` to the nearest multiple of `spacing` ≤ `tick`. Rust's
+/// integer division truncates toward zero, which mishandles negative
+/// ticks (`-3 / 64 = 0` instead of the `-64` we need for the bracket
+/// containing `-3`). This helper does the proper floor.
+fn floor_to_spacing(tick: i32, spacing: i32) -> i32 {
+    let q = tick / spacing;
+    let r = tick % spacing;
+    if r < 0 {
+        (q - 1) * spacing
+    } else {
+        q * spacing
+    }
+}
+
 /// Parse a Whirlpool account blob into a [`PoolConfig`]. Mirrors
 /// [`raydium_v4::parse_config`](crate::raydium_v4::parse_config) in shape
 /// and orientation: returns `None` when the data is too short, the fee is
@@ -1121,5 +1193,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ----- floor_to_spacing / apply_swap_within_tick --------------------
+
+    #[test]
+    fn floor_to_spacing_handles_positive_negative_and_exact() {
+        // Exact multiples stay put.
+        assert_eq!(floor_to_spacing(0, 64), 0);
+        assert_eq!(floor_to_spacing(64, 64), 64);
+        assert_eq!(floor_to_spacing(-64, 64), -64);
+        // Positive non-multiple floors down toward zero.
+        assert_eq!(floor_to_spacing(65, 64), 64);
+        assert_eq!(floor_to_spacing(127, 64), 64);
+        // Negative non-multiple floors *down* (toward -∞), not toward zero —
+        // this is the case the naive `tick / spacing * spacing` gets wrong.
+        assert_eq!(floor_to_spacing(-3, 64), -64);
+        assert_eq!(floor_to_spacing(-65, 64), -128);
+    }
+
+    fn make_pool(
+        sqrt_price_q64: u128,
+        liquidity: u128,
+        tick_current: i32,
+        spacing: u16,
+    ) -> WhirlpoolPool {
+        WhirlpoolPool {
+            liquidity,
+            sqrt_price_q64,
+            tick_current_index: tick_current,
+            tick_spacing: spacing,
+            fee_rate_hundredths_bps: 3000,
+        }
+    }
+
+    /// Pool fixture seated *strictly inside* the `[tick_lower, tick_upper]`
+    /// band so a→b and b→a both have room to move without hitting a
+    /// boundary on the first sub-tick step.
+    fn pool_inside_band() -> WhirlpoolPool {
+        // tick = 10, spacing = 64 ⇒ tick_lower = 0, tick_upper = 64.
+        // sqrt_price_at_tick(10) sits well between the two boundaries.
+        let tick = 10;
+        let sp = tick_math::sqrt_price_at_tick(tick);
+        make_pool(sp, 1_000_000_000, tick, 64)
+    }
+
+    #[test]
+    fn within_tick_a_to_b_small_amount_stays_in_range() {
+        // Modest swap on a 1B-liquidity pool — well below the
+        // tick_lower=0 boundary, so the result stays in-band.
+        let pool = pool_inside_band();
+        let (new_pool, out, fee) = pool
+            .apply_swap_within_tick(100_000, true, 3_000, 1_000_000)
+            .expect("within-tick swap should succeed");
+        assert!(new_pool.sqrt_price_q64 < pool.sqrt_price_q64);
+        // New tick stays within [tick_lower, tick_upper) = [0, 64).
+        assert!(new_pool.tick_current_index >= 0);
+        assert!(new_pool.tick_current_index < 64);
+        assert!(out > 0);
+        assert!(fee > 0);
+        // Liquidity invariant within the tick range.
+        assert_eq!(new_pool.liquidity, pool.liquidity);
+    }
+
+    #[test]
+    fn within_tick_b_to_a_small_amount_stays_in_range() {
+        let pool = pool_inside_band();
+        let (new_pool, out, _fee) = pool
+            .apply_swap_within_tick(100_000, false, 3_000, 1_000_000)
+            .expect("within-tick swap should succeed");
+        assert!(new_pool.sqrt_price_q64 > pool.sqrt_price_q64);
+        assert!(out > 0);
+    }
+
+    #[test]
+    fn within_tick_returns_none_when_swap_crosses_boundary() {
+        // Same starting position as the success cases, but tiny liquidity
+        // + huge amount means the swap walks past the boundary easily.
+        // apply_swap_within_tick must bail rather than silently extrapolate
+        // liquidity past where it's defined.
+        let tick = 10;
+        let sp = tick_math::sqrt_price_at_tick(tick);
+        let pool = make_pool(sp, 1_000, tick, 64);
+        assert!(pool
+            .apply_swap_within_tick(u64::MAX as u128, true, 3_000, 1_000_000)
+            .is_none());
+    }
+
+    #[test]
+    fn within_tick_zero_liquidity_returns_none() {
+        let tick = 10;
+        let sp = tick_math::sqrt_price_at_tick(tick);
+        let pool = make_pool(sp, 0, tick, 64);
+        assert!(pool
+            .apply_swap_within_tick(100, true, 3_000, 1_000_000)
+            .is_none());
+    }
+
+    #[test]
+    fn within_tick_at_lower_boundary_aborts_a_to_b() {
+        // Pathological starting state: sqrt_price sits *exactly* on the
+        // tick_lower boundary. An a→b swap can't proceed without crossing,
+        // so the within-tick path bails — production callers should treat
+        // this as the cross-tick walk's job (step 3-γ/δ).
+        let pool = make_pool(swap_math::Q64, 1_000_000_000, 0, 64);
+        assert!(pool
+            .apply_swap_within_tick(100_000, true, 3_000, 1_000_000)
+            .is_none());
+    }
+
+    #[test]
+    fn within_tick_negative_tick_uses_correct_lower_bound() {
+        // tick = -3, spacing 64 ⇒ tick_lower = -64, tick_upper = 0. An
+        // a→b swap should target sqrt_price_at_tick(-64) and stay within
+        // the band as long as it doesn't reach.
+        let sp = tick_math::sqrt_price_at_tick(-3);
+        let pool = make_pool(sp, 1_000_000_000, -3, 64);
+        let (new_pool, _, _) = pool
+            .apply_swap_within_tick(10_000, true, 3_000, 1_000_000)
+            .expect("should stay within [-64, 0]");
+        assert!(new_pool.sqrt_price_q64 < sp);
+        assert!(new_pool.tick_current_index >= -64);
     }
 }
