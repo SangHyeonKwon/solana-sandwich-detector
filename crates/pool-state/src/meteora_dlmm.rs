@@ -919,7 +919,21 @@ pub mod cross_bin {
             })
         }
 
-        /// Snapshot for `bin_id`, or `None` if outside the window.
+        /// Snapshot for `bin_id`. Returns `None` for either of:
+        ///   * `bin_id` outside the `range` covered by the supplied
+        ///     arrays (the walker stepped past the fetch window),
+        ///   * `bin_id` *within* `range` but not present in the
+        ///     `bins` map — happens when the caller passed a
+        ///     non-contiguous window (e.g. `[Some(-2), None,
+        ///     Some(0)]` after `into_iter().flatten()` collapsed to
+        ///     `[arr_-2, arr_0]`, so `range = (-140, 69)` covers bin
+        ///     `-71` but no entry exists for it).
+        ///
+        /// Both cases produce the same downstream behaviour
+        /// (`cross_bin_swap` bails with `None`, enrich reports
+        /// `CrossTickUnsupported`), so the caller doesn't need to
+        /// distinguish them — but they're semantically different
+        /// failure modes worth flagging in diagnostics.
         pub fn get(&self, bin_id: i32) -> Option<BinSnapshot> {
             if bin_id < self.range.0 || bin_id > self.range.1 {
                 return None;
@@ -1022,7 +1036,11 @@ pub mod cross_bin {
             // Mutate bin amounts. The "amount that lands inside the
             // bin" is the gross input minus the fee — fees are
             // collected by the protocol, not retained in the bin.
-            let amount_into_bin = step.amount_in_with_fees.saturating_sub(step.fee);
+            // Use `checked_sub` so a regression in `swap_within_bin`
+            // returning `fee > amount_in_with_fees` fails loudly
+            // rather than silently producing 0; on-chain `Bin::swap`
+            // mirrors this with `checked_sub(...).context("overflow")`.
+            let amount_into_bin = step.amount_in_with_fees.checked_sub(step.fee)?;
             let (new_x, new_y) = if swap_for_y {
                 (
                     snap.amount_x.saturating_add(amount_into_bin),

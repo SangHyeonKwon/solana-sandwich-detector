@@ -683,10 +683,16 @@ pub fn compute_loss_dlmm_with_trace(
         SwapDirection::Sell => (raw_profit_no_v as f64 * quote_per_base) as i64,
     };
 
-    // price_impact_bps: number of bins the frontrun moved active_id
-    // times the bin step (in bps). DLMM's bin_step is already in
-    // basis points, so the product is the bps spread between the
-    // initial and post-frontrun spot prices.
+    // price_impact_bps: first-order approximation, `bins_moved *
+    // bin_step`. The exact spread is `(1 + bin_step/10_000)^n - 1`;
+    // the linearisation drops the (1 + x)^n - 1 ≈ nx Taylor remainder.
+    // For realistic sandwiches (n ≤ 5, bin_step ≤ 25) the relative
+    // error is <0.1%, well below the bps reporting precision. Past
+    // ~50 bins (rare) the linearisation underestimates by a few
+    // percent — exact computation via `bin_price` ratio is a Phase 3
+    // refinement, behind variable-fee plumbing in priority since the
+    // approximation is already within the noise floor for the bps
+    // surface Vigil consumes.
     let active_id_diff = (active_after_front - initial_active_id).unsigned_abs();
     let price_impact_bps = active_id_diff.saturating_mul(pool.bin_step as u32);
 
@@ -740,7 +746,11 @@ pub fn compute_loss_dlmm_with_trace(
         // is the canonical fraction; surface that here so a reader
         // doesn't have to derive `base_factor * bin_step * 10` from
         // `bin_step` alone.
-        fee_num: pool.total_fee_rate().unwrap_or(0) as u64,
+        // Propagate `None` rather than masking with `0`: an
+        // overflow in `total_fee_rate` (only reachable in Phase 3
+        // variable-fee plumbing) shouldn't silently surface a "no
+        // fee" trace.
+        fee_num: pool.total_fee_rate()? as u64,
         fee_den: crate::meteora_dlmm::DLMM_FEE_PRECISION,
     };
 

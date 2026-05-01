@@ -1522,4 +1522,88 @@ mod tests {
         );
         assert_eq!(trace.active_id_pre, 60);
     }
+
+    /// Array-boundary walk: `active_id` starts near the edge of array 0
+    /// (bin 67, with array 0 covering `[0, 69]`) and the cross-bin
+    /// walker must step *into array 1* to absorb the input. Pins that
+    /// the 5-array window's peripheral arrays are actually used —
+    /// without array 1's reserves, the walker would bail with
+    /// `CrossTickUnsupported`.
+    #[tokio::test]
+    async fn dlmm_corpus_walks_across_array_boundary() {
+        let mut attack = make_dlmm_attack(10_000);
+        let tx = make_frontrun_tx();
+        // Active id 67: 3 bins from end of array 0. With Buy +
+        // base_is_token_a ⇒ swap_for_y = false ⇒ active_id increases
+        // ⇒ walker steps 67 → 68 → 69 → 70 (= array 1, slot 0).
+        // Without array 1 populated, walker would bail at bin 70.
+        let dynamic_state = DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 67,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        });
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
+            // Window: [array_idx-2, -1, 0, +1, +2] = [-2, -1, 0, 1, 2].
+            // Active array index = 0 (slot 2). Populate slot 3 too
+            // so the walker can cross into bin 70 mid-walk.
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                Some(dlmm_uniform_array(1, 1_000, 1_000)),
+                None,
+            ],
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(
+            result,
+            EnrichmentResult::Enriched,
+            "boundary-crossing walk must succeed when next array is populated",
+        );
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        // 10k input with 1k reserves per bin ⇒ ~10 bins drained;
+        // 67 + 10 = 77 lands in array 1.
+        assert!(
+            trace.active_id_post_front >= 70,
+            "expected walk to cross array boundary (≥ 70), got {}",
+            trace.active_id_post_front,
+        );
+    }
+
+    /// Partial-peripheral window: the walker should bail when it
+    /// steps into a `None` slot mid-walk, even if other peripherals
+    /// are populated. Configures `[Some(-2), None, Some(0), None,
+    /// Some(2)]` — gap at array indices -1 and +1. Cross-bin walks
+    /// from active_id 0 going up should hit bin 70 (array +1, missing)
+    /// and bail with `CrossTickUnsupported`.
+    #[tokio::test]
+    async fn dlmm_corpus_partial_peripheral_bails_into_gap() {
+        let mut attack = make_dlmm_attack(1_000_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            // Active array (slot 2) populated; slots 1 and 3 (the
+            // immediate neighbours, where a ±1-bin walk would land)
+            // are missing. Slots 0 and 4 are populated but
+            // unreachable thanks to the gap.
+            bin_arrays: vec![
+                Some(dlmm_uniform_array(-2, 1_000, 1_000)),
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                Some(dlmm_uniform_array(2, 1_000, 1_000)),
+            ],
+        };
+        // 1M input ≫ array 0's ~70k worth of reserves ⇒ walker must
+        // step into array 1, which is `None` ⇒ bail.
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::CrossTickUnsupported);
+    }
 }
