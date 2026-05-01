@@ -16,21 +16,26 @@ pub enum AmmKind {
     RaydiumCpmm,
     /// Orca Whirlpool concentrated-liquidity AMM. Config (vault / mint /
     /// fee) and pool-state (sqrt_price / liquidity / tick) parsing are
-    /// in [`crate::orca_whirlpool`]; replay support lands in a follow-up
-    /// — `enrich_attack` currently routes this kind to
-    /// [`EnrichmentResult::UnsupportedDex`](crate::EnrichmentResult).
+    /// in [`crate::orca_whirlpool`].
     OrcaWhirlpool,
+    /// Meteora DLMM (Liquidity Book) bin-based concentrated-liquidity AMM.
+    /// Config + dynamic-state parsing are in [`crate::meteora_dlmm`]; bin
+    /// math, swap step, and replay land in subsequent steps. Until then,
+    /// `enrich_attack` short-circuits this kind to
+    /// [`EnrichmentResult::UnsupportedDex`](crate::EnrichmentResult).
+    MeteoraDlmm,
 }
 
 impl AmmKind {
     /// Map a [`DexType`] to an AMM kind this crate can recognise. Returns
     /// `None` for DEXes we have neither config parsing nor replay for
-    /// (Pump.fun, Phoenix, Jupiter, Meteora DLMM, Raydium CLMM).
+    /// (Pump.fun, Phoenix, Jupiter, Raydium CLMM).
     pub fn from_dex(dex: DexType) -> Option<Self> {
         match dex {
             DexType::RaydiumV4 => Some(AmmKind::RaydiumV4),
             DexType::RaydiumCpmm => Some(AmmKind::RaydiumCpmm),
             DexType::OrcaWhirlpool => Some(AmmKind::OrcaWhirlpool),
+            DexType::MeteoraDlmm => Some(AmmKind::MeteoraDlmm),
             _ => None,
         }
     }

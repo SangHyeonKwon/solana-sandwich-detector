@@ -178,6 +178,13 @@ pub async fn enrich_attack(
                 .unwrap_or(0);
             (loss, None, Some(whirlpool_trace), pool_quote_tvl)
         }
+        AmmKind::MeteoraDlmm => {
+            // Phase 1 step 1 lands the LbPair config / dynamic-state
+            // parser; bin math + within-bin swap step + replay arrive
+            // in subsequent steps. Until then DLMM detections short-
+            // circuit even though `pool_config` now succeeds.
+            return EnrichmentResult::UnsupportedDex;
+        }
     };
 
     attack.victim_loss_lamports = Some(loss.victim_loss);

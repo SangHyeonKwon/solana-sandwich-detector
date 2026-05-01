@@ -22,7 +22,7 @@ use tracing::warn;
 
 use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLookup};
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
-use crate::{orca_whirlpool, raydium_cpmm, raydium_v4};
+use crate::{meteora_dlmm, orca_whirlpool, raydium_cpmm, raydium_v4};
 
 /// Slot-aware account-fetch surface for archival providers.
 ///
@@ -170,6 +170,7 @@ impl RpcPoolLookup {
             DexType::RaydiumV4 => raydium_v4::parse_config(pool, &account.data),
             DexType::RaydiumCpmm => raydium_cpmm::parse_config(pool, &account.data),
             DexType::OrcaWhirlpool => orca_whirlpool::parse_config(pool, &account.data),
+            DexType::MeteoraDlmm => meteora_dlmm::parse_config(pool, &account.data),
             _ => None,
         }
     }
