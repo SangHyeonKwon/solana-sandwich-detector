@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use swap_events::types::DexType;
@@ -23,8 +24,92 @@ use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLoo
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::{orca_whirlpool, raydium_cpmm, raydium_v4};
 
-pub struct RpcPoolLookup {
+/// Slot-aware account-fetch surface for archival providers.
+///
+/// The standard `solana-client` `getAccountInfo` always returns
+/// latest-confirmed state — fine for stream-mode detection (the
+/// frontrun landed seconds ago) but wrong for backfill replay against
+/// historical sandwiches. Archival providers expose proprietary
+/// slot-precise lookup methods that don't fit the public RPC surface;
+/// this trait is the integration point.
+///
+/// The default [`LatestAccountFetcher`] ignores `slot` and serves
+/// latest-confirmed state — same behaviour the codebase had before
+/// this trait existed. To wire archival, implement this trait against
+/// your provider's API (Helius `getAccountInfoAtSlot`, Triton's
+/// archival endpoint, etc.) and hand it to
+/// [`RpcPoolLookup::with_account_fetcher`].
+#[async_trait]
+pub trait AccountFetcher: Send + Sync {
+    /// Fetch a single account at the given slot. Returns `None` when
+    /// the fetch fails (RPC error, archival provider rejected the
+    /// slot, account doesn't exist).
+    ///
+    /// Implementations that don't support slot-precise lookups should
+    /// document that and ignore `slot`.
+    async fn fetch_account(&self, pubkey: &Pubkey, slot: u64) -> Option<Account>;
+
+    /// Fetch multiple accounts at the same slot. Result is **1:1
+    /// aligned** with `pubkeys` — `None` at index `i` means that
+    /// account's fetch failed or the account doesn't exist. Callers
+    /// rely on the alignment to match results back to their inputs.
+    async fn fetch_multiple_accounts(&self, pubkeys: &[Pubkey], slot: u64) -> Vec<Option<Account>>;
+}
+
+/// Default [`AccountFetcher`] — wraps an [`RpcClient`] and serves
+/// latest-confirmed state via `getAccountInfo` / `getMultipleAccounts`.
+/// `slot` is ignored. Suitable for stream-mode detection where the
+/// frontrun landed within the last few hundred ms; **not suitable**
+/// for backfill replay where slot-precise pre-frontrun state matters.
+pub struct LatestAccountFetcher {
     client: Arc<RpcClient>,
+}
+
+impl LatestAccountFetcher {
+    pub fn new(client: Arc<RpcClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl AccountFetcher for LatestAccountFetcher {
+    async fn fetch_account(&self, pubkey: &Pubkey, _slot: u64) -> Option<Account> {
+        match self.client.get_account(pubkey).await {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!(pubkey = %pubkey, error = %e, "get_account failed");
+                None
+            }
+        }
+    }
+
+    async fn fetch_multiple_accounts(
+        &self,
+        pubkeys: &[Pubkey],
+        _slot: u64,
+    ) -> Vec<Option<Account>> {
+        if pubkeys.is_empty() {
+            return Vec::new();
+        }
+        match self.client.get_multiple_accounts(pubkeys).await {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                warn!(error = %e, "get_multiple_accounts failed");
+                pubkeys.iter().map(|_| None).collect()
+            }
+        }
+    }
+}
+
+pub struct RpcPoolLookup {
+    /// Static-config client. Pool config (vault addrs, fee rate) is
+    /// invariant per pool, so latest-confirmed is always correct here
+    /// — no archival routing needed.
+    client: Arc<RpcClient>,
+    /// Slot-aware fetcher for *dynamic* state. Defaults to
+    /// [`LatestAccountFetcher`]; swap in a provider-specific impl via
+    /// [`Self::with_account_fetcher`] for archival backfill.
+    fetcher: Arc<dyn AccountFetcher>,
     cache: Mutex<HashMap<String, Option<PoolConfig>>>,
 }
 
@@ -37,8 +122,31 @@ impl RpcPoolLookup {
     }
 
     pub fn with_client(client: Arc<RpcClient>) -> Self {
+        let fetcher: Arc<dyn AccountFetcher> = Arc::new(LatestAccountFetcher::new(client.clone()));
         Self {
             client,
+            fetcher,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Construct an [`RpcPoolLookup`] that routes dynamic-state and
+    /// tick-array fetches through a custom [`AccountFetcher`]. Static
+    /// pool-config lookups continue to use `rpc_url` directly because
+    /// pool config doesn't vary by slot.
+    ///
+    /// Use this when you have an archival provider integration —
+    /// `enrich_attack` will pass `attack.slot` through to the fetcher,
+    /// and the provider's slot-precise lookup serves pre-frontrun
+    /// pool state for backfill replay.
+    pub fn with_account_fetcher(rpc_url: &str, fetcher: Arc<dyn AccountFetcher>) -> Self {
+        let client = Arc::new(RpcClient::new_with_commitment(
+            rpc_url.to_string(),
+            CommitmentConfig::confirmed(),
+        ));
+        Self {
+            client,
+            fetcher,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -85,23 +193,24 @@ impl PoolStateLookup for RpcPoolLookup {
             .clone()
     }
 
-    /// Fetch the pool's dynamic state via `getAccountInfo`, parsing the
-    /// account blob with the same layout reader the static-config path
-    /// uses. Not cached — dynamic state evolves every swap, so a stale
-    /// snapshot is worse than a fresh round-trip. Whirlpool is the only
-    /// kind we can serve today; other dynamic-state DEXes return `None`
-    /// (the trait default) and stay opt-in.
+    /// Fetch the pool's dynamic state via the configured
+    /// [`AccountFetcher`], parsing the account blob with the same
+    /// layout reader the static-config path uses. Not cached — dynamic
+    /// state evolves every swap, so a stale snapshot is worse than a
+    /// fresh round-trip. Whirlpool is the only kind we can serve
+    /// today; other dynamic-state DEXes return `None` (the trait
+    /// default) and stay opt-in.
     ///
-    /// `slot` is accepted but unused. Mainnet `getAccountInfo` returns
-    /// latest-confirmed state, which lines up with stream-mode detection
-    /// where enrichment runs within a few hundred ms of the frontrun
-    /// landing. Archival-anchored fetches (slot-precise pre-frontrun
-    /// state) need a different RPC and land in a follow-up.
+    /// `slot` is forwarded to the fetcher. The default
+    /// [`LatestAccountFetcher`] ignores it (returns latest-confirmed,
+    /// fine for stream-mode); supply a custom fetcher via
+    /// [`Self::with_account_fetcher`] for slot-precise archival
+    /// backfill.
     async fn pool_dynamic_state(
         &self,
         pool: &str,
         dex: DexType,
-        _slot: u64,
+        slot: u64,
     ) -> Option<DynamicPoolState> {
         if !matches!(dex, DexType::OrcaWhirlpool) {
             return None;
@@ -113,13 +222,7 @@ impl PoolStateLookup for RpcPoolLookup {
                 return None;
             }
         };
-        let account = match self.client.get_account(&pubkey).await {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(pool, error = %e, "pool account fetch failed for dynamic state");
-                return None;
-            }
-        };
+        let account = self.fetcher.fetch_account(&pubkey, slot).await?;
         let pool_state = orca_whirlpool::parse_pool_state(&account.data)?;
         Some(DynamicPoolState::Whirlpool {
             sqrt_price_q64: pool_state.sqrt_price_q64,
@@ -129,13 +232,13 @@ impl PoolStateLookup for RpcPoolLookup {
         })
     }
 
-    /// Fetch one or more Whirlpool TickArray accounts via
-    /// `getMultipleAccounts`. PDA is derived per-slot from
-    /// `(pool, start_tick_index)`; missing accounts (slot uninitialised
-    /// on-chain or RPC dropped them) come back as `None` at the
-    /// matching index. A whole-call RPC failure fills the result with
-    /// `None`s of the right length so callers can still match
-    /// `start_indices` slot-by-slot.
+    /// Fetch one or more Whirlpool TickArray accounts via the
+    /// configured [`AccountFetcher`]. PDA is derived per-slot from
+    /// `(pool, start_tick_index)`; missing accounts (slot
+    /// uninitialised on-chain or fetcher dropped them) come back as
+    /// `None` at the matching index. A whole-call fetch failure fills
+    /// the result with `None`s of the right length so callers can
+    /// still match `start_indices` slot-by-slot.
     ///
     /// Not cached — TickArray contents change every swap that crosses
     /// or initialises a tick within the array. A stale snapshot would
@@ -145,7 +248,7 @@ impl PoolStateLookup for RpcPoolLookup {
         pool: &str,
         dex: DexType,
         start_indices: &[i32],
-        _slot: u64,
+        slot: u64,
     ) -> Vec<Option<ParsedTickArray>> {
         if !matches!(dex, DexType::OrcaWhirlpool) || start_indices.is_empty() {
             return Vec::new();
@@ -161,13 +264,19 @@ impl PoolStateLookup for RpcPoolLookup {
             .iter()
             .map(|&start| orca_whirlpool::tick_array::tick_array_pda(&pool_pubkey, start).0)
             .collect();
-        let accounts = match self.client.get_multiple_accounts(&pdas).await {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(pool, error = %e, "tick array fetch failed");
-                return start_indices.iter().map(|_| None).collect();
-            }
-        };
+        let accounts = self.fetcher.fetch_multiple_accounts(&pdas, slot).await;
+        // Defensive: a misbehaving custom fetcher could return a
+        // wrong-length vec. Re-pad with `None` so the caller's
+        // by-index matching stays sound.
+        if accounts.len() != pdas.len() {
+            warn!(
+                pool,
+                expected = pdas.len(),
+                got = accounts.len(),
+                "fetcher returned mismatched account count for tick arrays",
+            );
+            return start_indices.iter().map(|_| None).collect();
+        }
         accounts
             .into_iter()
             .map(|opt| opt.and_then(|a| orca_whirlpool::tick_array::parse_tick_array(&a.data)))
@@ -253,6 +362,7 @@ impl SlotLeaderLookup for RpcSlotLeaderLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn page_start_floors_to_boundary() {
@@ -261,5 +371,119 @@ mod tests {
         assert_eq!(RpcSlotLeaderLookup::page_start(1000), 1000);
         assert_eq!(RpcSlotLeaderLookup::page_start(1234), 1000);
         assert_eq!(RpcSlotLeaderLookup::page_start(2_000_000), 2_000_000);
+    }
+
+    /// Mock [`AccountFetcher`] that records every call (pubkey + slot)
+    /// and serves preset blobs. Used to pin slot propagation through
+    /// `RpcPoolLookup` without standing up a live RPC.
+    struct RecordingFetcher {
+        calls: StdMutex<Vec<(Pubkey, u64)>>,
+    }
+
+    impl RecordingFetcher {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(Pubkey, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AccountFetcher for RecordingFetcher {
+        async fn fetch_account(&self, pubkey: &Pubkey, slot: u64) -> Option<Account> {
+            self.calls.lock().unwrap().push((*pubkey, slot));
+            None
+        }
+
+        async fn fetch_multiple_accounts(
+            &self,
+            pubkeys: &[Pubkey],
+            slot: u64,
+        ) -> Vec<Option<Account>> {
+            for pk in pubkeys {
+                self.calls.lock().unwrap().push((*pk, slot));
+            }
+            pubkeys.iter().map(|_| None).collect()
+        }
+    }
+
+    /// `pool_dynamic_state` must forward the caller-supplied slot to
+    /// the configured [`AccountFetcher`]. Pins the contract a custom
+    /// archival fetcher relies on — without slot propagation, an
+    /// archival impl would always serve latest-confirmed, defeating
+    /// the abstraction.
+    #[tokio::test]
+    async fn pool_dynamic_state_forwards_slot_to_fetcher() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            // rpc_url is unused for dynamic state — the fetcher owns
+            // those calls. Any string parses; only fetcher matters.
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let pool = Pubkey::new_unique();
+        let _ = lookup
+            .pool_dynamic_state(&pool.to_string(), DexType::OrcaWhirlpool, 12_345)
+            .await;
+        let calls = fetcher.calls();
+        assert_eq!(calls.len(), 1, "expected exactly one fetch_account call");
+        assert_eq!(calls[0].0, pool, "pubkey should round-trip");
+        assert_eq!(calls[0].1, 12_345, "slot must be propagated");
+    }
+
+    /// `tick_arrays` must forward the caller-supplied slot for *every*
+    /// PDA in the multi-fetch and align the result vec 1:1 with
+    /// `start_indices`. A misbehaving fetcher returning a wrong-length
+    /// vec triggers the defensive re-pad branch.
+    #[tokio::test]
+    async fn tick_arrays_forwards_slot_per_pda() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let pool = Pubkey::new_unique();
+        let starts = [0i32, 5_632, 11_264];
+        let result = lookup
+            .tick_arrays(&pool.to_string(), DexType::OrcaWhirlpool, &starts, 99_999)
+            .await;
+        let calls = fetcher.calls();
+        assert_eq!(calls.len(), 3, "one fetch entry per start_index");
+        for (_, slot) in &calls {
+            assert_eq!(*slot, 99_999, "slot must be propagated to every PDA");
+        }
+        assert_eq!(
+            result.len(),
+            starts.len(),
+            "result vec must align 1:1 with start_indices",
+        );
+    }
+
+    /// Non-Whirlpool DEX short-circuits without invoking the fetcher
+    /// at all — pool_dynamic_state returns the trait-default `None`
+    /// path (no archival fetch wasted on a config-only AMM).
+    #[tokio::test]
+    async fn pool_dynamic_state_skips_fetcher_for_non_whirlpool() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let pool = Pubkey::new_unique();
+        let result = lookup
+            .pool_dynamic_state(&pool.to_string(), DexType::RaydiumV4, 12_345)
+            .await;
+        assert!(
+            result.is_none(),
+            "non-Whirlpool dex should short-circuit to None",
+        );
+        assert!(
+            fetcher.calls().is_empty(),
+            "fetcher should not be called for unsupported dex",
+        );
     }
 }

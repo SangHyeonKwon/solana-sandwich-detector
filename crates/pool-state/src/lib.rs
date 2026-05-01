@@ -37,4 +37,6 @@ pub use lookup::{
     SlotLeaderLookup,
 };
 pub use orca_whirlpool::tick_array::{ParsedTickArray, TickData};
-pub use rpc::{RpcPoolLookup, RpcSlotLeaderLookup, SLOT_LEADER_PAGE_SIZE};
+pub use rpc::{
+    AccountFetcher, LatestAccountFetcher, RpcPoolLookup, RpcSlotLeaderLookup, SLOT_LEADER_PAGE_SIZE,
+};
