@@ -127,20 +127,48 @@ pub struct DlmmPool {
 }
 
 impl DlmmPool {
-    /// Compute base swap fee on `amount` using the on-chain formula:
-    /// `fee = amount * base_factor * bin_step * 10 * 10^base_fee_power_factor / DLMM_FEE_PRECISION`.
+    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]).
     ///
-    /// Variable fee (volatility-driven) is ignored — Phase 1 contract.
-    /// Returns `None` on overflow.
-    pub fn compute_base_fee(&self, amount: u64) -> Option<u64> {
+    /// Phase 1 implements **base fee only**: `base_factor * bin_step *
+    /// 10 * 10^base_fee_power_factor`. Variable fee (volatility-driven)
+    /// would add to this rate but is intentionally skipped — pinning
+    /// the Phase 1 cap on accuracy. Phase 3 follow-up plumbs
+    /// `VolatilityAccumulator` and brings replay numbers into bit-for-
+    /// bit agreement with on-chain `quote_exact_in`.
+    pub fn total_fee_rate(&self) -> Option<u128> {
         let factor = (self.base_factor as u128)
             .checked_mul(self.bin_step as u128)?
             .checked_mul(10)?;
         let power_mul: u128 = 10u128.checked_pow(self.base_fee_power_factor as u32)?;
-        let base_fee_rate = factor.checked_mul(power_mul)?;
-        let fee = (amount as u128)
-            .checked_mul(base_fee_rate)?
-            .checked_div(DLMM_FEE_PRECISION as u128)?;
+        factor.checked_mul(power_mul)
+    }
+
+    /// Fee charged when the caller knows the *net* (post-fee) amount
+    /// they need to push into the bin and must gross-up.
+    ///
+    /// Mirrors `LbPair::compute_fee` in commons:
+    /// `ceil(net * rate / (DLMM_FEE_PRECISION - rate))`.
+    pub fn compute_fee_on_net(&self, net_amount: u64) -> Option<u64> {
+        let rate = self.total_fee_rate()?;
+        let den = (DLMM_FEE_PRECISION as u128).checked_sub(rate)?;
+        if den == 0 {
+            return None;
+        }
+        let num = (net_amount as u128).checked_mul(rate)?;
+        let fee = num.checked_add(den.checked_sub(1)?)?.checked_div(den)?;
+        u64::try_from(fee).ok()
+    }
+
+    /// Fee charged when the caller knows the *gross* (pre-fee) amount
+    /// already pushed in and must recover the fee component.
+    ///
+    /// Mirrors `LbPair::compute_fee_from_amount` in commons:
+    /// `ceil(gross * rate / DLMM_FEE_PRECISION)`.
+    pub fn compute_fee_from_amount(&self, gross_amount: u64) -> Option<u64> {
+        let rate = self.total_fee_rate()?;
+        let num = (gross_amount as u128).checked_mul(rate)?;
+        let den = DLMM_FEE_PRECISION as u128;
+        let fee = num.checked_add(den.checked_sub(1)?)?.checked_div(den)?;
         u64::try_from(fee).ok()
     }
 }
@@ -566,6 +594,193 @@ pub mod price_math {
 /// shape Whirlpool uses.
 pub use price_math::bin_price;
 
+/// Single-bin within-bin swap math.
+///
+/// DLMM swap math is *constant sum* within a bin (`P*x + y = L`) — no
+/// curve traversal like V3, just a linear price * amount conversion.
+/// The bin's available output is whichever side is being drained
+/// (`amount_y` for `swap_for_y`, `amount_x` otherwise); the input
+/// required to fully drain that side is computed via the same `mul_shr` /
+/// `shl_div` primitives the on-chain `Bin::swap` uses.
+///
+/// Two distinct cases:
+///   1. `amount_in <= max_amount_in`: the swap fits inside the bin.
+///      Compute `fee = ceil(amount_in * rate / DLMM_FEE_PRECISION)`
+///      and `amount_out = (amount_in - fee) * price` (or `/price`,
+///      depending on direction).
+///   2. `amount_in > max_amount_in`: the swap drains the bin. Cap
+///      output at `max_amount_out` and report the bin as drained;
+///      the cross-bin walker (Phase 2) advances `active_id` and
+///      retries with the leftover input.
+pub mod swap_math {
+    use super::{price_math, DlmmPool};
+    use primitive_types::U256;
+
+    /// Outcome of one bin's contribution to a swap.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BinSwapStep {
+        /// Gross input consumed (`amount_in_after_fee + fee`). Always
+        /// `<= caller's amount_in_remaining`.
+        pub amount_in_with_fees: u64,
+        /// Token-out delivered. For `swap_for_y` this is in token Y;
+        /// otherwise token X.
+        pub amount_out: u64,
+        /// Fee withheld from `amount_in_with_fees`. Already counted
+        /// inside it (matches the on-chain `SwapResult` shape).
+        pub fee: u64,
+        /// True iff the bin's output side is now empty. `false` means
+        /// the entire `amount_in` was consumed within this bin and the
+        /// caller's swap is complete.
+        pub bin_drained: bool,
+    }
+
+    /// `(x * y) >> offset` rounded floor / ceil, in U256 to dodge
+    /// the Q64.64 squaring-overflow trap. Mirrors
+    /// `safe_mul_shr_cast` from commons.
+    fn mul_shr(x: u128, y: u128, offset: u8, ceil: bool) -> Option<u128> {
+        let prod = U256::from(x).checked_mul(U256::from(y))?;
+        let denom = U256::one() << offset;
+        let q = prod.checked_div(denom)?;
+        let r = prod % denom;
+        let result = if ceil && !r.is_zero() {
+            q.checked_add(U256::one())?
+        } else {
+            q
+        };
+        if result.bits() > 128 {
+            return None;
+        }
+        Some(result.low_u128())
+    }
+
+    /// `(x << offset) / y` rounded floor / ceil.
+    fn shl_div(x: u128, y: u128, offset: u8, ceil: bool) -> Option<u128> {
+        if y == 0 {
+            return None;
+        }
+        let scaled = U256::from(x) << offset;
+        let denom = U256::from(y);
+        let q = scaled.checked_div(denom)?;
+        let r = scaled % denom;
+        let result = if ceil && !r.is_zero() {
+            q.checked_add(U256::one())?
+        } else {
+            q
+        };
+        if result.bits() > 128 {
+            return None;
+        }
+        Some(result.low_u128())
+    }
+
+    /// Apply an exact-input swap step against a single bin.
+    ///
+    /// `swap_for_y = true` ⇒ token X in, token Y out (price drops as
+    /// caller eats the y side). `swap_for_y = false` ⇒ token Y in,
+    /// token X out.
+    ///
+    /// Returns `None` on arithmetic overflow or zero `price`. A bin
+    /// with zero output reserve returns a zero-amount step with
+    /// `bin_drained = true`, signalling the caller to advance to the
+    /// next bin.
+    pub fn swap_within_bin(
+        amount_in: u64,
+        bin_amount_x: u64,
+        bin_amount_y: u64,
+        price: u128,
+        swap_for_y: bool,
+        pool: &DlmmPool,
+    ) -> Option<BinSwapStep> {
+        if price == 0 {
+            return None;
+        }
+
+        let max_amount_out = if swap_for_y {
+            bin_amount_y
+        } else {
+            bin_amount_x
+        };
+        if max_amount_out == 0 {
+            return Some(BinSwapStep {
+                amount_in_with_fees: 0,
+                amount_out: 0,
+                fee: 0,
+                bin_drained: true,
+            });
+        }
+
+        // Input required to fully drain max_amount_out. Ceil rounding
+        // is the on-chain convention (commons uses `Rounding::Up`):
+        // we need *at least* enough input to fully consume the bin.
+        let max_in_pre_fee_u128 = if swap_for_y {
+            // X→Y: Y = X * price >> 64 ⇒ X = ceil((Y << 64) / price).
+            shl_div(
+                max_amount_out as u128,
+                price,
+                price_math::SCALE_OFFSET,
+                true,
+            )?
+        } else {
+            // Y→X: X = (Y << 64) / price ⇒ Y = ceil((X * price) >> 64).
+            mul_shr(
+                max_amount_out as u128,
+                price,
+                price_math::SCALE_OFFSET,
+                true,
+            )?
+        };
+        let max_in_pre_fee: u64 = max_in_pre_fee_u128.try_into().ok()?;
+        let max_fee = pool.compute_fee_on_net(max_in_pre_fee)?;
+        let max_amount_in = max_in_pre_fee.checked_add(max_fee)?;
+
+        if amount_in > max_amount_in {
+            // Bin gets fully drained; caller advances with the
+            // leftover. Cap output at `max_amount_out` exactly.
+            return Some(BinSwapStep {
+                amount_in_with_fees: max_amount_in,
+                amount_out: max_amount_out,
+                fee: max_fee,
+                bin_drained: true,
+            });
+        }
+
+        // Partial fill: the entire amount_in lands inside this bin.
+        let fee = pool.compute_fee_from_amount(amount_in)?;
+        let amount_in_after_fee = amount_in.checked_sub(fee)?;
+        let amount_out_u128 = if swap_for_y {
+            // X→Y: floor mul_shr.
+            mul_shr(
+                amount_in_after_fee as u128,
+                price,
+                price_math::SCALE_OFFSET,
+                false,
+            )?
+        } else {
+            // Y→X: floor shl_div.
+            shl_div(
+                amount_in_after_fee as u128,
+                price,
+                price_math::SCALE_OFFSET,
+                false,
+            )?
+        };
+        let amount_out_raw: u64 = amount_out_u128.try_into().ok()?;
+        // commons applies `min(amount_out_raw, max_amount_out)` after
+        // the partial-fill calc — guards against floor-rounding drift
+        // pushing amount_out one unit above the bin's actual reserve.
+        let amount_out = amount_out_raw.min(max_amount_out);
+
+        Some(BinSwapStep {
+            amount_in_with_fees: amount_in,
+            amount_out,
+            fee,
+            bin_drained: false,
+        })
+    }
+}
+
+pub use swap_math::{swap_within_bin, BinSwapStep};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,8 +834,8 @@ mod tests {
         assert_eq!(state.base_fee_power_factor, 0);
         assert_eq!(state.protocol_share, 2000);
 
-        // 1_000_000 * 2_000_000 / 1e9 = 2_000.
-        assert_eq!(state.compute_base_fee(1_000_000).unwrap(), 2_000);
+        // 1_000_000 * 2_000_000 / 1e9 = 2_000 (exact division).
+        assert_eq!(state.compute_fee_from_amount(1_000_000).unwrap(), 2_000);
     }
 
     /// When mint_y is the quote, base lives on token_x ⇒ axis a.
@@ -684,7 +899,7 @@ mod tests {
     /// `pow(10, p as u8)` (saturating at 255 instead of overflowing) or
     /// drops the multiplication entirely.
     #[test]
-    fn compute_base_fee_honours_power_factor() {
+    fn compute_fee_from_amount_honours_power_factor() {
         let pool = DlmmPool {
             active_id: 0,
             bin_step: 25,
@@ -693,8 +908,26 @@ mod tests {
             protocol_share: 0,
         };
         // base_fee_rate = 8000 * 25 * 10 * 10 = 20_000_000 → 2% in 1e9.
-        // fee on 1_000_000 = 1_000_000 * 20_000_000 / 1e9 = 20_000.
-        assert_eq!(pool.compute_base_fee(1_000_000).unwrap(), 20_000);
+        // fee on 1_000_000 = 1_000_000 * 20_000_000 / 1e9 = 20_000 (exact).
+        assert_eq!(pool.compute_fee_from_amount(1_000_000).unwrap(), 20_000);
+    }
+
+    /// `compute_fee_on_net` ceil-rounds, mirroring on-chain
+    /// `LbPair::compute_fee`: `ceil(net * rate / (1e9 - rate))`.
+    /// Pin the boundary case where the division has a non-zero
+    /// remainder so the ceil branch fires.
+    #[test]
+    fn compute_fee_on_net_ceil_rounds() {
+        let pool = DlmmPool {
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        };
+        // rate = 2e6, den = 998e6; 1e6 * 2e6 / 998e6 = 2004.0080...
+        // floor = 2004, remainder ≠ 0 ⇒ ceil = 2005.
+        assert_eq!(pool.compute_fee_on_net(1_000_000).unwrap(), 2_005);
     }
 }
 
@@ -924,5 +1157,116 @@ mod price_math_tests {
     fn scale_offset_one_pin() {
         assert_eq!(SCALE_OFFSET, 64);
         assert_eq!(ONE, 1u128 << 64);
+    }
+}
+
+#[cfg(test)]
+mod swap_math_tests {
+    use super::price_math::ONE;
+    use super::swap_math::{swap_within_bin, BinSwapStep};
+    use super::DlmmPool;
+
+    /// Standard test pool: 25-bp bin step, base_factor 8000 ⇒
+    /// 0.2% base fee in 1e9 units. No variable fee (Phase 1).
+    fn pool_8000_25() -> DlmmPool {
+        DlmmPool {
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        }
+    }
+
+    /// Empty bin (output side has zero reserves): swap should bail
+    /// with a zero-amount step + `bin_drained = true`. Pins the
+    /// caller contract that drained bins propagate to the next bin
+    /// without breaking the input.
+    #[test]
+    fn empty_output_side_drains_immediately() {
+        let pool = pool_8000_25();
+        let step = swap_within_bin(1_000_000, 0, 0, ONE, true, &pool).unwrap();
+        assert_eq!(
+            step,
+            BinSwapStep {
+                amount_in_with_fees: 0,
+                amount_out: 0,
+                fee: 0,
+                bin_drained: true,
+            }
+        );
+    }
+
+    /// Zero price → arithmetic impossible; bail with `None` rather
+    /// than divide-by-zero. Catches a future regression where someone
+    /// swaps an uninitialised bin (Bin.price == 0) without first
+    /// recomputing it via `bin_price`.
+    #[test]
+    fn zero_price_returns_none() {
+        let pool = pool_8000_25();
+        assert!(swap_within_bin(1_000_000, 1_000, 1_000, 0, true, &pool).is_none());
+    }
+
+    /// Partial fill at price = 1.0 (Q64.64 ONE): one unit of X buys
+    /// roughly one unit of Y minus the 0.2% fee. Pins the X→Y
+    /// floor formula `(amount_in - fee) * price >> 64`. Reserves
+    /// sized to comfortably contain the swap (1B ≫ 1M caller input).
+    #[test]
+    fn partial_x_to_y_at_unit_price() {
+        let pool = pool_8000_25();
+        let big = 1_000_000_000u64;
+        // amount_in = 1_000_000, price = ONE (1.0).
+        // Expected fee = ceil(1_000_000 * 2e6 / 1e9) = 2_000.
+        // amount_in_after_fee = 998_000.
+        // amount_out = floor(998_000 * 2^64 / 2^64) = 998_000.
+        let step = swap_within_bin(1_000_000, big, big, ONE, true, &pool).unwrap();
+        assert!(!step.bin_drained);
+        assert_eq!(step.amount_in_with_fees, 1_000_000);
+        assert_eq!(step.fee, 2_000);
+        assert_eq!(step.amount_out, 998_000);
+    }
+
+    /// Drain-bin path: caller hands in more than the bin can absorb.
+    /// Output is capped at `bin_amount_y`; fee uses the
+    /// "compute_fee_on_net" branch (gross-up from net).
+    #[test]
+    fn drain_bin_caps_output_and_uses_compute_fee_on_net() {
+        let pool = pool_8000_25();
+        // Bin has only 100 Y available. Caller offers a huge X.
+        // max_in_pre_fee = ceil((100 << 64) / ONE) = 100.
+        // max_fee = ceil(100 * 2e6 / 998e6) = ceil(0.2004...) = 1.
+        // max_amount_in = 101.
+        let step = swap_within_bin(1_000_000_000, 999_999, 100, ONE, true, &pool).unwrap();
+        assert!(step.bin_drained);
+        assert_eq!(step.amount_out, 100);
+        assert_eq!(step.amount_in_with_fees, 101);
+        assert_eq!(step.fee, 1);
+    }
+
+    /// Y→X direction: at price = ONE, 1 Y buys 1 X minus fee.
+    /// Mirrors the X→Y test with directions swapped to pin the
+    /// `swap_for_y = false` branch.
+    #[test]
+    fn partial_y_to_x_at_unit_price() {
+        let pool = pool_8000_25();
+        let big = 1_000_000_000u64;
+        let step = swap_within_bin(1_000_000, big, big, ONE, false, &pool).unwrap();
+        assert!(!step.bin_drained);
+        assert_eq!(step.fee, 2_000);
+        assert_eq!(step.amount_out, 998_000);
+    }
+
+    /// Price > 1.0: at p = 2.0 (Q64.64), 1 X buys 2 Y. Pins the
+    /// scaling so a regression that drops the price multiplication
+    /// (returning amount_in instead of amount_in * price) is caught.
+    #[test]
+    fn partial_x_to_y_at_double_price() {
+        let pool = pool_8000_25();
+        let big = 1_000_000_000u64;
+        let p = ONE * 2;
+        // amount_in_after_fee = 998_000.
+        // amount_out = floor(998_000 * 2 * ONE / ONE) = 1_996_000.
+        let step = swap_within_bin(1_000_000, big, big, p, true, &pool).unwrap();
+        assert_eq!(step.amount_out, 1_996_000);
     }
 }
