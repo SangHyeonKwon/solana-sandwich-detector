@@ -1392,4 +1392,134 @@ mod tests {
             EnrichmentResult::CrossTickUnsupported,
         );
     }
+
+    /// Build a ParsedBinArray where every bin has identical reserves
+    /// (lazy-cached prices). Lets cross-bin walks proceed across the
+    /// array's 70 bins without hitting empty-bin skip paths.
+    fn dlmm_uniform_array(index: i64, amount_x: u64, amount_y: u64) -> ParsedBinArray {
+        let bins = (0..MAX_BIN_PER_ARRAY)
+            .map(|_| ParsedBin {
+                amount_x,
+                amount_y,
+                // Lazy-cached `0` exercises the from_arrays recompute path.
+                price: 0,
+                liquidity_supply: 1_000_000_000,
+            })
+            .collect();
+        ParsedBinArray {
+            index,
+            version: 1,
+            lb_pair: Pubkey::new_unique(),
+            bins,
+        }
+    }
+
+    /// Phase 2's headline: a cross-bin sandwich that fits in the
+    /// supplied window produces non-zero `victim_loss` and a
+    /// populated `dlmm_replay` trace. Pin that the enrich path
+    /// surfaces both — Vigil consumers depend on the trace to verify
+    /// loss numbers themselves.
+    #[tokio::test]
+    async fn dlmm_cross_bin_corpus_yields_positive_loss_with_trace() {
+        // Buy direction + base_is_token_a ⇒ swap_for_y = false ⇒
+        // walker advances active_id forward through array 0's bins
+        // [0, 69]. 1k per axis per bin × ~50 bins = enough liquidity
+        // to absorb a 50k input without leaving array 0.
+        let mut attack = make_dlmm_attack(50_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                None,
+            ],
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let loss = attack
+            .victim_loss_lamports
+            .expect("victim_loss populated for cross-bin sandwich");
+        assert!(
+            loss > 0,
+            "cross-bin sandwich must produce positive loss, got {loss}"
+        );
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        // Frontrun moved active_id; trace must reflect that.
+        assert_ne!(trace.active_id_post_front, trace.active_id_pre);
+        // Surfaced bin_step + bin_price match pool config.
+        assert_eq!(trace.bin_step, 25);
+        // Bin 0 with bin_step=25 ⇒ price = (1+25/10000)^0 = 1.0 = ONE.
+        assert_eq!(trace.bin_price_pre, 1u128 << 64);
+        // Trace residuals shape: actual_victim_out < counterfactual.
+        assert!(trace.actual_victim_out < trace.counterfactual_victim_out);
+        // Price impact > 0 since active_id moved.
+        assert!(attack.price_impact_bps.unwrap_or(0) > 0);
+    }
+
+    /// Sell-first variant: Sell direction (base in) ⇒ `swap_for_y =
+    /// true` ⇒ active_id decreases. Pins both the direction-flip
+    /// invariant and that cross-bin loss accrues regardless of
+    /// which axis the sandwich consumes.
+    #[tokio::test]
+    async fn dlmm_sell_first_cross_bin_corpus() {
+        // Sell/Sell/Buy attack with smaller amounts so the walker
+        // stays comfortably inside array 0 across all 5 legs (frontrun,
+        // victim, victim-counterfactual, backrun, no-victim backrun).
+        let mut attack = SandwichAttack {
+            dex: DexType::MeteoraDlmm,
+            frontrun: SwapEvent {
+                dex: DexType::MeteoraDlmm,
+                ..make_swap("f", "atk", SwapDirection::Sell, 5_000, 0)
+            },
+            victim: SwapEvent {
+                dex: DexType::MeteoraDlmm,
+                ..make_swap("v", "vic", SwapDirection::Sell, 2_500, 0)
+            },
+            backrun: SwapEvent {
+                dex: DexType::MeteoraDlmm,
+                ..make_swap("b", "atk", SwapDirection::Buy, 5_000, 0)
+            },
+            ..make_attack()
+        };
+        // Active id at 60 ⇒ array index 0 still covers it ([0, 69]).
+        // 5k Sell amount with 1k reserves per bin ⇒ walker drains ~5
+        // bins (60 → 55), staying well inside array 0.
+        let dynamic_state = DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 60,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        });
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                None,
+            ],
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.unwrap_or(0) > 0);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        // Sell direction ⇒ active_id decreased.
+        assert!(
+            trace.active_id_post_front < trace.active_id_pre,
+            "Sell frontrun must decrement active_id; pre={} post_front={}",
+            trace.active_id_pre,
+            trace.active_id_post_front,
+        );
+        assert_eq!(trace.active_id_pre, 60);
+    }
 }
