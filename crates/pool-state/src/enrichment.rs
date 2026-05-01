@@ -205,17 +205,42 @@ pub async fn enrich_attack(
             };
 
             let array_index = bin_id_to_bin_array_index(dlmm_pool.active_id) as i64;
-            let arrays = lookup
-                .bin_arrays(&attack.pool, attack.dex, &[array_index], attack.slot)
+            // Fetch a 5-array window centered on the active bin's
+            // array (mirrors Whirlpool's center±2 fetch). 5 arrays =
+            // 350 bins of reach — covers any realistic sandwich
+            // amount on a paid-tier pool. Cross-bin walks beyond the
+            // window land on `out_of_window_bails` in `cross_bin_swap`
+            // and surface as `CrossTickUnsupported`.
+            let array_indices: [i64; 5] = [
+                array_index - 2,
+                array_index - 1,
+                array_index,
+                array_index + 1,
+                array_index + 2,
+            ];
+            let arrays_raw = lookup
+                .bin_arrays(&attack.pool, attack.dex, &array_indices, attack.slot)
                 .await;
             // Empty `Vec` from a lookup that doesn't speak BinArray is
             // the "not supported" signal — same convention as Whirlpool's
-            // tick_arrays. Phase 1 needs the active bin's reserves to
-            // do anything, so bail.
-            let active_array: ParsedBinArray = match arrays.into_iter().next() {
-                Some(Some(arr)) => arr,
+            // tick_arrays. The active array specifically must be present
+            // for Phase 1 within-bin replay; missing peripheral arrays
+            // only matter if the swap actually walks there.
+            if arrays_raw.is_empty() {
+                return EnrichmentResult::CrossTickUnsupported;
+            }
+            // Pick the active array (index 2 in the request order) for
+            // Phase 1's bin-lookup path. The full window flows into
+            // Phase 2's cross-bin walker (step 4 wire-up).
+            let active_array: ParsedBinArray = match arrays_raw.get(2) {
+                Some(Some(arr)) => arr.clone(),
                 _ => return EnrichmentResult::CrossTickUnsupported,
             };
+            // Hold on to the full window for the (yet-to-land)
+            // cross-bin fallback. Step 4 will pass `arrays` into
+            // `compute_loss_dlmm_with_trace`; for now Phase 1's
+            // active-bin-only path uses just `active_array`.
+            let _arrays: Vec<ParsedBinArray> = arrays_raw.into_iter().flatten().collect();
 
             // Unreachable in practice: array_index came from
             // bin_id_to_bin_array_index(active_id), the inverse of
@@ -1327,6 +1352,10 @@ mod tests {
     /// Within-bin sandwich: comfortable bin reserves, modest swap
     /// amounts. Replay should succeed with `victim_loss = 0` (the
     /// constant-sum invariant) and `Enriched` outcome.
+    ///
+    /// Window layout mirrors enrich's actual fetch: 5-array vec
+    /// (center ± 2), with the active array at slot 2. Peripherals
+    /// stay `None` since within-bin replay never reaches them.
     #[tokio::test]
     async fn dlmm_within_bin_corpus_yields_zero_loss_enriched() {
         let mut attack = make_dlmm_attack(100_000);
@@ -1335,7 +1364,13 @@ mod tests {
             config: dlmm_config(),
             dynamic_state: Some(dlmm_state()),
             tick_arrays: vec![],
-            bin_arrays: vec![Some(dlmm_active_array(1_000_000_000, 1_000_000_000))],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_active_array(1_000_000_000, 1_000_000_000)),
+                None,
+                None,
+            ],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -1355,7 +1390,10 @@ mod tests {
             config: dlmm_config(),
             dynamic_state: Some(dlmm_state()),
             tick_arrays: vec![],
-            bin_arrays: vec![Some(dlmm_active_array(100, 100))],
+            // 5-array window with tiny active-bin reserves and no
+            // peripheral bins — frontrun drains the active bin
+            // immediately, then runs out of window.
+            bin_arrays: vec![None, None, Some(dlmm_active_array(100, 100)), None, None],
         };
         assert_eq!(
             enrich_attack(&mut attack, &tx, None, &lookup).await,
