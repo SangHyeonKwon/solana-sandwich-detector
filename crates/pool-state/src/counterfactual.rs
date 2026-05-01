@@ -16,7 +16,8 @@
 
 use swap_events::types::{AmmReplayTrace, SandwichAttack, SwapDirection, WhirlpoolReplayTrace};
 
-use crate::meteora_dlmm::{swap_within_bin, BinSwapStep, DlmmPool};
+use crate::meteora_dlmm::bin_array::ParsedBinArray;
+use crate::meteora_dlmm::{cross_bin_swap, DlmmBinState, DlmmPool};
 use crate::orca_whirlpool::swap_math;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::orca_whirlpool::WhirlpoolPool;
@@ -525,35 +526,33 @@ fn sort_arrays_for_direction(
     sorted.into_iter().map(Some).collect()
 }
 
-/// Replay a sandwich through a single DLMM bin (Phase 1 within-bin path).
+/// Replay a DLMM sandwich through cross-bin walks (Phase 2).
 ///
-/// DLMM bin math is constant-sum: within one bin the price is fixed, so
-/// the actual and counterfactual victim outputs are *equal by construction*
-/// — the frontrun shifts bin reserves but doesn't move price. This means
-/// `victim_loss = 0` for any sandwich whose three legs all stay inside
-/// the active bin.
-///
-/// That makes Phase 1 a *classifier*: it confidently labels within-bin
-/// DLMM detections as "no extraction" (sandwich attempt occurred but the
-/// constant-sum mechanic absorbed it without victim cost), and bails to
-/// `None` whenever any leg crosses a bin boundary. Cross-bin replay —
-/// where DLMM extraction actually materialises — is Phase 2 follow-up.
+/// Each leg goes through [`cross_bin_swap`]; bins drain ⇒ walker
+/// advances `active_id` ± 1 until input is exhausted or the walker
+/// exits the supplied window. Within-bin sandwiches still produce
+/// `victim_loss = 0` (the constant-sum invariant — frontrun doesn't
+/// move price inside one bin), but cross-bin sandwiches now produce
+/// non-zero loss because the frontrun pushes `active_id` through
+/// price levels and the victim eats those worse prices.
 ///
 /// Returns `None` on:
 ///   * direction-mismatched legs (detector invariant violation),
-///   * any leg's `bin_drained = true` (cross-bin, Phase 2 territory),
-///   * arithmetic overflow at any swap step.
+///   * any leg's `cross_bin_swap` failing — out-of-window, iteration
+///     cap, arithmetic overflow,
+///   * empty `arrays` slice (no liquidity reachable),
+///   * the active bin being absent from the supplied window (shouldn't
+///     happen; enrich centers the window on `active_id`'s array).
 ///
-/// `bin_amount_x` / `bin_amount_y` / `bin_price` come from the active
-/// bin in the BinArray fetched by [`crate::lookup::PoolStateLookup`]'s
-/// (future) `bin_arrays` method. `pool` carries the `bin_step` /
-/// `base_factor` triple needed for fee math.
+/// `arrays` is the BinArray window enrich fetched (typically 5
+/// arrays, center ± 2). `pool.active_id` seeds the walker; the
+/// initial bin's price drives the quote-axis conversion. The
+/// underlying [`DlmmBinState`] is cloned per leg so the four
+/// counterfactual replays don't pollute each other.
 pub fn compute_loss_dlmm(
     attack: &SandwichAttack,
     pool: &DlmmPool,
-    bin_amount_x: u64,
-    bin_amount_y: u64,
-    bin_price: u128,
+    arrays: &[ParsedBinArray],
     base_is_token_a: bool,
 ) -> Option<LossEstimate> {
     if attack.victim.direction != attack.frontrun.direction {
@@ -562,12 +561,12 @@ pub fn compute_loss_dlmm(
     if attack.backrun.direction == attack.frontrun.direction {
         return None;
     }
-    // `bin_price == 0` is the on-chain "lazy-cached, never swapped"
-    // sentinel — the caller is supposed to recompute via
-    // `bin_price(active_id, bin_step)` before calling this function.
-    // Defend against a regression in `enrichment.rs` (skipping that
-    // recompute) so all-`None` legs don't masquerade as cross-bin.
-    if bin_price == 0 {
+
+    let initial_state = DlmmBinState::from_arrays(arrays, pool.bin_step)?;
+    let initial_active_id = pool.active_id;
+    let initial_snap = initial_state.get(initial_active_id)?;
+    let bin_price_q64 = initial_snap.price;
+    if bin_price_q64 == 0 {
         return None;
     }
 
@@ -583,64 +582,61 @@ pub fn compute_loss_dlmm(
     let victim_swap_for_y = frontrun_swap_for_y;
     let backrun_swap_for_y = !frontrun_swap_for_y;
 
-    // 1. Frontrun → bin_1. Cross-bin bails (Phase 2 territory).
-    let fr = swap_within_bin(
+    // 1. Frontrun on initial state → state_1.
+    let mut state_1 = initial_state.clone();
+    let fr = cross_bin_swap(
         attack.frontrun.amount_in,
-        bin_amount_x,
-        bin_amount_y,
-        bin_price,
+        initial_active_id,
+        &mut state_1,
         frontrun_swap_for_y,
         pool,
     )?;
-    if fr.bin_drained {
-        return None;
-    }
-    let (bin_x_1, bin_y_1) =
-        post_swap_amounts(bin_amount_x, bin_amount_y, &fr, frontrun_swap_for_y);
+    let active_after_front = fr.final_active_id;
 
-    // 2. Victim on bin_1 (real outcome).
-    let v = swap_within_bin(
+    // 2. Victim on state_1 → state_2.
+    let mut state_2 = state_1.clone();
+    let v = cross_bin_swap(
         attack.victim.amount_in,
-        bin_x_1,
-        bin_y_1,
-        bin_price,
+        active_after_front,
+        &mut state_2,
         victim_swap_for_y,
         pool,
     )?;
-    if v.bin_drained {
-        return None;
-    }
-    let (bin_x_2, bin_y_2) = post_swap_amounts(bin_x_1, bin_y_1, &v, victim_swap_for_y);
 
-    // 3. Counterfactual: victim on initial bin (no frontrun).
-    let v_counter = swap_within_bin(
+    // 3. Counterfactual victim on initial state.
+    let mut state_counter = initial_state.clone();
+    let v_counter = cross_bin_swap(
         attack.victim.amount_in,
-        bin_amount_x,
-        bin_amount_y,
-        bin_price,
+        initial_active_id,
+        &mut state_counter,
         victim_swap_for_y,
         pool,
     )?;
-    if v_counter.bin_drained {
-        return None;
-    }
 
-    // 4. Backrun on bin_2.
-    let b = swap_within_bin(
+    // 4. Backrun on state_2.
+    let mut state_3 = state_2.clone();
+    let b = cross_bin_swap(
         attack.backrun.amount_in,
-        bin_x_2,
-        bin_y_2,
-        bin_price,
+        v.final_active_id,
+        &mut state_3,
         backrun_swap_for_y,
         pool,
     )?;
-    if b.bin_drained {
-        return None;
-    }
 
-    // Quote-axis conversion. price = y per x in Q64.64, so when
-    // base = x, quote_per_base = price; when base = y, quote_per_base = 1/price.
-    let price_f64 = q64_to_f64(bin_price);
+    // 5. Counterfactual: backrun on state_1 (no victim).
+    let mut state_no_v = state_1.clone();
+    let b_no_v = cross_bin_swap(
+        attack.backrun.amount_in,
+        active_after_front,
+        &mut state_no_v,
+        backrun_swap_for_y,
+        pool,
+    )?;
+
+    // Quote-axis conversion. Initial bin price is the spot at the
+    // pre-frontrun moment — same convention as Whirlpool's
+    // `quote_per_base_0`.
+    let price_f64 = q64_to_f64(bin_price_q64);
     let quote_per_base = if base_is_token_a {
         price_f64
     } else {
@@ -649,10 +645,6 @@ pub fn compute_loss_dlmm(
 
     let actual_victim_out = v.amount_out;
     let counterfactual_victim_out = v_counter.amount_out;
-    // Within-bin invariant: actual == counterfactual (same input, same
-    // price). raw_victim_delta is therefore 0 in well-formed cases;
-    // we still compute via .max(0) to defend against rounding-driven
-    // off-by-one drift that would surface as a 1-unit "loss".
     let raw_victim_delta = (counterfactual_victim_out as i64 - actual_victim_out as i64).max(0);
     let victim_loss = match attack.victim.direction {
         SwapDirection::Buy => (raw_victim_delta as f64 * quote_per_base) as i64,
@@ -665,23 +657,18 @@ pub fn compute_loss_dlmm(
         SwapDirection::Sell => (raw_profit as f64 * quote_per_base) as i64,
     };
 
-    // No-victim counterfactual: backrun on bin_1 directly.
-    let b_no_v = swap_within_bin(
-        attack.backrun.amount_in,
-        bin_x_1,
-        bin_y_1,
-        bin_price,
-        backrun_swap_for_y,
-        pool,
-    )?;
-    if b_no_v.bin_drained {
-        return None;
-    }
     let raw_profit_no_v = b_no_v.amount_out as i64 - attack.frontrun.amount_in as i64;
     let counterfactual_attacker_profit_no_victim = match attack.frontrun.direction {
         SwapDirection::Buy => raw_profit_no_v,
         SwapDirection::Sell => (raw_profit_no_v as f64 * quote_per_base) as i64,
     };
+
+    // price_impact_bps: number of bins the frontrun moved active_id
+    // times the bin step (in bps). DLMM's bin_step is already in
+    // basis points, so the product is the bps spread between the
+    // initial and post-frontrun spot prices.
+    let active_id_diff = (active_after_front - initial_active_id).unsigned_abs();
+    let price_impact_bps = active_id_diff.saturating_mul(pool.bin_step as u32);
 
     let residual_bps_frontrun = residual_bps(fr.amount_out, attack.frontrun.amount_out);
     let residual_bps_victim = residual_bps(v.amount_out, attack.victim.amount_out);
@@ -708,10 +695,7 @@ pub fn compute_loss_dlmm(
     Some(LossEstimate {
         victim_loss,
         attacker_profit_real,
-        // Within-bin: price doesn't change, so impact is zero by the
-        // mechanic's design. Phase 2 cross-bin replay computes the real
-        // impact via active_id transitions.
-        price_impact_bps: 0,
+        price_impact_bps,
         counterfactual_victim_out,
         actual_victim_out,
         residual_bps_frontrun,
@@ -721,25 +705,6 @@ pub fn compute_loss_dlmm(
         victim_loss_lower,
         victim_loss_upper,
     })
-}
-
-/// Update `(amount_x, amount_y)` after applying one [`BinSwapStep`].
-/// `swap_for_y = true` ⇒ X in, Y out. `false` ⇒ Y in, X out. The
-/// "amount in" that lands inside the bin is the gross input minus the
-/// fee (which is taken off the top, not retained in the bin).
-fn post_swap_amounts(x: u64, y: u64, step: &BinSwapStep, swap_for_y: bool) -> (u64, u64) {
-    let amount_in_after_fee = step.amount_in_with_fees.saturating_sub(step.fee);
-    if swap_for_y {
-        (
-            x.saturating_add(amount_in_after_fee),
-            y.saturating_sub(step.amount_out),
-        )
-    } else {
-        (
-            x.saturating_sub(step.amount_out),
-            y.saturating_add(amount_in_after_fee),
-        )
-    }
 }
 
 /// Q64.64 fixed-point → `f64`. Same precision-tradeoff rationale as
@@ -1432,14 +1397,15 @@ mod tests {
         );
     }
 
-    // ----- DLMM (Phase 1 within-bin) -------------------------------------
+    // ----- DLMM (Phase 2 cross-bin) --------------------------------------
     //
-    // DLMM constant-sum bins absorb a sandwich's price-impact at zero
-    // victim cost — the within-bin replay should consistently report
-    // `victim_loss = 0`. These tests pin that contract and the
-    // bail-on-cross-bin classifier behaviour.
+    // Phase 2 replays the sandwich through `cross_bin_swap` so cross-bin
+    // walks produce real (non-zero) victim_loss. Within-bin sandwiches
+    // still satisfy the constant-sum invariant (loss = 0) since the
+    // walker terminates after one bin and active_id doesn't move.
 
-    use crate::meteora_dlmm::price_math::ONE as DLMM_ONE;
+    use crate::meteora_dlmm::bin_array::{ParsedBin, MAX_BIN_PER_ARRAY};
+    use solana_sdk::pubkey::Pubkey;
 
     fn dlmm_pool() -> DlmmPool {
         DlmmPool {
@@ -1451,22 +1417,40 @@ mod tests {
         }
     }
 
-    /// Within-bin sandwich: every leg fits inside the active bin's
-    /// reserves. `victim_loss = 0` (constant-sum invariant), but the
-    /// detector still classifies as a sandwich since detection runs
-    /// upstream of replay. Pins that the replay surfaces "zero loss"
-    /// rather than bailing.
+    /// Build a 1-array window where every bin holds the supplied
+    /// reserves. Array index 0 ⇒ bins `[0, 69]` ⇒ `pool.active_id = 0`
+    /// lands at `bins[0]`. Bin price stays lazy-cached (`0`) so the
+    /// `DlmmBinState::from_arrays` path exercises the recompute branch.
+    fn dlmm_uniform_window(amount_x: u64, amount_y: u64) -> Vec<ParsedBinArray> {
+        let bins = (0..MAX_BIN_PER_ARRAY)
+            .map(|_| ParsedBin {
+                amount_x,
+                amount_y,
+                price: 0,
+                liquidity_supply: 1_000_000_000,
+            })
+            .collect();
+        vec![ParsedBinArray {
+            index: 0,
+            version: 1,
+            lb_pair: Pubkey::new_unique(),
+            bins,
+        }]
+    }
+
+    /// Within-bin sandwich: comfortable reserves, walker terminates in
+    /// one iteration per leg, `victim_loss = 0` per the constant-sum
+    /// invariant, `price_impact_bps = 0` (active_id didn't move).
     #[test]
     fn dlmm_within_bin_sandwich_yields_zero_loss() {
         let pool = dlmm_pool();
-        let big = 1_000_000_000u64;
+        let arrays = dlmm_uniform_window(1_000_000_000, 1_000_000_000);
         let attack = make_attack(
             swap("f", "atk", SwapDirection::Buy, 100_000, 0),
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        // base = x (token A), price = ONE (1.0).
-        let loss = compute_loss_dlmm(&attack, &pool, big, big, DLMM_ONE, true).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true).unwrap();
         assert_eq!(
             loss.victim_loss, 0,
             "within-bin replay must yield zero loss"
@@ -1475,49 +1459,83 @@ mod tests {
         assert_eq!(loss.price_impact_bps, 0);
     }
 
-    /// Cross-bin sandwich (frontrun drains the bin): bail with `None`
-    /// so the enrich layer can report `CrossTickUnsupported` /
-    /// `CrossBinUnsupported` for Phase 2 follow-up.
+    /// Cross-bin sandwich whose walker exits the supplied window: tiny
+    /// bin reserves + 1B input ⇒ walker drains every bin in the array
+    /// and runs out of window ⇒ `cross_bin_swap` returns `None` ⇒
+    /// enrich reports `CrossTickUnsupported`. Replaces the old "any
+    /// drain ⇒ None" Phase 1 contract.
     #[test]
-    fn dlmm_cross_bin_returns_none() {
+    fn dlmm_cross_bin_out_of_window_returns_none() {
         let pool = dlmm_pool();
-        // Tiny bin reserves vs. huge frontrun ⇒ bin_drained on first leg.
+        // 70 bins * 100 Y = 7_000 Y; need much more X to drain that.
+        let arrays = dlmm_uniform_window(0, 100);
         let attack = make_attack(
             swap("f", "atk", SwapDirection::Buy, 1_000_000_000, 0),
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 1_000_000_000, 0),
         );
-        assert!(compute_loss_dlmm(&attack, &pool, 100, 100, DLMM_ONE, true).is_none());
+        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true).is_none());
     }
 
-    /// Direction mismatch (detector invariant violation) bails the
-    /// same as ConstantProduct / Whirlpool paths.
+    /// Direction mismatch bails before any cross-bin work.
     #[test]
     fn dlmm_rejects_direction_mismatch() {
         let pool = dlmm_pool();
-        let big = 1_000_000_000u64;
+        let arrays = dlmm_uniform_window(1_000_000_000, 1_000_000_000);
         let attack = make_attack(
             swap("f", "atk", SwapDirection::Buy, 100_000, 0),
             swap("v", "vic", SwapDirection::Sell, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        assert!(compute_loss_dlmm(&attack, &pool, big, big, DLMM_ONE, true).is_none());
+        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true).is_none());
     }
 
-    /// `base_is_token_a = false` (base sits on y-axis): pin the
-    /// SwapDirection ⇒ swap_for_y mapping flip. With unit price the
-    /// loss is still 0 but we exercise the !base_is_token_a branch.
+    /// `base_is_token_a = false` (base on y-axis): exercise the
+    /// SwapDirection ⇒ swap_for_y mapping flip. Within-bin so loss = 0,
+    /// but the !base_is_token_a branch runs.
     #[test]
     fn dlmm_within_bin_base_is_y_axis() {
         let pool = dlmm_pool();
-        let big = 1_000_000_000u64;
+        let arrays = dlmm_uniform_window(1_000_000_000, 1_000_000_000);
         let attack = make_attack(
             swap("f", "atk", SwapDirection::Buy, 100_000, 0),
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, big, big, DLMM_ONE, false).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, false).unwrap();
         assert_eq!(loss.victim_loss, 0);
         assert_eq!(loss.actual_victim_out, loss.counterfactual_victim_out);
+    }
+
+    /// Cross-bin sandwich that *fits* in the window: a multi-bin
+    /// frontrun moves active_id, victim eats worse-priced bins ⇒
+    /// `victim_loss > 0` and `price_impact_bps > 0`. Pin the Phase 2
+    /// promise: real DLMM extraction surfaces here.
+    #[test]
+    fn dlmm_cross_bin_within_window_produces_loss() {
+        let pool = dlmm_pool();
+        // Each bin holds 1k of *both* axes — Buy direction means Y→X
+        // (since base = token_a), so we need x reserves to drain.
+        // Walker advances a handful of bins (frontrun consumes ~5k X),
+        // staying inside array 0's bin range [0, 69].
+        let arrays = dlmm_uniform_window(1_000, 1_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 5_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 5_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 5_000, 0),
+        );
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true).unwrap();
+        // Cross-bin walk: active_id moved, victim ate worse prices.
+        // The exact loss depends on the price progression, but it
+        // must be non-zero.
+        assert!(
+            loss.actual_victim_out < loss.counterfactual_victim_out,
+            "actual={} expected < counterfactual={}",
+            loss.actual_victim_out,
+            loss.counterfactual_victim_out,
+        );
+        // price_impact_bps = bins_moved * bin_step. With bin_step=25
+        // and a handful of bins moved, expect >0.
+        assert!(loss.price_impact_bps > 0);
     }
 }

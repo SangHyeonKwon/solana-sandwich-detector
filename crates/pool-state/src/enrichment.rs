@@ -16,10 +16,8 @@ use swap_events::types::{
 };
 
 use crate::lookup::{AmmKind, DynamicPoolState};
-use crate::meteora_dlmm::bin_array::{
-    bin_id_to_bin_array_index, bin_index_in_array, ParsedBinArray,
-};
-use crate::meteora_dlmm::{bin_price, DlmmPool};
+use crate::meteora_dlmm::bin_array::{bin_id_to_bin_array_index, ParsedBinArray};
+use crate::meteora_dlmm::DlmmPool;
 use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
@@ -223,60 +221,29 @@ pub async fn enrich_attack(
                 .await;
             // Empty `Vec` from a lookup that doesn't speak BinArray is
             // the "not supported" signal — same convention as Whirlpool's
-            // tick_arrays. The active array specifically must be present
-            // for Phase 1 within-bin replay; missing peripheral arrays
-            // only matter if the swap actually walks there.
+            // tick_arrays.
             if arrays_raw.is_empty() {
                 return EnrichmentResult::CrossTickUnsupported;
             }
-            // Pick the active array (index 2 in the request order) for
-            // Phase 1's bin-lookup path. The full window flows into
-            // Phase 2's cross-bin walker (step 4 wire-up).
-            let active_array: ParsedBinArray = match arrays_raw.get(2) {
-                Some(Some(arr)) => arr.clone(),
-                _ => return EnrichmentResult::CrossTickUnsupported,
-            };
-            // Hold on to the full window for the (yet-to-land)
-            // cross-bin fallback. Step 4 will pass `arrays` into
-            // `compute_loss_dlmm_with_trace`; for now Phase 1's
-            // active-bin-only path uses just `active_array`.
-            let _arrays: Vec<ParsedBinArray> = arrays_raw.into_iter().flatten().collect();
+            // The active array (slot 2 in the request order) is the
+            // *minimum* for any DLMM replay — within-bin or otherwise.
+            // Missing it means the lookup couldn't serve the most
+            // important account in the window.
+            if !matches!(arrays_raw.get(2), Some(Some(_))) {
+                return EnrichmentResult::CrossTickUnsupported;
+            }
+            // Collapse the window to the populated arrays. Cross-bin
+            // walker tolerates missing peripherals — it just bails
+            // sooner if a leg walks into the gap.
+            let arrays: Vec<ParsedBinArray> = arrays_raw.into_iter().flatten().collect();
 
-            // Unreachable in practice: array_index came from
-            // bin_id_to_bin_array_index(active_id), the inverse of
-            // bin_array_lower_upper_bin_id, so `active_id` is by
-            // construction in this array's range. Defend against a
-            // future regression in either helper by mapping to the
-            // same CrossTickUnsupported bail the rest of this arm
-            // uses, rather than silently bypassing the metrics.
-            let bin_idx = match bin_index_in_array(array_index as i32, dlmm_pool.active_id) {
-                Some(i) => i,
-                None => return EnrichmentResult::CrossTickUnsupported,
-            };
-            let active_bin = active_array.bins[bin_idx];
-
-            // On-chain `Bin.price` is lazy-cached: zero until the bin's
-            // first swap. Recompute via `bin_price` when zero.
-            let price = if active_bin.price != 0 {
-                active_bin.price
-            } else {
-                match bin_price(dlmm_pool.active_id, dlmm_pool.bin_step) {
-                    Some(p) => p,
-                    None => return EnrichmentResult::ReplayFailed,
-                }
-            };
-
-            let Some(loss) = compute_loss_dlmm(
-                attack,
-                &dlmm_pool,
-                active_bin.amount_x,
-                active_bin.amount_y,
-                price,
-                config.base_is_token_a,
-            ) else {
-                // None ⇒ cross-bin or direction violation; map to
-                // CrossTickUnsupported so Phase 2 follow-up sees the
-                // count separately from invariant-violation cases.
+            let Some(loss) = compute_loss_dlmm(attack, &dlmm_pool, &arrays, config.base_is_token_a)
+            else {
+                // None ⇒ cross-bin walked off the window, iteration
+                // cap fired, or direction-mismatch invariant violation.
+                // Map to CrossTickUnsupported so Phase 3 follow-up
+                // (variable fee, token-2022) can be tracked separately
+                // from invariant-violation cases.
                 return EnrichmentResult::CrossTickUnsupported;
             };
 
@@ -285,8 +252,8 @@ pub async fn enrich_attack(
             let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
                 .map(|r| r.pre.1)
                 .unwrap_or(0);
-            // No DLMM-specific replay trace yet; that ships in a
-            // Phase 1 follow-up alongside vigil-v1 schema bumps.
+            // No DLMM-specific replay trace yet; step 5 lands that
+            // alongside vigil-v1 schema bumps.
             (loss, None, None, pool_quote_tvl)
         }
     };
