@@ -8,6 +8,10 @@ license.workspace = true
 name = "sandwich-detect"
 path = "src/main.rs"
 
+[[bin]]
+name = "archival-diff"
+path = "src/bin/archival_diff.rs"
+
 [dependencies]
 sandwich-detector = { workspace = true }
 sandwich-eval = { workspace = true }
@@ -21,6 +25,8 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
 futures = { workspace = true }
+solana-client = { workspace = true }
+solana-sdk = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
