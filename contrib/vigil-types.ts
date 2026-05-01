@@ -29,6 +29,30 @@ export interface JsonlHeader {
 export interface JsonlHeartbeat {
   /** Detector wall-clock unix epoch ms; emitted periodically in `--follow`. */
   _heartbeat: number;
+  /** Process-lifetime counters for enrichment outcomes. Lets ops watch
+   *  the cross-tick fetch window — `cross_tick_unsupported` climbing
+   *  relative to `enriched` means the 5-array center-±2 fetch window
+   *  is starting to under-fetch and the bracket should widen. */
+  metrics: EnrichmentMetricsSnapshot;
+}
+
+export interface EnrichmentMetricsSnapshot {
+  /** Replay landed; victim_loss / attacker_profit / signals populated. */
+  enriched: number;
+  /** DEX never spoken (Jupiter, Phoenix, Pump.fun, etc.). */
+  unsupported_dex: number;
+  /** Pool config fetch failed (bad pubkey, RPC error, unknown layout). */
+  config_unavailable: number;
+  /** Pool config OK but the frontrun tx had no vault balances —
+   *  parser bug, or non-standard tx routing. */
+  reserves_missing: number;
+  /** Replay returned `None` — direction-invariant break or zero
+   *  reserves. Should be vanishingly rare on real sandwiches. */
+  replay_failed: number;
+  /** Whirlpool replay exhausted both within-tick and cross-tick paths.
+   *  Watch this counter — it's the leading signal that the fetch
+   *  window needs widening. */
+  cross_tick_unsupported: number;
 }
 
 export type DetectorLine = JsonlHeader | JsonlHeartbeat | SandwichAttack;

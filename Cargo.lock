@@ -3401,6 +3401,7 @@ dependencies = [
  "pool-state",
  "sandwich-detector",
  "sandwich-eval",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
