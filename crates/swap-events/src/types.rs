@@ -407,6 +407,15 @@ pub struct SandwichAttack {
     /// consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub whirlpool_replay: Option<WhirlpoolReplayTrace>,
+    /// Meteora DLMM-specific replay trace — populated only when `dex`
+    /// is `MeteoraDlmm` and Phase 2 cross-bin replay ran successfully.
+    /// Tracks `active_id` transitions instead of Whirlpool's
+    /// sqrt_price/liquidity/tick triple, since DLMM's discrete-bin
+    /// model captures a leg's effect entirely in which bin became
+    /// active. Distinct field rather than a `whirlpool_replay` enum
+    /// variant for the same backward-compat reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlmm_replay: Option<MeteoraDlmmReplayTrace>,
 
     // -- Vigil-aligned fields (schema `vigil-v1`) ----------------------------
     // Additive; populated by callers via [`SandwichAttack::finalize_for_vigil`]
@@ -1020,10 +1029,55 @@ pub struct WhirlpoolReplayTrace {
     pub fee_den: u32,
 }
 
+/// Per-step DLMM (Meteora Liquidity Book) replay trace surfaced on
+/// `SandwichAttack.dlmm_replay`. Mirrors [`WhirlpoolReplayTrace`] in
+/// shape but tracks `active_id` transitions instead of sqrt_price /
+/// liquidity / tick — DLMM's discrete-bin model means a leg's effect
+/// is fully captured by which bin became active.
+///
+/// `bin_price_pre` is Q64.64; serialised as a base-10 decimal string
+/// per the same JS-BigInt rationale that drove [`WhirlpoolReplayTrace`].
+/// `active_id` fits in i32 (per the on-chain `MIN_BIN_ID` /
+/// `MAX_BIN_ID = ±443_636` cap), safe in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MeteoraDlmmReplayTrace {
+    /// Active bin id immediately before the frontrun executed.
+    pub active_id_pre: i32,
+    /// Active bin id after the frontrun, before the victim.
+    pub active_id_post_front: i32,
+    /// Active bin id after the victim, before the backrun.
+    pub active_id_post_victim: i32,
+    /// Active bin id after the backrun (end of the triplet).
+    pub active_id_post_back: i32,
+
+    /// Q64.64 spot price at the pre-frontrun moment (the active
+    /// bin's price). DLMM bin prices are static per bin (set at
+    /// pool creation via the `bin_step` formula), so this is the
+    /// canonical pre-frontrun spot.
+    #[serde(with = "u128_string")]
+    #[schemars(with = "String")]
+    pub bin_price_pre: u128,
+
+    /// What the victim would have received without the frontrun.
+    pub counterfactual_victim_out: u64,
+    /// What the victim actually received.
+    pub actual_victim_out: u64,
+
+    /// Bin step in basis points (`25 = 0.25%`). Static per pool;
+    /// surfaced here so a reader can derive any bin's price from
+    /// `bin_id` without re-deriving the pool config.
+    pub bin_step: u16,
+
+    /// LP fee fraction. DLMM uses `fee_num / 1_000_000_000` units
+    /// (`base_factor * bin_step * 10 * 10^bf_power`), capped at 10%.
+    pub fee_num: u64,
+    pub fee_den: u64,
+}
+
 /// Serde adapter that serialises a `u128` as a base-10 decimal string
 /// rather than a JSON number, so JS consumers can `BigInt(...)` it
-/// without losing precision past `2^53`. Only used by
-/// [`WhirlpoolReplayTrace`] today.
+/// without losing precision past `2^53`. Used by
+/// [`WhirlpoolReplayTrace`] and [`MeteoraDlmmReplayTrace`].
 mod u128_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -1274,6 +1328,7 @@ mod evidence_tests {
             evidence: Some(evidence),
             amm_replay: Some(replay),
             whirlpool_replay: None,
+            dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,
@@ -1366,6 +1421,7 @@ mod vigil_schema_tests {
                 fee_den: 10_000,
             }),
             whirlpool_replay: None,
+            dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,

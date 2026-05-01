@@ -637,7 +637,7 @@ pub mod swap_math {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct BinSwapStep {
         /// Gross input consumed (`amount_in_after_fee + fee`). Always
-        /// `<= caller's amount_in_remaining`.
+        /// `<= caller's amount_in`.
         pub amount_in_with_fees: u64,
         /// Token-out delivered. For `swap_for_y` this is in token Y;
         /// otherwise token X.
@@ -649,6 +649,13 @@ pub mod swap_math {
         /// the entire `amount_in` was consumed within this bin and the
         /// caller's swap is complete.
         pub bin_drained: bool,
+        /// Input not consumed by this bin. Always `0` on partial-fill
+        /// (`bin_drained = false`); on drain it equals
+        /// `amount_in - amount_in_with_fees`, which the cross-bin
+        /// walker passes into the next active bin. Phase 1 callers
+        /// can ignore this — they bail on `bin_drained = true` before
+        /// the leftover matters.
+        pub amount_in_remaining: u64,
     }
 
     /// `(x * y) >> offset` rounded floor / ceil, in U256 to dodge
@@ -723,6 +730,9 @@ pub mod swap_math {
                 amount_out: 0,
                 fee: 0,
                 bin_drained: true,
+                // Bin can't absorb anything ⇒ the entire input is
+                // leftover for the next bin.
+                amount_in_remaining: amount_in,
             });
         }
 
@@ -758,6 +768,7 @@ pub mod swap_math {
                 amount_out: max_amount_out,
                 fee: max_fee,
                 bin_drained: true,
+                amount_in_remaining: amount_in - max_amount_in,
             });
         }
 
@@ -792,11 +803,286 @@ pub mod swap_math {
             amount_out,
             fee,
             bin_drained: false,
+            // Partial fill ⇒ caller's swap is complete; nothing
+            // leftover for downstream bins.
+            amount_in_remaining: 0,
         })
     }
 }
 
 pub use swap_math::{swap_within_bin, BinSwapStep};
+
+/// Cross-bin swap walker. Drives `swap_within_bin` across `active_id`
+/// transitions until the input is exhausted, the walker leaves the
+/// supplied bin window, or the iteration cap fires.
+///
+/// DLMM cross-bin walking is structurally similar to Whirlpool's
+/// cross-tick walk but simpler — bin price is fixed per bin (no
+/// curve traversal), so each bin's contribution resolves in a
+/// single `swap_within_bin` call. The walker:
+///
+///   1. Looks up the active bin's `(amount_x, amount_y, price)` in
+///      the `DlmmBinState` map.
+///   2. Calls `swap_within_bin` with the leftover input.
+///   3. Updates the bin's amounts in-place (next legs see post-swap state).
+///   4. Advances `active_id` by ±1 if the bin drained.
+///   5. Repeats until `amount_in_remaining = 0` or the active bin
+///      falls outside the supplied window.
+///
+/// Empty bins (output reserve zero) take one iteration each: the
+/// `swap_within_bin` empty-side fast path returns
+/// `amount_in_remaining = amount_in` + `bin_drained = true`, so the
+/// walker advances without consuming input. The iteration cap
+/// bounds total bin traversal even in pathological "thousands of
+/// empty bins between liquidity" pools.
+pub mod cross_bin {
+    use super::price_math::bin_price;
+    use super::swap_math::swap_within_bin;
+    use super::{
+        bin_array::{bin_array_lower_upper_bin_id, ParsedBinArray},
+        DlmmPool,
+    };
+    use std::collections::HashMap;
+
+    /// Maximum bin transitions per walk. Sized to comfortably exceed
+    /// the realistic sandwich (most cross-bin swaps move 1-5 bins;
+    /// large MEV bots occasionally push 20-50). 256 also caps the
+    /// pathological "long empty-bin run" — the iteration cap stops
+    /// the walk before the supplied window runs out, so the bail
+    /// surfaces as `None` rather than an infinite loop.
+    pub const MAX_SWAP_ITERATIONS: usize = 256;
+
+    /// Mutable map of `bin_id → (amount_x, amount_y, price)` covering
+    /// the bins the walker can reach. Built once from the BinArray
+    /// window the caller fetched; updated in-place as the walker
+    /// drains bins.
+    ///
+    /// Price is cached (with a `bin_price` recompute when the
+    /// on-chain `Bin.price = 0` lazy-init sentinel is hit). Storing
+    /// price here avoids re-deriving it once per walk iteration —
+    /// `pow` is cheap but not free, and a 256-bin walk would call it
+    /// 256 times otherwise.
+    #[derive(Debug, Clone)]
+    pub struct DlmmBinState {
+        bins: HashMap<i32, BinSnapshot>,
+        bin_step: u16,
+        /// Inclusive bin id range the supplied arrays cover. Used
+        /// to short-circuit `get` for bins outside the window
+        /// without searching the map.
+        range: (i32, i32),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BinSnapshot {
+        pub amount_x: u64,
+        pub amount_y: u64,
+        pub price: u128,
+    }
+
+    impl DlmmBinState {
+        /// Build the map from a BinArray window. Skips bins outside
+        /// the arrays' range. Recomputes price for any lazy-cached
+        /// (on-chain `Bin.price = 0`) bin via [`bin_price`].
+        pub fn from_arrays(arrays: &[ParsedBinArray], bin_step: u16) -> Option<Self> {
+            if arrays.is_empty() {
+                return None;
+            }
+            let mut bins = HashMap::new();
+            let mut min_id = i32::MAX;
+            let mut max_id = i32::MIN;
+            for arr in arrays {
+                let array_idx = arr.index as i32;
+                let (lower, upper) = bin_array_lower_upper_bin_id(array_idx);
+                min_id = min_id.min(lower);
+                max_id = max_id.max(upper);
+                for (i, bin) in arr.bins.iter().enumerate() {
+                    let bin_id = lower.checked_add(i as i32)?;
+                    let price = if bin.price != 0 {
+                        bin.price
+                    } else {
+                        bin_price(bin_id, bin_step)?
+                    };
+                    bins.insert(
+                        bin_id,
+                        BinSnapshot {
+                            amount_x: bin.amount_x,
+                            amount_y: bin.amount_y,
+                            price,
+                        },
+                    );
+                }
+            }
+            Some(Self {
+                bins,
+                bin_step,
+                range: (min_id, max_id),
+            })
+        }
+
+        /// Snapshot for `bin_id`. Returns `None` for either of:
+        ///   * `bin_id` outside the `range` covered by the supplied
+        ///     arrays (the walker stepped past the fetch window),
+        ///   * `bin_id` *within* `range` but not present in the
+        ///     `bins` map — happens when the caller passed a
+        ///     non-contiguous window (e.g. `[Some(-2), None,
+        ///     Some(0)]` after `into_iter().flatten()` collapsed to
+        ///     `[arr_-2, arr_0]`, so `range = (-140, 69)` covers bin
+        ///     `-71` but no entry exists for it).
+        ///
+        /// Both cases produce the same downstream behaviour
+        /// (`cross_bin_swap` bails with `None`, enrich reports
+        /// `CrossTickUnsupported`), so the caller doesn't need to
+        /// distinguish them — but they're semantically different
+        /// failure modes worth flagging in diagnostics.
+        pub fn get(&self, bin_id: i32) -> Option<BinSnapshot> {
+            if bin_id < self.range.0 || bin_id > self.range.1 {
+                return None;
+            }
+            self.bins.get(&bin_id).copied()
+        }
+
+        /// Apply post-swap mutation to a bin. Caller computed
+        /// `(new_x, new_y)` from `swap_within_bin`'s result.
+        pub fn update(&mut self, bin_id: i32, amount_x: u64, amount_y: u64) {
+            if let Some(b) = self.bins.get_mut(&bin_id) {
+                b.amount_x = amount_x;
+                b.amount_y = amount_y;
+            }
+        }
+
+        /// Inclusive bin id range covered by the underlying arrays.
+        pub fn range(&self) -> (i32, i32) {
+            self.range
+        }
+
+        /// `bin_step` the state was built from. Surfaced for callers
+        /// that need to derive prices for bins beyond the window.
+        pub fn bin_step(&self) -> u16 {
+            self.bin_step
+        }
+    }
+
+    /// Result of a multi-bin walk.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CrossBinSwapResult {
+        /// Total gross input consumed (= caller's `amount_in` on
+        /// successful completion).
+        pub amount_in_with_fees: u64,
+        /// Total token-out delivered.
+        pub amount_out: u64,
+        /// Total fee withheld across all bins.
+        pub fee: u64,
+        /// `active_id` after the walk. Differs from the initial
+        /// `active_id` by the number of bin transitions.
+        pub final_active_id: i32,
+        /// Number of `swap_within_bin` iterations the walker ran.
+        /// Surfaced for diagnostics — most realistic swaps complete
+        /// in 1-5 iterations; a value approaching `MAX_SWAP_ITERATIONS`
+        /// indicates a sparse-liquidity pool.
+        pub iterations: usize,
+    }
+
+    /// Walk the active bin sequence, draining bins until `amount_in`
+    /// is exhausted or the walker exits the supplied window.
+    ///
+    /// Returns `None` on:
+    ///   * arithmetic overflow at any step,
+    ///   * the walker stepping outside the BinArray window without
+    ///     having consumed `amount_in`,
+    ///   * the iteration cap firing before `amount_in_remaining = 0`,
+    ///   * a single `swap_within_bin` call returning `None` (zero
+    ///     price hit on a bin with no `bin_price` recompute fallback —
+    ///     the `from_arrays` constructor already resolves this, so
+    ///     the `None` here means a real arithmetic edge case).
+    ///
+    /// Side effect: `state` is mutated to reflect post-swap bin
+    /// reserves. Caller passes a clone for counterfactual replays.
+    pub fn cross_bin_swap(
+        amount_in: u64,
+        initial_active_id: i32,
+        state: &mut DlmmBinState,
+        swap_for_y: bool,
+        pool: &DlmmPool,
+    ) -> Option<CrossBinSwapResult> {
+        let mut amount_left = amount_in;
+        let mut total_in_with_fees: u64 = 0;
+        let mut total_out: u64 = 0;
+        let mut total_fee: u64 = 0;
+        let mut active_id = initial_active_id;
+
+        for iter in 0..MAX_SWAP_ITERATIONS {
+            if amount_left == 0 {
+                return Some(CrossBinSwapResult {
+                    amount_in_with_fees: total_in_with_fees,
+                    amount_out: total_out,
+                    fee: total_fee,
+                    final_active_id: active_id,
+                    iterations: iter,
+                });
+            }
+            let snap = state.get(active_id)?;
+            let step = swap_within_bin(
+                amount_left,
+                snap.amount_x,
+                snap.amount_y,
+                snap.price,
+                swap_for_y,
+                pool,
+            )?;
+            total_in_with_fees = total_in_with_fees.checked_add(step.amount_in_with_fees)?;
+            total_out = total_out.checked_add(step.amount_out)?;
+            total_fee = total_fee.checked_add(step.fee)?;
+
+            // Mutate bin amounts. The "amount that lands inside the
+            // bin" is the gross input minus the fee — fees are
+            // collected by the protocol, not retained in the bin.
+            // Use `checked_sub` so a regression in `swap_within_bin`
+            // returning `fee > amount_in_with_fees` fails loudly
+            // rather than silently producing 0; on-chain `Bin::swap`
+            // mirrors this with `checked_sub(...).context("overflow")`.
+            let amount_into_bin = step.amount_in_with_fees.checked_sub(step.fee)?;
+            let (new_x, new_y) = if swap_for_y {
+                (
+                    snap.amount_x.saturating_add(amount_into_bin),
+                    snap.amount_y.saturating_sub(step.amount_out),
+                )
+            } else {
+                (
+                    snap.amount_x.saturating_sub(step.amount_out),
+                    snap.amount_y.saturating_add(amount_into_bin),
+                )
+            };
+            state.update(active_id, new_x, new_y);
+
+            amount_left = step.amount_in_remaining;
+
+            if !step.bin_drained {
+                // Partial fill ⇒ caller's swap is complete.
+                return Some(CrossBinSwapResult {
+                    amount_in_with_fees: total_in_with_fees,
+                    amount_out: total_out,
+                    fee: total_fee,
+                    final_active_id: active_id,
+                    iterations: iter + 1,
+                });
+            }
+
+            // Bin drained ⇒ advance to the next active bin.
+            // swap_for_y eats the y-axis (price drops): bin id decreases.
+            // Otherwise: bin id increases.
+            active_id = if swap_for_y {
+                active_id.checked_sub(1)?
+            } else {
+                active_id.checked_add(1)?
+            };
+        }
+        // Iteration cap hit without finishing — pathological pool
+        // (sparse liquidity beyond the cap, or a misbehaving caller).
+        None
+    }
+}
+
+pub use cross_bin::{cross_bin_swap, BinSnapshot, CrossBinSwapResult, DlmmBinState};
 
 #[cfg(test)]
 mod tests {
@@ -1248,7 +1534,43 @@ mod swap_math_tests {
                 amount_out: 0,
                 fee: 0,
                 bin_drained: true,
+                // Empty bin can't absorb anything ⇒ caller's full
+                // input remains for the next bin.
+                amount_in_remaining: 1_000_000,
             }
+        );
+    }
+
+    /// Partial fill ⇒ no leftover. Pin the contract that
+    /// `amount_in_remaining = 0` is the cross-bin walker's "stop"
+    /// signal — a regression that returns non-zero here would cause
+    /// the walker to re-enter the same bin and either spin or
+    /// double-charge.
+    #[test]
+    fn partial_fill_leaves_zero_remaining() {
+        let pool = pool_8000_25();
+        let big = 1_000_000_000u64;
+        let step = swap_within_bin(1_000_000, big, big, ONE, true, &pool).unwrap();
+        assert_eq!(step.amount_in_remaining, 0);
+        assert!(!step.bin_drained);
+    }
+
+    /// Drain path ⇒ leftover = `amount_in - max_amount_in` (the gross
+    /// amount the bin actually absorbed). The cross-bin walker
+    /// (Phase 2 step 2) uses this to seed the next bin's swap.
+    #[test]
+    fn drain_path_returns_correct_leftover() {
+        let pool = pool_8000_25();
+        // Reserves of 100 Y vs huge X input (1B). The bin's
+        // max_amount_in is small (≈101 from the cross-bin test);
+        // leftover ≈ 1B - 101.
+        let step = swap_within_bin(1_000_000_000, 999_999, 100, ONE, true, &pool).unwrap();
+        assert!(step.bin_drained);
+        // Sum invariant: amount_in_with_fees + amount_in_remaining
+        // == caller's gross amount_in.
+        assert_eq!(
+            step.amount_in_with_fees as u128 + step.amount_in_remaining as u128,
+            1_000_000_000,
         );
     }
 
@@ -1323,5 +1645,167 @@ mod swap_math_tests {
         // amount_out = floor(998_000 * 2 * ONE / ONE) = 1_996_000.
         let step = swap_within_bin(1_000_000, big, big, p, true, &pool).unwrap();
         assert_eq!(step.amount_out, 1_996_000);
+    }
+}
+
+#[cfg(test)]
+mod cross_bin_tests {
+    use super::bin_array::{ParsedBin, ParsedBinArray, MAX_BIN_PER_ARRAY};
+    use super::cross_bin::{cross_bin_swap, DlmmBinState, MAX_SWAP_ITERATIONS};
+    use super::DlmmPool;
+    use solana_sdk::pubkey::Pubkey;
+
+    fn pool() -> DlmmPool {
+        DlmmPool {
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        }
+    }
+
+    /// Build a synthetic ParsedBinArray at the given index where every
+    /// bin has identical reserves + price (`DLMM_ONE` for `bin_id = 0`,
+    /// else lazy-cached `0` so the walker recomputes via `bin_price`).
+    fn uniform_array(index: i64, amount_x: u64, amount_y: u64) -> ParsedBinArray {
+        let bins = (0..MAX_BIN_PER_ARRAY)
+            .map(|_| ParsedBin {
+                amount_x,
+                amount_y,
+                // Lazy-cached `0` exercises the `from_arrays` recompute
+                // branch — the walker should produce identical results
+                // regardless of cache hit / miss.
+                price: 0,
+                liquidity_supply: 1_000_000_000,
+            })
+            .collect();
+        ParsedBinArray {
+            index,
+            version: 1,
+            lb_pair: Pubkey::new_unique(),
+            bins,
+        }
+    }
+
+    /// Single-bin walk: amount fits inside the active bin. Should
+    /// produce one iteration and `final_active_id == initial`.
+    /// Mostly a sanity check that the walker doesn't over-step on
+    /// partial fills.
+    #[test]
+    fn single_bin_walk_one_iteration() {
+        let arrays = vec![uniform_array(0, 1_000_000_000, 1_000_000_000)];
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let pool = pool();
+        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &pool).unwrap();
+        assert_eq!(r.iterations, 1);
+        assert_eq!(r.final_active_id, 0);
+        assert_eq!(r.amount_in_with_fees, 1_000_000);
+        // Bin reserves should reflect the swap (X went up, Y went down).
+        let snap = state.get(0).unwrap();
+        assert!(snap.amount_x > 1_000_000_000);
+        assert!(snap.amount_y < 1_000_000_000);
+    }
+
+    /// Multi-bin walk: each bin has 100 Y, frontrun input 1B X. The
+    /// walker should drain bins one by one (swap_for_y direction =
+    /// X→Y, active_id decreases) until input is exhausted or window
+    /// runs out. Pin that final_active_id < initial and iterations
+    /// is small (~few bins worth of liquidity).
+    #[test]
+    fn multi_bin_walk_advances_active_id() {
+        // Window: array indices -2, -1, 0, 1, 2 (covers bins -140..=139).
+        let arrays = vec![
+            uniform_array(-2, 0, 1_000),
+            uniform_array(-1, 0, 1_000),
+            uniform_array(0, 0, 1_000),
+            uniform_array(1, 0, 1_000),
+            uniform_array(2, 0, 1_000),
+        ];
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let pool = pool();
+
+        // Start at active_id = 0; swap X→Y. Each bin holds 1_000 Y.
+        // Caller hands in enough X to drain ~5 bins.
+        let r = cross_bin_swap(20_000, 0, &mut state, true, &pool).unwrap();
+        // Walker should have advanced backward (X→Y consumes y, bin
+        // ids decrease).
+        assert!(r.final_active_id < 0, "got {}", r.final_active_id);
+        // Some Y must have been delivered.
+        assert!(r.amount_out > 0);
+        // Total fee ≤ 0.2% of input.
+        assert!(r.fee <= r.amount_in_with_fees / 100);
+    }
+
+    /// Out-of-window: walker steps past the supplied arrays without
+    /// consuming all input ⇒ `None`. Catches the regression where
+    /// a too-small fetch window silently truncates the swap.
+    #[test]
+    fn out_of_window_bails() {
+        // Single array at index 0 covers bins [0, 69]. Each bin
+        // holds 100 Y. Caller hands in enough X to need >70 bins'
+        // worth — walker hits bin -1 (outside window) and bails.
+        let arrays = vec![uniform_array(0, 0, 100)];
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let pool = pool();
+        // 70 bins * 100 Y = 7_000 Y; need much more X to drain that.
+        let r = cross_bin_swap(1_000_000_000, 0, &mut state, true, &pool);
+        assert!(r.is_none(), "should bail when walker leaves window");
+    }
+
+    /// Empty bin skip: walker advances past empty bins without
+    /// charging the input. Pin that the iteration cap doesn't fire
+    /// when a stretch of empty bins separates liquidity.
+    #[test]
+    fn empty_bin_skip_propagates_input() {
+        // Build an array where bin 0 is empty (Y=0) and bin -1 has
+        // liquidity. Walker should skip bin 0 → bin -1.
+        let bins = vec![
+            ParsedBin {
+                amount_x: 0,
+                amount_y: 0, // empty Y
+                price: 0,
+                liquidity_supply: 0,
+            };
+            MAX_BIN_PER_ARRAY
+        ];
+        // Bin -1 is at array index -1, slot 69. Build a separate
+        // array for bin -1 with liquidity.
+        let array_0 = ParsedBinArray {
+            index: 0,
+            version: 1,
+            lb_pair: Pubkey::new_unique(),
+            bins: bins.clone(),
+        };
+        let mut bins_minus1 = bins.clone();
+        bins_minus1[MAX_BIN_PER_ARRAY - 1] = ParsedBin {
+            amount_x: 0,
+            amount_y: 1_000_000_000, // bin -1 has plenty
+            price: 0,
+            liquidity_supply: 1_000_000_000,
+        };
+        let array_minus1 = ParsedBinArray {
+            index: -1,
+            version: 1,
+            lb_pair: array_0.lb_pair,
+            bins: bins_minus1,
+        };
+        let arrays = vec![array_0, array_minus1];
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let pool = pool();
+        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &pool).unwrap();
+        // Walker advanced from 0 (empty) → -1 (liquid). At least 2
+        // iterations: one to skip bin 0, one to swap in bin -1.
+        assert!(r.iterations >= 2);
+        assert_eq!(r.final_active_id, -1);
+        assert!(r.amount_out > 0);
+    }
+
+    /// Iteration cap pin: declarative — `MAX_SWAP_ITERATIONS = 256`.
+    /// Catches accidental tightening that would break realistic
+    /// sparse-liquidity pools.
+    #[test]
+    fn iteration_cap_constant_pin() {
+        assert_eq!(MAX_SWAP_ITERATIONS, 256);
     }
 }

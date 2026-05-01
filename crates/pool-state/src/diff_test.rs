@@ -378,6 +378,7 @@ mod tests {
                 fee_num: 3_000,
                 fee_den: 1_000_000,
             }),
+            dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,

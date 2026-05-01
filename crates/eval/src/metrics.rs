@@ -213,6 +213,7 @@ mod tests {
             evidence: None,
             amm_replay: None,
             whirlpool_replay: None,
+            dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,

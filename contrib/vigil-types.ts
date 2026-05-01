@@ -239,6 +239,41 @@ export interface WhirlpoolReplayTrace {
   fee_den: number;
 }
 
+/** Per-step Meteora DLMM (Liquidity Book) replay trace. Populated when
+ *  `dex` is `meteora_dlmm` and Phase 2 cross-bin replay ran successfully.
+ *  Tracks `active_id` transitions instead of Whirlpool's sqrt_price /
+ *  liquidity / tick triple — DLMM's discrete-bin model captures a leg's
+ *  effect entirely in which bin became active.
+ *
+ *  `bin_price_pre` is Q64.64; serialised as a base-10 decimal string,
+ *  read with `BigInt(...)` to preserve precision past 2^53.
+ *  `active_id_*` fit in `number` (DLMM bin ids cap at ±443_636).
+ */
+export interface MeteoraDlmmReplayTrace {
+  /** Active bin id immediately before the frontrun. */
+  active_id_pre: number;
+  /** After the frontrun, before the victim. */
+  active_id_post_front: number;
+  /** After the victim, before the backrun. */
+  active_id_post_victim: number;
+  /** After the backrun (end of the triplet). */
+  active_id_post_back: number;
+
+  /** Q64.64 spot price at the pre-frontrun moment (active bin's price). */
+  bin_price_pre: string;
+
+  counterfactual_victim_out: number;
+  actual_victim_out: number;
+
+  /** Bin step in basis points (`25` = 0.25%). Static per pool. */
+  bin_step: number;
+
+  /** DLMM fee fraction. `fee_num / fee_den` where `fee_den = 1e9`
+   *  (DLMM_FEE_PRECISION). e.g. `2_000_000 / 1e9` = 0.2%. */
+  fee_num: number;
+  fee_den: number;
+}
+
 // ---------------------------------------------------------------------------
 // Per-tx swap event (frontrun / victim / backrun)
 // ---------------------------------------------------------------------------
@@ -341,6 +376,11 @@ export interface SandwichAttack {
    *  Mutually exclusive with `amm_replay`: dispatch by `dex` to pick
    *  the right view of the swap arithmetic. */
   whirlpool_replay?: WhirlpoolReplayTrace | null;
+
+  /** Meteora DLMM-specific replay trace. Populated when `dex` is
+   *  `meteora_dlmm` and Phase 2 cross-bin replay ran. Mutually exclusive
+   *  with `whirlpool_replay` and the constant-product `amm_replay`. */
+  dlmm_replay?: MeteoraDlmmReplayTrace | null;
 
   // -- Vigil v1 — populated by `finalize_for_vigil()` --
   /** Canonical attack id (= victim signature today). FK target for receipts. */
