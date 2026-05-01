@@ -1093,4 +1093,117 @@ mod tests {
         assert!(loss.victim_loss > 0);
         assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
     }
+
+    // ----- Tier 4 — corpus expansion (golden + adversarial) --------------
+
+    /// Sell-first happy-path mirror of
+    /// `whirlpool_within_tick_sandwich_produces_loss`. The Buy-first case
+    /// already pins one direction; this one guards against accidental
+    /// asymmetry in the a/b axis mapping that could let only one
+    /// direction extract victim loss.
+    #[test]
+    fn whirlpool_sell_first_sandwich_produces_loss() {
+        let pool_0 = make_whirlpool(1_000_000_000_000, 10, 64);
+        // base=token_a, Sell ⇒ a_to_b=true.
+        let (_, fr_out, _) = pool_0
+            .apply_swap_within_tick(100_000_000, true, 3_000, 1_000_000)
+            .expect("frontrun within-tick");
+        let mut attack = make_attack(
+            swap("f", "atk", SwapDirection::Sell, 100_000_000, 0),
+            swap("v", "vic", SwapDirection::Sell, 10_000_000, 0),
+            swap("b", "atk", SwapDirection::Buy, 0, 0),
+        );
+        attack.backrun.amount_in = fr_out as u64;
+
+        let loss = compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &[])
+            .expect("within-tick replay should succeed for Sell-first");
+        assert!(
+            loss.victim_loss > 0,
+            "expected positive victim loss, got {}",
+            loss.victim_loss,
+        );
+        assert!(loss.actual_victim_out < loss.counterfactual_victim_out);
+        assert!(loss.price_impact_bps > 0);
+    }
+
+    /// Cross-tick replay surfaces a populated trace. The within-tick
+    /// trace test pins the trace shape against the within-tick path; this
+    /// test mirrors it for the cross-tick fallback path so a regression
+    /// where the fallback drops trace fields gets caught.
+    #[test]
+    fn whirlpool_cross_tick_trace_captures_state_progression() {
+        use crate::orca_whirlpool::{swap_math, tick_math};
+        let pool_0 = WhirlpoolPool {
+            liquidity: 1_500_000_000,
+            sqrt_price_q64: tick_math::sqrt_price_at_tick(0),
+            tick_current_index: 0,
+            tick_spacing: 64,
+            fee_rate_hundredths_bps: 3_000,
+        };
+        let arrays = double_lp_arrays();
+
+        let mut attack = make_attack(
+            swap("f", "atk", SwapDirection::Sell, 1_000_000, 0),
+            swap("v", "vic", SwapDirection::Sell, 100_000, 0),
+            swap("b", "atk", SwapDirection::Buy, 0, 0),
+        );
+        let mut sorted = arrays.clone();
+        sorted.sort_by_key(|a| std::cmp::Reverse(a.start_tick_index));
+        let sorted: Vec<Option<_>> = sorted.into_iter().map(Some).collect();
+        let fr = swap_math::cross_tick_swap(pool_0, 1_000_000, true, 3_000, 1_000_000, &sorted)
+            .expect("frontrun cross-tick should resolve");
+        attack.backrun.amount_in = fr.amount_out.min(u64::MAX as u128) as u64;
+
+        let (loss, trace) =
+            compute_loss_whirlpool_with_trace(&attack, pool_0, 3_000, 1_000_000, true, &arrays)
+                .expect("cross-tick replay should resolve");
+
+        // Pre-state mirrors the fixture exactly.
+        assert_eq!(trace.sqrt_price_pre, tick_math::sqrt_price_at_tick(0));
+        assert_eq!(trace.liquidity_pre, 1_500_000_000);
+        assert_eq!(trace.tick_current_pre, 0);
+
+        // Sell-first sandwich: frontrun + victim are a→b ⇒ sqrt_price
+        // strictly drops on each leg. Backrun is b→a ⇒ rises back up.
+        assert!(trace.sqrt_price_post_front < trace.sqrt_price_pre);
+        assert!(trace.sqrt_price_post_victim <= trace.sqrt_price_post_front);
+        assert!(trace.sqrt_price_post_back > trace.sqrt_price_post_victim);
+
+        // Trace's victim figures align with the LossEstimate (same data
+        // source — just two views of the same replay).
+        assert_eq!(trace.actual_victim_out, loss.actual_victim_out);
+        assert_eq!(
+            trace.counterfactual_victim_out,
+            loss.counterfactual_victim_out,
+        );
+    }
+
+    /// Adversarial: a Whirlpool with zero active liquidity can't service
+    /// a swap. `cross_tick_swap`'s first guard rejects it (liquidity == 0
+    /// short-circuit), so `compute_loss_whirlpool` returns None and the
+    /// caller routes the attack to `CrossTickUnsupported`. Pin the
+    /// short-circuit so a future relaxation (e.g. "walk into the next
+    /// LP") doesn't silently change behaviour without a corresponding
+    /// trace-shape decision.
+    #[test]
+    fn whirlpool_zero_liquidity_returns_none() {
+        use crate::orca_whirlpool::tick_math;
+        let pool_0 = WhirlpoolPool {
+            liquidity: 0,
+            sqrt_price_q64: tick_math::sqrt_price_at_tick(0),
+            tick_current_index: 0,
+            tick_spacing: 64,
+            fee_rate_hundredths_bps: 3_000,
+        };
+        let arrays = double_lp_arrays();
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 100_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 10_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 100_000, 0),
+        );
+        assert!(
+            compute_loss_whirlpool(&attack, pool_0, 3_000, 1_000_000, true, &arrays).is_none(),
+            "zero-liquidity pool should fail replay even with tick_arrays supplied",
+        );
+    }
 }
