@@ -562,6 +562,14 @@ pub fn compute_loss_dlmm(
     if attack.backrun.direction == attack.frontrun.direction {
         return None;
     }
+    // `bin_price == 0` is the on-chain "lazy-cached, never swapped"
+    // sentinel — the caller is supposed to recompute via
+    // `bin_price(active_id, bin_step)` before calling this function.
+    // Defend against a regression in `enrichment.rs` (skipping that
+    // recompute) so all-`None` legs don't masquerade as cross-bin.
+    if bin_price == 0 {
+        return None;
+    }
 
     // SwapDirection (Buy/Sell, quote terms) ⇒ DLMM `swap_for_y`. The
     // DLMM x/y axis is V3's a/b axis, so the mapping mirrors

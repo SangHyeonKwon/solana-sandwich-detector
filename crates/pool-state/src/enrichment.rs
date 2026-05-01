@@ -217,9 +217,16 @@ pub async fn enrich_attack(
                 _ => return EnrichmentResult::CrossTickUnsupported,
             };
 
+            // Unreachable in practice: array_index came from
+            // bin_id_to_bin_array_index(active_id), the inverse of
+            // bin_array_lower_upper_bin_id, so `active_id` is by
+            // construction in this array's range. Defend against a
+            // future regression in either helper by mapping to the
+            // same CrossTickUnsupported bail the rest of this arm
+            // uses, rather than silently bypassing the metrics.
             let bin_idx = match bin_index_in_array(array_index as i32, dlmm_pool.active_id) {
                 Some(i) => i,
-                None => return EnrichmentResult::ReplayFailed,
+                None => return EnrichmentResult::CrossTickUnsupported,
             };
             let active_bin = active_array.bins[bin_idx];
 

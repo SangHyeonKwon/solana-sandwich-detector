@@ -86,6 +86,15 @@ const MIN_LAYOUT_LEN: usize = RESERVE_Y_OFFSET + 32; // 216
 /// over `10^9`.
 pub const DLMM_FEE_PRECISION: u64 = 1_000_000_000;
 
+/// Maximum fee rate cap (10%, in `DLMM_FEE_PRECISION` units). Mirrors
+/// `MAX_FEE_RATE` in `commons/src/constants.rs`. On-chain `get_total_fee`
+/// applies `min(rate, MAX_FEE_RATE)` so that `compute_fee_on_net`'s
+/// `1e9 - rate` denominator never underflows. We faithfully cap here
+/// even though the Phase 1 base-fee-only path can't actually exceed
+/// 10% with legal pool config — Phase 3's variable-fee plumbing will,
+/// and pinning the cap now prevents a silent underflow regression.
+pub const DLMM_MAX_FEE_RATE: u128 = 100_000_000;
+
 /// Default base fee fallback (`30 bps`, expressed in `DLMM_FEE_PRECISION`)
 /// applied when the on-chain config parses as zero/degenerate. Same shape
 /// as the Raydium V4 / Whirlpool parsers' fallback.
@@ -127,7 +136,8 @@ pub struct DlmmPool {
 }
 
 impl DlmmPool {
-    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]).
+    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]),
+    /// capped at [`DLMM_MAX_FEE_RATE`] to mirror on-chain `get_total_fee`.
     ///
     /// Phase 1 implements **base fee only**: `base_factor * bin_step *
     /// 10 * 10^base_fee_power_factor`. Variable fee (volatility-driven)
@@ -140,7 +150,8 @@ impl DlmmPool {
             .checked_mul(self.bin_step as u128)?
             .checked_mul(10)?;
         let power_mul: u128 = 10u128.checked_pow(self.base_fee_power_factor as u32)?;
-        factor.checked_mul(power_mul)
+        let raw = factor.checked_mul(power_mul)?;
+        Some(raw.min(DLMM_MAX_FEE_RATE))
     }
 
     /// Fee charged when the caller knows the *net* (post-fee) amount
@@ -163,12 +174,18 @@ impl DlmmPool {
     /// already pushed in and must recover the fee component.
     ///
     /// Mirrors `LbPair::compute_fee_from_amount` in commons:
-    /// `ceil(gross * rate / DLMM_FEE_PRECISION)`.
+    /// `ceil(gross * rate / DLMM_FEE_PRECISION)`. Hardcoded
+    /// `DLMM_FEE_PRECISION - 1` mirrors the on-chain idiom (the on-chain
+    /// code uses the literal constant, not `den - 1` — keeping the
+    /// shape identical guards against future refactors silently
+    /// changing the rounding.)
     pub fn compute_fee_from_amount(&self, gross_amount: u64) -> Option<u64> {
         let rate = self.total_fee_rate()?;
         let num = (gross_amount as u128).checked_mul(rate)?;
         let den = DLMM_FEE_PRECISION as u128;
-        let fee = num.checked_add(den.checked_sub(1)?)?.checked_div(den)?;
+        let fee = num
+            .checked_add((DLMM_FEE_PRECISION - 1) as u128)?
+            .checked_div(den)?;
         u64::try_from(fee).ok()
     }
 }
@@ -928,6 +945,44 @@ mod tests {
         // rate = 2e6, den = 998e6; 1e6 * 2e6 / 998e6 = 2004.0080...
         // floor = 2004, remainder ≠ 0 ⇒ ceil = 2005.
         assert_eq!(pool.compute_fee_on_net(1_000_000).unwrap(), 2_005);
+    }
+
+    /// `compute_fee_from_amount` ceil-rounds. The default test (in
+    /// `parses_synthetic_lbpair_x_quote`) hits the exact-division
+    /// case (no remainder); this exercises the ceil branch with a
+    /// non-zero remainder so a regression to floor is caught.
+    #[test]
+    fn compute_fee_from_amount_ceil_rounds() {
+        let pool = DlmmPool {
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        };
+        // rate = 2e6; gross = 1; num = 2e6; ceil(2e6 / 1e9) = 1.
+        // (Floor would yield 0 — pin that we round up.)
+        assert_eq!(pool.compute_fee_from_amount(1).unwrap(), 1);
+    }
+
+    /// `total_fee_rate` caps at `DLMM_MAX_FEE_RATE` (10%). With Phase 1
+    /// base-fee-only this never bites — `MAX_BIN_STEP=400` keeps the
+    /// rate under 4% — but pin the cap so a future Phase 3 variable-fee
+    /// regression that pushes rate above 10% can't underflow
+    /// `compute_fee_on_net`'s `1e9 - rate` denominator.
+    #[test]
+    fn total_fee_rate_caps_at_max() {
+        // Synthesise a pool whose raw rate exceeds MAX_FEE_RATE (10% in
+        // 1e9 = 1e8). 10000 * 400 * 10 = 40_000_000 (4%). Bump
+        // base_fee_power_factor to 1 ⇒ 400_000_000 (40%, > cap).
+        let pool = DlmmPool {
+            active_id: 0,
+            bin_step: 400,
+            base_factor: 10_000,
+            base_fee_power_factor: 1,
+            protocol_share: 0,
+        };
+        assert_eq!(pool.total_fee_rate(), Some(DLMM_MAX_FEE_RATE));
     }
 }
 
