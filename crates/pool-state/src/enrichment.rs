@@ -370,15 +370,18 @@ mod tests {
 
     struct MockLookup {
         config: PoolConfig,
-        /// `Some` lets tests exercise the Whirlpool dispatch path; the
-        /// constant-product tests leave it at `None` and never call
-        /// `pool_dynamic_state`.
+        /// `Some` lets tests exercise the Whirlpool / DLMM dispatch
+        /// path; constant-product tests leave it at `None`.
         dynamic_state: Option<DynamicPoolState>,
         /// Tests that exercise cross-tick replay populate this; the
         /// trait impl returns it verbatim, ignoring the start_indices
         /// the caller asked for. Default is empty — every test that
         /// doesn't care about cross-tick keeps within-tick behaviour.
         tick_arrays: Vec<Option<ParsedTickArray>>,
+        /// Tests that exercise DLMM replay populate this. Same opt-in
+        /// shape as `tick_arrays`: returned verbatim regardless of
+        /// the requested `array_indices`.
+        bin_arrays: Vec<Option<ParsedBinArray>>,
     }
 
     #[async_trait]
@@ -404,6 +407,16 @@ mod tests {
             _slot: u64,
         ) -> Vec<Option<ParsedTickArray>> {
             self.tick_arrays.clone()
+        }
+
+        async fn bin_arrays(
+            &self,
+            _pool: &str,
+            _dex: DexType,
+            _array_indices: &[i64],
+            _slot: u64,
+        ) -> Vec<Option<ParsedBinArray>> {
+            self.bin_arrays.clone()
         }
     }
 
@@ -526,6 +539,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -555,6 +569,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -575,6 +590,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -593,6 +609,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -635,6 +652,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -702,6 +720,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -738,6 +757,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -761,6 +781,7 @@ mod tests {
             config,
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -790,6 +811,7 @@ mod tests {
             config,
             dynamic_state: Some(dynamic_state),
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -877,6 +899,7 @@ mod tests {
             config,
             dynamic_state: Some(dynamic_state),
             tick_arrays,
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -914,6 +937,7 @@ mod tests {
             config,
             dynamic_state: Some(dynamic_state),
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -930,6 +954,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -997,6 +1022,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1031,6 +1057,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1065,6 +1092,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, None, &lookup).await;
@@ -1100,6 +1128,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1120,6 +1149,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1147,6 +1177,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1182,6 +1213,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1195,6 +1227,152 @@ mod tests {
         assert!(
             !any,
             "should be silent when backrun tx has no vault balances",
+        );
+    }
+
+    // ----- DLMM (Phase 1) Tier 4 corpus ---------------------------------
+    //
+    // The Phase 1 within-bin DLMM replay produces `victim_loss = 0` by
+    // construction (constant-sum mechanic ⇒ frontrun doesn't move price).
+    // These integration fixtures pin the end-to-end flow:
+    //   1. within-bin sandwich ⇒ Enriched, victim_loss = 0;
+    //   2. cross-bin sandwich (bin gets drained) ⇒ CrossTickUnsupported;
+    //   3. missing BinArray ⇒ CrossTickUnsupported.
+
+    use crate::meteora_dlmm::bin_array::{ParsedBin, ParsedBinArray, MAX_BIN_PER_ARRAY};
+    use crate::meteora_dlmm::price_math::ONE as DLMM_ONE;
+    use crate::meteora_dlmm::DlmmPool;
+    use solana_sdk::pubkey::Pubkey;
+
+    fn dlmm_config() -> PoolConfig {
+        PoolConfig {
+            kind: AmmKind::MeteoraDlmm,
+            pool: "POOL".into(),
+            vault_base: "VAULT_BASE".into(),
+            vault_quote: "VAULT_QUOTE".into(),
+            base_mint: "BASE_MINT".into(),
+            quote_mint: "QUOTE_MINT".into(),
+            // base_factor=8000 * bin_step=25 * 10 = 2_000_000 ⇒ 0.2% in 1e9.
+            fee_num: 2_000_000,
+            fee_den: 1_000_000_000,
+            // base = x ⇒ swap_for_y = Sell, !swap_for_y = Buy.
+            base_is_token_a: true,
+        }
+    }
+
+    fn make_dlmm_attack(amount: u64) -> SandwichAttack {
+        let frontrun = make_swap("f", "atk", SwapDirection::Buy, amount, 0);
+        let mut victim = make_swap("v", "vic", SwapDirection::Buy, amount / 2, 0);
+        let mut backrun = make_swap("b", "atk", SwapDirection::Sell, amount, 0);
+        // Override DEX so AmmKind::from_dex picks MeteoraDlmm.
+        let frontrun = SwapEvent {
+            dex: DexType::MeteoraDlmm,
+            ..frontrun
+        };
+        victim.dex = DexType::MeteoraDlmm;
+        backrun.dex = DexType::MeteoraDlmm;
+        SandwichAttack {
+            dex: DexType::MeteoraDlmm,
+            frontrun,
+            victim,
+            backrun,
+            ..make_attack()
+        }
+    }
+
+    /// Build a synthetic ParsedBinArray whose active bin (id = 0) has
+    /// the supplied `(amount_x, amount_y)`. Array index 0 covers
+    /// bins `[0, 69]`, so bin 0 lands at `bins[0]`.
+    fn dlmm_active_array(amount_x: u64, amount_y: u64) -> ParsedBinArray {
+        let mut bins = vec![
+            ParsedBin {
+                amount_x: 0,
+                amount_y: 0,
+                price: 0,
+                liquidity_supply: 0,
+            };
+            MAX_BIN_PER_ARRAY
+        ];
+        bins[0] = ParsedBin {
+            amount_x,
+            amount_y,
+            price: DLMM_ONE,
+            liquidity_supply: 1_000_000_000,
+        };
+        ParsedBinArray {
+            index: 0,
+            version: 1,
+            lb_pair: Pubkey::new_unique(),
+            bins,
+        }
+    }
+
+    fn dlmm_state() -> DynamicPoolState {
+        DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        })
+    }
+
+    /// Within-bin sandwich: comfortable bin reserves, modest swap
+    /// amounts. Replay should succeed with `victim_loss = 0` (the
+    /// constant-sum invariant) and `Enriched` outcome.
+    #[tokio::test]
+    async fn dlmm_within_bin_corpus_yields_zero_loss_enriched() {
+        let mut attack = make_dlmm_attack(100_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![Some(dlmm_active_array(1_000_000_000, 1_000_000_000))],
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert_eq!(attack.victim_loss_lamports, Some(0));
+    }
+
+    /// Cross-bin sandwich: tiny bin reserves (100 each) vs. a much
+    /// larger frontrun (1B). First leg drains the bin ⇒
+    /// `compute_loss_dlmm` returns `None` ⇒ enrich reports
+    /// `CrossTickUnsupported`. Phase 2 will pick this up.
+    #[tokio::test]
+    async fn dlmm_cross_bin_corpus_returns_cross_tick_unsupported() {
+        let mut attack = make_dlmm_attack(1_000_000_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![Some(dlmm_active_array(100, 100))],
+        };
+        assert_eq!(
+            enrich_attack(&mut attack, &tx, None, &lookup).await,
+            EnrichmentResult::CrossTickUnsupported,
+        );
+    }
+
+    /// Missing BinArray (lookup returns empty Vec) ⇒ enrich can't see
+    /// the active bin's reserves and bails with
+    /// `CrossTickUnsupported`. Same convention as Whirlpool when
+    /// tick_arrays come back empty.
+    #[tokio::test]
+    async fn dlmm_missing_bin_array_corpus_returns_cross_tick_unsupported() {
+        let mut attack = make_dlmm_attack(100_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+        };
+        assert_eq!(
+            enrich_attack(&mut attack, &tx, None, &lookup).await,
+            EnrichmentResult::CrossTickUnsupported,
         );
     }
 }
