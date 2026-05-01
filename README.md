@@ -2,8 +2,14 @@
   <h1 align="center">solana-sandwich-detector</h1>
   <p align="center">
     A Rust library for detecting same-block and cross-slot sandwich attacks on Solana.<br/>
-    Parses swap events from 8 DEXes and identifies frontrun/victim/backrun patterns using sliding-window correlation and precision filters.
+    Parses swap events from 8 DEXes and identifies frontrun/victim/backrun patterns using sliding-window correlation, precision filters, and AMM-correct victim-loss replay.
   </p>
+</p>
+
+<p align="center">
+  <strong>English</strong> &middot;
+  <a href="README.ko.md">한국어</a> &middot;
+  <a href="README.es.md">Español</a>
 </p>
 
 <p align="center">
@@ -17,6 +23,7 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#how-it-works">How It Works</a> &middot;
+  <a href="#vigil-integration">Vigil Integration</a> &middot;
   <a href="#use-as-a-library">Library</a> &middot;
   <a href="#scope">Scope</a> &middot;
   <a href="#contributing">Contributing</a>
@@ -24,32 +31,32 @@
 
 ---
 
-Sandwich attacks are the most common form of MEV exploitation on Solana. An attacker front-runs a victim's swap, pushes the price, and back-runs to profit -- within the same block or across nearby slots.
+Sandwich attacks are the most common form of MEV exploitation on Solana. An attacker front-runs a victim's swap, pushes the price, and back-runs to profit — within the same block or across nearby slots.
 
-**solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It supports **same-block detection** (classic single-slot pattern) and **cross-slot window detection** (attacks spanning multiple slots, with Jito bundle provenance, economic feasibility, and victim plausibility filters). A thin streaming CLI (`sandwich-detect`) and an evaluation framework (`sandwich-eval`) are shipped alongside.
+**solana-sandwich-detector** is a Rust library that turns a stream of Solana blocks into a stream of detected attacks. It supports **same-block detection** (classic single-slot pattern) and **cross-slot window detection** (attacks spanning multiple slots, with Jito bundle provenance, economic feasibility, and victim plausibility filters). AMM-replay enrichment computes the victim's *actual loss* — not just the naive `amount_out - amount_in` heuristic. A streaming CLI (`sandwich-detect`), an evaluation framework (`sandwich-eval`), and an archival diff harness (`archival-diff`) ship alongside.
 
-> Used by [Vigil](https://github.com/EarthIsMine/Vigil-RPC) -- a Solana MEV transparency platform -- as the detection primitive. Validator scoring, persistence, alerting, and dashboards live in Vigil, not here. See [Scope](#scope).
+> Powers [Vigil](https://github.com/EarthIsMine/Vigil-RPC) — a Solana MEV transparency platform — as the detection primitive. Validator scoring, persistence, alerting, and dashboards live in Vigil; this repo stays focused on **stream-in → stream-out**. See [Scope](#scope) and [Vigil Integration](#vigil-integration).
 
 ### Supported DEXes
 
-| DEX | Coverage |
-|-----|----------|
-| Raydium V4 | Direct swaps + CPI |
-| Raydium CLMM | Direct swaps + CPI |
-| Raydium CPMM | Direct swaps + CPI |
-| Orca Whirlpool | Direct swaps + CPI |
-| Jupiter V6 | Route-through (resolves underlying pool) |
-| Meteora DLMM | Direct swaps + CPI |
-| Pump.fun | Direct swaps + CPI |
-| Phoenix | Direct swaps + CPI |
+| DEX | Swap-event parsing | AMM replay (victim-loss) |
+|-----|--------------------|---------------------------|
+| Raydium V4 | Direct swaps + CPI | ✅ Constant product |
+| Raydium CPMM | Direct swaps + CPI | ✅ Constant product |
+| Raydium CLMM | Direct swaps + CPI | — |
+| Orca Whirlpool | Direct swaps + CPI | ✅ Concentrated, within-tick + cross-tick |
+| Meteora DLMM | Direct swaps + CPI | ✅ Constant-sum, within-bin + cross-bin |
+| Jupiter V6 | Route-through (resolves underlying pool) | (via underlying pool) |
+| Pump.fun | Direct swaps + CPI | — |
+| Phoenix | Direct swaps + CPI | — |
 
-> Adding a new DEX takes ~50 lines. See [Contributing](#contributing).
+> Adding a new DEX takes ~50 lines for swap parsing; replay support adds another module. See [Contributing](#contributing).
 
 ---
 
 ## Quick Start
 
-The repo ships with `sandwich-detect`, a thin streaming CLI that wraps the library -- useful for smoke-testing, ad-hoc analysis, and piping detections into other tools. For embedding in your own service, [use the library directly](#use-as-a-library).
+The repo ships with `sandwich-detect`, a streaming CLI that wraps the library — useful for smoke-testing, ad-hoc analysis, and piping detections into other tools (Vigil, `jq`, a database, your own dashboard). For embedding in your own service, [use the library directly](#use-as-a-library).
 
 ```bash
 # Build
@@ -65,33 +72,21 @@ Each detected sandwich prints as a JSON line to stdout:
 {
   "slot": 285012345,
   "attacker": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
-  "frontrun": {
-    "signature": "4vJ9JU1b...",
-    "dex": "raydium_v4",
-    "direction": "buy",
-    "amount_in": 5000000000,
-    "amount_out": 128934512
-  },
-  "victim": {
-    "signature": "3kPnR8xz...",
-    "dex": "raydium_v4",
-    "direction": "buy",
-    "amount_in": 2000000000,
-    "amount_out": 48201100
-  },
-  "backrun": {
-    "signature": "5tYm2Wqp...",
-    "dex": "raydium_v4",
-    "direction": "sell",
-    "amount_in": 128934512,
-    "amount_out": 5127300000
-  },
+  "frontrun": { "signature": "4vJ9JU1b...", "dex": "raydium_v4", "direction": "buy",  "amount_in": 5000000000, "amount_out": 128934512 },
+  "victim":   { "signature": "3kPnR8xz...", "dex": "raydium_v4", "direction": "buy",  "amount_in": 2000000000, "amount_out":  48201100 },
+  "backrun":  { "signature": "5tYm2Wqp...", "dex": "raydium_v4", "direction": "sell", "amount_in":  128934512, "amount_out": 5127300000 },
   "pool": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
-  "dex": "raydium_v4"
+  "dex": "raydium_v4",
+  "victim_loss_lamports": 8423100,
+  "attacker_profit": 6210400,
+  "price_impact_bps": 142,
+  "severity": "medium",
+  "confidence": 0.86,
+  "confidence_level": "high"
 }
 ```
 
-Pipe it anywhere -- `jq`, a database, an alert system, your own dashboard.
+Pipe it anywhere — `jq`, a database, an alert system, your own dashboard.
 
 ### More examples
 
@@ -108,9 +103,8 @@ sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4
 # Pretty-print for humans
 sandwich-detect --rpc $RPC_URL --follow --format pretty
 
-# Scan a range and print an aggregate economics summary at the end
-# (enrichment is on by default; pass --no-enrich to disable, --summary to
-# emit the aggregate to stderr)
+# Scan a range and emit an aggregate economics summary at the end
+# (enrichment is on by default; pass --no-enrich to disable)
 sandwich-detect --rpc $RPC_URL --range 285012000-285012100 --window 4 --summary
 ```
 
@@ -146,9 +140,9 @@ Slot N+2:  attacker SELLS in pool P  (backrun -- opposite direction)
 
 The cross-slot detector (`FilteredWindowDetector`) maintains a per-pool sliding window of W slots and applies three precision filters:
 
-1. **Bundle provenance** -- Checks Jito bundle co-location (AtomicBundle > SpanningBundle > TipRace > Organic)
-2. **Economic feasibility** -- `backrun.amount_out - frontrun.amount_in > tx fees`
-3. **Victim plausibility** -- Size ratio check + known-attacker exclusion
+1. **Bundle provenance** — Jito bundle co-location (AtomicBundle > SpanningBundle > TipRace > Organic)
+2. **Economic feasibility** — `backrun.amount_out - frontrun.amount_in > tx fees`
+3. **Victim plausibility** — Size ratio check + known-attacker exclusion
 
 Each detection gets a composite **confidence score** (0.0-1.0) weighted across these filters.
 
@@ -163,30 +157,81 @@ Each detection gets a composite **confidence score** (0.0-1.0) weighted across t
 | Same pool | Price impact is local to the pool |
 | Same slot (same-block) or within W slots (window) | Temporal proximity |
 
-The detector uses a **hybrid parsing approach**: instruction discriminators identify the DEX program and pool address, while pre/post token balance changes determine swap direction and amounts. This is more robust than pure instruction decoding since it works even when instruction formats change.
+The detector uses a **hybrid parsing approach**: instruction discriminators identify the DEX program and pool address, while pre/post token balance changes determine swap direction and amounts. More robust than pure instruction decoding since it works even when instruction formats change.
 
 ### Victim loss measurement (AMM replay)
 
-Rule-based detection answers *"was this a sandwich?"* but not *"how much did the victim lose?"* — the naive `backrun.amount_out - frontrun.amount_in` heuristic breaks for multi-token pairs and doesn't account for price-impact dynamics. The `pool-state` crate fixes both by replaying each swap through the AMM's math:
+Rule-based detection answers *"was this a sandwich?"* but not *"how much did the victim lose?"* — the naive `backrun.amount_out - frontrun.amount_in` heuristic breaks for multi-token pairs and ignores price-impact dynamics. The `pool-state` crate fixes both by replaying each swap through the AMM's own math:
 
 ```
 state_0  = pool reserves just before the frontrun  (from tx meta)
-state_1  = state_0 after frontrun
-state_2  = state_1 after victim
-victim_actual_out   = what the victim received (via state_1)
-victim_expected_out = what they would have received without the frontrun (via state_0)
-victim_loss         = victim_expected_out - victim_actual_out
+state_1  = state_0 after frontrun                  (replay)
+state_2  = state_1 after victim                    (replay, "actual")
+state_2c = state_0 after victim, no frontrun       (replay, "counterfactual")
+victim_loss = victim_out(state_2c) - victim_out(state_2)
 ```
 
-Reserves at each step come from the transaction's own `pre_token_balances` / `post_token_balances` — no historical RPC needed. Pool config (vault addresses, fee rate) is fetched once per pool via `getAccountInfo` and cached. Currently supported: **Raydium V4** and **Raydium CPMM** (constant-product). CLMM/Whirlpool tick math is a follow-up.
+Reserves at each step come from the transaction's own `pre_token_balances` / `post_token_balances` — no historical RPC needed for constant-product pools. Concentrated-liquidity AMMs (Whirlpool, DLMM) need the dynamic `sqrt_price` / `liquidity` / `active_id` snapshot, fetched via `getAccountInfo` on the pool account; the `AccountFetcher` trait lets you plug in archival providers for backfill.
 
 When enrichment succeeds, each `SandwichAttack` gets:
 
-- `victim_loss_lamports` — AMM-correct, in the quote token's smallest unit (Vigil ERD `mev_attack.victim_loss_lamports`)
-- `attacker_profit` — counterfactual attacker gross profit (Vigil ERD `mev_attack.attacker_profit`); differs from the naive `estimated_attacker_profit` when rule-based logic over-attributes
+- `victim_loss_lamports` — AMM-correct, in the quote token's smallest unit
+- `victim_loss_lamports_lower` / `_upper` — confidence interval derived from per-step parser-vs-model residuals
+- `attacker_profit` — counterfactual attacker gross profit (differs from `estimated_attacker_profit` when rule-based logic over-attributes)
 - `price_impact_bps` — frontrun-induced price shift in basis points
+- `severity` — bucket from the loss-to-pool-TVL ratio
+- Per-DEX trace: `amm_replay` (constant product), `whirlpool_replay` (Whirlpool), `dlmm_replay` (DLMM) — lets a downstream consumer recompute the loss from raw arithmetic
 
 Attacks on unsupported DEXes pass through with these fields set to `None`.
+
+---
+
+## Vigil Integration
+
+This repo is the upstream detection primitive for [Vigil](https://github.com/EarthIsMine/Vigil-RPC). The contract surface is stable enough for Vigil's BE/FE to ship today; the four pieces below are what a downstream consumer wires against.
+
+### 1. JSONL stream contract
+
+`sandwich-detect` emits three line shapes on stdout, all newline-delimited JSON. A consumer dispatches on a discriminator:
+
+```jsonc
+// Header — emitted once at startup.
+{ "_header": true, "schema_version": "vigil-v1", "tool_version": "0.x.y", "started_at_ms": 1730000000000 }
+
+// Heartbeat — every 30s while running. Includes enrichment metric snapshot.
+{ "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
+    "enriched": 142, "unsupported_dex": 18, "config_unavailable": 3,
+    "reserves_missing": 1, "replay_failed": 0, "cross_tick_unsupported": 4 } }
+
+// SandwichAttack — one per detection. Full schema in vigil-v1.json.
+{ "slot": 285012345, "attacker": "...", "frontrun": {...}, "victim": {...}, ... }
+```
+
+### 2. Schema + TypeScript types
+
+| File | Purpose |
+|------|---------|
+| `crates/swap-events/schema/vigil-v1.json` | Canonical JSON Schema for `SandwichAttack`. Generated by `cargo run -p swap-events --bin gen-schema`. |
+| `contrib/vigil-types.ts` | Hand-tuned TS interfaces matching the schema. Includes `parseDetectorLine()` discriminator + BigInt guidance for u128 fields (sqrt_price, liquidity, bin_price). |
+| `swap_events::SCHEMA_VERSION` | Rust constant `"vigil-v1"`. Bumped on breaking schema changes. |
+
+### 3. BE-friendly Rust helpers
+
+```rust
+// One-shot conversion: SandwichAttack → MevReceipt (per-victim row for Vigil's `mev_receipt` table).
+let receipt = MevReceipt::from_attack(&attack);
+
+// Idempotent: derives Vigil-shaped fields (attack_signature, attack_type, confidence_level,
+// victim_signer/amount_*, receipts vec) from raw detector output. Caller can pre-set any
+// field to override; finalize() preserves what's already non-None.
+attack.finalize_for_vigil();
+```
+
+`finalize_for_vigil()` intentionally **does not set `severity`** — that needs pool-TVL context the BE holds. Same for USD pricing on receipts. Other Vigil columns (slot leader, validator identity) are populated by Tier 2 enrichment when configured.
+
+### 4. NestJS consumer example
+
+`contrib/vigil-service.example.ts` ships a complete NestJS service: spawns `sandwich-detect --follow`, reads stdout via readline, dispatches header/heartbeat/attack lines, handles graceful restart, and stubs out DB writes / WebSocket broadcasts. Drop-in starting point.
 
 ---
 
@@ -226,7 +271,7 @@ let mut detector = FilteredWindowDetector::new(4); // 4-slot window
 for (slot, swaps) in blocks_stream {
     let attacks = detector.ingest_slot(slot, swaps);
     for attack in &attacks {
-        println!("Sandwich detected: confidence={:.2}", attack.confidence.unwrap_or(0.0));
+        println!("Sandwich: confidence={:.2}", attack.confidence.unwrap_or(0.0));
     }
 }
 
@@ -239,13 +284,16 @@ let remaining = detector.flush();
 | Type | Description |
 |------|-------------|
 | `SwapEvent` | A single parsed swap (signer, pool, direction, amounts) |
-| `SandwichAttack` | A detected sandwich (frontrun + victim + backrun + confidence) |
-| `BlockSource` | Trait -- plug in your own block fetcher (RPC, gRPC, WebSocket) |
-| `DexParser` | Trait -- add support for any DEX in ~50 lines |
-| `WindowDetector` | Trait -- cross-slot detection with sliding window |
+| `SandwichAttack` | A detected sandwich (frontrun + victim + backrun + confidence + replay) |
+| `BlockSource` | Trait — plug in your own block fetcher (RPC, gRPC, WebSocket) |
+| `DexParser` | Trait — add support for any DEX in ~50 lines |
+| `WindowDetector` | Trait — cross-slot detection with sliding window |
 | `FilteredWindowDetector` | Production detector with 3 precision filters + confidence scoring |
 | `FilterConfig` | Configurable thresholds (min profit, victim ratio, confidence) |
-| `BundleLookup` | Trait -- inject Jito bundle data for provenance classification |
+| `BundleLookup` | Trait — inject Jito bundle data for provenance classification |
+| `PoolStateLookup` | Trait — config + dynamic state + tick/bin array fetches for AMM replay |
+| `AccountFetcher` | Trait — slot-aware account fetch surface for archival providers |
+| `MevReceipt` | Per-victim row shape for downstream persistence |
 
 ---
 
@@ -254,19 +302,25 @@ let remaining = detector.flush();
 ```
 crates/
   swap-events/           Swap event types, DEX parsers, block sources
+                         + JSON schema (vigil-v1.json) + gen-schema bin
   detector-sameblock/    Same-block sandwich detection
   detector-window/       Cross-slot window detector + precision filters
-  pool-state/            AMM math + pool-state enrichment (victim loss, real profit)
+  pool-state/            AMM math + pool-state enrichment + archival diff
+                         (constant product / Whirlpool / DLMM)
   detector/              Facade crate (re-exports for backward compatibility)
-  cli/                   CLI binary (sandwich-detect)
+  cli/                   CLI binaries (sandwich-detect, archival-diff)
   eval/                  Evaluation framework + economic aggregates
+
+contrib/
+  vigil-types.ts         TS interfaces matching vigil-v1.json
+  vigil-service.example.ts  NestJS consumer driver
 ```
 
 ---
 
 ## Scope
 
-This library covers **detection over a stream of blocks** -- both same-block and cross-slot patterns. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/EarthIsMine/Vigil-RPC) instead.
+This library covers **detection over a stream of blocks** — both same-block and cross-slot patterns, plus AMM-correct victim-loss replay. Anything stateful, opinionated, or product-shaped is out of scope and lives in [Vigil](https://github.com/EarthIsMine/Vigil-RPC) instead.
 
 **In scope** (PRs welcome):
 
@@ -276,11 +330,11 @@ This library covers **detection over a stream of blocks** -- both same-block and
 - Confidence scoring and filter tuning
 - Jito bundle integration improvements
 - Eval framework improvements (metrics, labeling tools)
-- Pool-state coverage for more AMMs (Orca Whirlpool CLMM, Raydium CLMM, Meteora DLMM)
+- Pool-state coverage for more AMMs (Raydium CLMM, Lifinity, ...)
 - Mainnet test fixtures
 - Performance: allocation reduction, parallelism, batching
 - API ergonomics, documentation, examples
-- CLI flags that stay within "stream in -> stream out"
+- CLI flags that stay within "stream in → stream out"
 
 **Out of scope** (these belong in a downstream consumer like Vigil):
 
@@ -302,11 +356,12 @@ The rule of thumb: **"compute over a stream"** stays here, **"state, output, pre
 
 PRs welcome. Here's where help is most valuable:
 
-- **Add a DEX parser** -- implement `DexParser` for a new protocol (Lifinity, Marinade, Sanctum, ...)
-- **Add test fixtures** -- capture mainnet blocks with confirmed sandwiches under `fixtures/`
-- **Improve detection** -- edge cases, cross-slot accuracy, confidence tuning
-- **Eval framework** -- add labeled datasets, improve metrics, new evaluation modes
-- **Add block sources** -- gRPC (Yellowstone), WebSocket subscriptions
+- **Add a DEX parser** — implement `DexParser` for a new protocol (Lifinity, Marinade, Sanctum, ...)
+- **Add test fixtures** — capture mainnet blocks with confirmed sandwiches under `fixtures/`
+- **Improve detection** — edge cases, cross-slot accuracy, confidence tuning
+- **Eval framework** — add labeled datasets, improve metrics, new evaluation modes
+- **Add block sources** — gRPC (Yellowstone), WebSocket subscriptions
+- **Pool-state coverage** — add a new AMM's replay (Raydium CLMM next on the list)
 
 ```bash
 # Run tests
@@ -314,6 +369,9 @@ cargo test --workspace
 
 # Check everything compiles
 cargo check --workspace
+
+# Regenerate the Vigil schema (run before committing schema changes)
+cargo run -p swap-events --bin gen-schema > crates/swap-events/schema/vigil-v1.json
 ```
 
 ---
@@ -337,7 +395,7 @@ sandwich-eval summarize --input detections.jsonl > report.txt
 sandwich-eval summarize --input detections.jsonl --json > report.json
 ```
 
-For short runs the scanner can also emit the report itself by passing `--summary`; the aggregation is done in-memory, which is fine up to a few hundred MB of detections but not for multi-day scans.
+For short runs the scanner can also emit the report itself by passing `--summary`; the aggregation runs in-memory, fine up to a few hundred MB of detections but not for multi-day scans.
 
 The summary includes total victim loss (quote-token smallest unit), unique attackers/victims/pools, per-DEX breakdown, top attackers by extracted value, and a *reclassification rate* — the share of sandwiches the naive rule-based profit flags as profitable but AMM replay shows to be losing money. That reclassification is the signal that makes pool-state enrichment worth running.
 
