@@ -301,6 +301,7 @@ pub fn detect_authority_hop_sandwiches(
                         evidence: Some(evidence),
                         amm_replay: None,
                         whirlpool_replay: None,
+                        dlmm_replay: None,
                         attack_signature: None,
                         timestamp_ms: None,
                         // Left None so finalize_for_vigil reads the

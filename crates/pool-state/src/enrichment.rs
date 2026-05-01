@@ -22,8 +22,8 @@ use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
 use crate::{
-    compute_loss_dlmm, compute_loss_whirlpool_with_trace, compute_loss_with_trace, diff_test,
-    reserves, ConstantProduct, PoolStateLookup,
+    compute_loss_dlmm_with_trace, compute_loss_whirlpool_with_trace, compute_loss_with_trace,
+    diff_test, reserves, ConstantProduct, PoolStateLookup,
 };
 
 /// Outcome of an enrichment attempt. Signals *why* it failed so callers can
@@ -74,11 +74,13 @@ pub async fn enrich_attack(
 
     // Dispatch by AMM kind. Each path produces (loss,
     // amm_replay_trace_opt, whirlpool_replay_trace_opt,
-    // pool_quote_tvl). The two trace options are mutually exclusive —
-    // ConstantProduct fills `amm_replay_trace_opt`, Whirlpool fills
-    // `whirlpool_replay_trace_opt`. Common attack-field / signal
-    // wiring runs after the match.
-    let (loss, trace_opt, whirlpool_trace_opt, pool_quote_tvl) = match config.kind {
+    // dlmm_replay_trace_opt, pool_quote_tvl). The three trace options
+    // are mutually exclusive: ConstantProduct fills
+    // `amm_replay_trace_opt`, Whirlpool fills
+    // `whirlpool_replay_trace_opt`, DLMM fills
+    // `dlmm_replay_trace_opt`. Common attack-field / signal wiring
+    // runs after the match.
+    let (loss, trace_opt, whirlpool_trace_opt, dlmm_trace_opt, pool_quote_tvl) = match config.kind {
         AmmKind::RaydiumV4 | AmmKind::RaydiumCpmm => {
             let Some(tx_reserves) = reserves::extract(frontrun_tx, &config) else {
                 let accounts: Vec<&str> = frontrun_tx
@@ -104,7 +106,7 @@ pub async fn enrich_attack(
             let Some((loss, trace)) = compute_loss_with_trace(attack, pool_0) else {
                 return EnrichmentResult::ReplayFailed;
             };
-            (loss, Some(trace), None, tx_reserves.pre.1)
+            (loss, Some(trace), None, None, tx_reserves.pre.1)
         }
         AmmKind::OrcaWhirlpool => {
             // Within-tick Whirlpool replay (Tier 3.4 step 4-α). Needs
@@ -182,7 +184,7 @@ pub async fn enrich_attack(
             let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
                 .map(|r| r.pre.1)
                 .unwrap_or(0);
-            (loss, None, Some(whirlpool_trace), pool_quote_tvl)
+            (loss, None, Some(whirlpool_trace), None, pool_quote_tvl)
         }
         AmmKind::MeteoraDlmm => {
             // Phase 1 within-bin DLMM replay. Fetch dynamic state
@@ -237,7 +239,8 @@ pub async fn enrich_attack(
             // sooner if a leg walks into the gap.
             let arrays: Vec<ParsedBinArray> = arrays_raw.into_iter().flatten().collect();
 
-            let Some(loss) = compute_loss_dlmm(attack, &dlmm_pool, &arrays, config.base_is_token_a)
+            let Some((loss, dlmm_trace)) =
+                compute_loss_dlmm_with_trace(attack, &dlmm_pool, &arrays, config.base_is_token_a)
             else {
                 // None ⇒ cross-bin walked off the window, iteration
                 // cap fired, or direction-mismatch invariant violation.
@@ -252,9 +255,7 @@ pub async fn enrich_attack(
             let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
                 .map(|r| r.pre.1)
                 .unwrap_or(0);
-            // No DLMM-specific replay trace yet; step 5 lands that
-            // alongside vigil-v1 schema bumps.
-            (loss, None, None, pool_quote_tvl)
+            (loss, None, None, Some(dlmm_trace), pool_quote_tvl)
         }
     };
 
@@ -353,6 +354,9 @@ pub async fn enrich_attack(
     }
     if let Some(whirlpool_trace) = whirlpool_trace_opt {
         attack.whirlpool_replay = Some(whirlpool_trace);
+    }
+    if let Some(dlmm_trace) = dlmm_trace_opt {
+        attack.dlmm_replay = Some(dlmm_trace);
     }
 
     EnrichmentResult::Enriched
@@ -468,6 +472,7 @@ mod tests {
             evidence: None,
             amm_replay: None,
             whirlpool_replay: None,
+            dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,

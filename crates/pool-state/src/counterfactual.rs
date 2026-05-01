@@ -14,7 +14,9 @@
 //! All values are in the quote-token smallest unit (typically lamports for
 //! SOL-quoted pools, or USDC micro-units for USDC-quoted pools).
 
-use swap_events::types::{AmmReplayTrace, SandwichAttack, SwapDirection, WhirlpoolReplayTrace};
+use swap_events::types::{
+    AmmReplayTrace, MeteoraDlmmReplayTrace, SandwichAttack, SwapDirection, WhirlpoolReplayTrace,
+};
 
 use crate::meteora_dlmm::bin_array::ParsedBinArray;
 use crate::meteora_dlmm::{cross_bin_swap, DlmmBinState, DlmmPool};
@@ -555,6 +557,24 @@ pub fn compute_loss_dlmm(
     arrays: &[ParsedBinArray],
     base_is_token_a: bool,
 ) -> Option<LossEstimate> {
+    compute_loss_dlmm_with_trace(attack, pool, arrays, base_is_token_a).map(|(loss, _trace)| loss)
+}
+
+/// Like [`compute_loss_dlmm`] but also returns a
+/// [`MeteoraDlmmReplayTrace`] suitable for surfacing on
+/// `SandwichAttack.dlmm_replay`. The trace lets a reader recompute
+/// victim loss themselves from the per-step `active_id` transitions,
+/// the pre-frontrun bin price (Q64.64), and the fee parameters.
+///
+/// Same `None` conditions as [`compute_loss_dlmm`]: direction mismatch,
+/// any leg's `cross_bin_swap` failing, empty arrays, or the active
+/// bin missing from the supplied window.
+pub fn compute_loss_dlmm_with_trace(
+    attack: &SandwichAttack,
+    pool: &DlmmPool,
+    arrays: &[ParsedBinArray],
+    base_is_token_a: bool,
+) -> Option<(LossEstimate, MeteoraDlmmReplayTrace)> {
     if attack.victim.direction != attack.frontrun.direction {
         return None;
     }
@@ -692,7 +712,7 @@ pub fn compute_loss_dlmm(
         _ => (None, None),
     };
 
-    Some(LossEstimate {
+    let loss = LossEstimate {
         victim_loss,
         attacker_profit_real,
         price_impact_bps,
@@ -704,7 +724,27 @@ pub fn compute_loss_dlmm(
         counterfactual_attacker_profit_no_victim,
         victim_loss_lower,
         victim_loss_upper,
-    })
+    };
+
+    let trace = MeteoraDlmmReplayTrace {
+        active_id_pre: initial_active_id,
+        active_id_post_front: active_after_front,
+        active_id_post_victim: v.final_active_id,
+        active_id_post_back: b.final_active_id,
+        bin_price_pre: bin_price_q64,
+        counterfactual_victim_out,
+        actual_victim_out,
+        bin_step: pool.bin_step,
+        // Caller-friendly numerator/denominator. Phase 1 step 4
+        // restructured fee math so `total_fee_rate / DLMM_FEE_PRECISION`
+        // is the canonical fraction; surface that here so a reader
+        // doesn't have to derive `base_factor * bin_step * 10` from
+        // `bin_step` alone.
+        fee_num: pool.total_fee_rate().unwrap_or(0) as u64,
+        fee_den: crate::meteora_dlmm::DLMM_FEE_PRECISION,
+    };
+
+    Some((loss, trace))
 }
 
 /// Q64.64 fixed-point → `f64`. Same precision-tradeoff rationale as
@@ -765,6 +805,7 @@ mod tests {
             evidence: None,
             amm_replay: None,
             whirlpool_replay: None,
+            dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
             attack_type: None,

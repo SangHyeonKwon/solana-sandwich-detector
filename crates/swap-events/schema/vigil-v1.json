@@ -197,6 +197,17 @@
         }
       ]
     },
+    "dlmm_replay": {
+      "description": "Meteora DLMM-specific replay trace — populated only when `dex` is `MeteoraDlmm` and Phase 2 cross-bin replay ran successfully. Tracks `active_id` transitions instead of Whirlpool's sqrt_price/liquidity/tick triple, since DLMM's discrete-bin model captures a leg's effect entirely in which bin became active. Distinct field rather than a `whirlpool_replay` enum variant for the same backward-compat reason.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MeteoraDlmmReplayTrace"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "attack_signature": {
       "description": "Canonical attack signature mirrored to Vigil's `mev_attack.signature`. Today set to the victim tx signature so per-victim receipts can FK by `attack_signature`. `None` on records emitted before this field existed.",
       "type": [
@@ -1098,6 +1109,77 @@
         "fee_den": {
           "type": "integer",
           "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "MeteoraDlmmReplayTrace": {
+      "description": "Per-step DLMM (Meteora Liquidity Book) replay trace surfaced on `SandwichAttack.dlmm_replay`. Mirrors [`WhirlpoolReplayTrace`] in shape but tracks `active_id` transitions instead of sqrt_price / liquidity / tick — DLMM's discrete-bin model means a leg's effect is fully captured by which bin became active.\n\n`bin_price_pre` is Q64.64; serialised as a base-10 decimal string per the same JS-BigInt rationale that drove [`WhirlpoolReplayTrace`]. `active_id` fits in i32 (per the on-chain `MIN_BIN_ID` / `MAX_BIN_ID = ±443_636` cap), safe in JSON.",
+      "type": "object",
+      "required": [
+        "active_id_post_back",
+        "active_id_post_front",
+        "active_id_post_victim",
+        "active_id_pre",
+        "actual_victim_out",
+        "bin_price_pre",
+        "bin_step",
+        "counterfactual_victim_out",
+        "fee_den",
+        "fee_num"
+      ],
+      "properties": {
+        "active_id_pre": {
+          "description": "Active bin id immediately before the frontrun executed.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "active_id_post_front": {
+          "description": "Active bin id after the frontrun, before the victim.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "active_id_post_victim": {
+          "description": "Active bin id after the victim, before the backrun.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "active_id_post_back": {
+          "description": "Active bin id after the backrun (end of the triplet).",
+          "type": "integer",
+          "format": "int32"
+        },
+        "bin_price_pre": {
+          "description": "Q64.64 spot price at the pre-frontrun moment (the active bin's price). DLMM bin prices are static per bin (set at pool creation via the `bin_step` formula), so this is the canonical pre-frontrun spot.",
+          "type": "string"
+        },
+        "counterfactual_victim_out": {
+          "description": "What the victim would have received without the frontrun.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "actual_victim_out": {
+          "description": "What the victim actually received.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "bin_step": {
+          "description": "Bin step in basis points (`25 = 0.25%`). Static per pool; surfaced here so a reader can derive any bin's price from `bin_id` without re-deriving the pool config.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "fee_num": {
+          "description": "LP fee fraction. DLMM uses `fee_num / 1_000_000_000` units (`base_factor * bin_step * 10 * 10^bf_power`), capped at 10%.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "fee_den": {
+          "type": "integer",
+          "format": "uint64",
           "minimum": 0.0
         }
       }
