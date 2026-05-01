@@ -176,6 +176,7 @@ fn make_attack(
         price_impact_bps: None,
         evidence: None,
         amm_replay: None,
+        whirlpool_replay: None,
         attack_signature: None,
         timestamp_ms: None,
         attack_type: None,
