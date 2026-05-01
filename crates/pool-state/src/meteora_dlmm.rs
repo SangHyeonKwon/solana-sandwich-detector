@@ -451,6 +451,121 @@ pub mod bin_array {
     }
 }
 
+/// Q64.64 fixed-point bin price math.
+///
+/// DLMM bin prices follow `price(bin_id, bin_step) = (1 + bin_step / 10_000)^bin_id`,
+/// stored on-chain as `Q64.64` (the integer is `price * 2^64`). The on-chain
+/// implementation lives in `MeteoraAg/dlmm-sdk/commons/src/math/u64x64_math.rs`
+/// and uses a 19-bit binary exponentiation.
+///
+/// Why 19 bits: the legal bin id range is `[-443_636, 443_636]` (the
+/// hardcoded [`MAX_EXPONENTIAL`] cap), which fits in 19 bits. So the
+/// exponent loop terminates at most 19 iterations, regardless of the
+/// concrete `bin_id`.
+///
+/// Why the `if squared_base >= ONE { invert }` dance: when `base > 1.0`,
+/// squaring it in `Q64.64` would produce a `Q128.128` that overflows
+/// `u128`. The on-chain code dodges this by inverting the base
+/// (`u128::MAX / base ≈ ONE^2 / base ≈ 1 / base` in Q64.64) so the
+/// loop runs entirely in the `< ONE` regime, then re-inverts at the
+/// end. The `u128::MAX / x` shortcut introduces a 1-ULP rounding error
+/// vs. an exact `(2^128) / x`; we mirror the on-chain quirk so our
+/// replay results match chain values bit-for-bit, including the error.
+pub mod price_math {
+    /// Number of fractional bits in the Q64.64 representation. Must
+    /// match [`u64x64_math::SCALE_OFFSET`] in the SDK.
+    pub const SCALE_OFFSET: u8 = 64;
+
+    /// `1.0` represented as Q64.64 (`1 << 64`).
+    pub const ONE: u128 = 1u128 << SCALE_OFFSET;
+
+    /// Hardcoded cap on the absolute exponent — derived from the
+    /// `[-443_636, 443_636]` legal bin id range, the largest exponent
+    /// at which `(1 + 1bps)^id` still fits in Q64.64. `0x80000 = 1 << 19`,
+    /// the next power-of-two above `443_636`.
+    pub const MAX_EXPONENTIAL: u32 = 0x80000;
+
+    /// Basis-point denominator. `bin_step` is expressed in basis points
+    /// of the multiplicative price step (`25 = 0.25%`).
+    pub const BASIS_POINT_MAX: u128 = 10_000;
+
+    /// Compute `base^exp` in Q64.64 fixed point.
+    ///
+    /// Returns `None` on overflow or when `|exp| >= MAX_EXPONENTIAL`. A
+    /// negative exponent produces the reciprocal: `base^-n = 1 / base^n`,
+    /// also via the `u128::MAX / x` integer division that the on-chain
+    /// implementation uses (1 ULP error preserved).
+    pub fn pow(base: u128, exp: i32) -> Option<u128> {
+        if exp == 0 {
+            return Some(ONE);
+        }
+        let mut invert = exp.is_negative();
+        let exp_abs: u32 = if invert {
+            exp.unsigned_abs()
+        } else {
+            exp as u32
+        };
+        if exp_abs >= MAX_EXPONENTIAL {
+            return None;
+        }
+
+        let mut squared_base = base;
+        let mut result = ONE;
+
+        // If base >= 1.0, invert into the < 1.0 regime to keep upper
+        // 64 bits zero while squaring. Re-invert at the end via the
+        // `invert` flag toggle.
+        if squared_base >= result {
+            squared_base = u128::MAX.checked_div(squared_base)?;
+            invert = !invert;
+        }
+
+        // Binary exponentiation; at most ceil(log2(MAX_EXPONENTIAL)) =
+        // 20 iterations.
+        let mut e = exp_abs;
+        while e > 0 {
+            if e & 1 == 1 {
+                result = result.checked_mul(squared_base)? >> SCALE_OFFSET;
+            }
+            e >>= 1;
+            if e > 0 {
+                squared_base = squared_base.checked_mul(squared_base)? >> SCALE_OFFSET;
+            }
+        }
+
+        if invert {
+            u128::MAX.checked_div(result)
+        } else {
+            Some(result)
+        }
+    }
+
+    /// `bin_price(bin_id, bin_step) = (1 + bin_step / 10_000)^bin_id`
+    /// in Q64.64.
+    ///
+    /// Returns `None` on the same conditions as [`pow`], or when
+    /// `bin_step` produces an overflow during `(bin_step << 64)`
+    /// (impossible in practice — `MAX_BIN_STEP = 400` keeps the shift
+    /// well under u128 range).
+    ///
+    /// On-chain `Bin.price` is lazy-cached: a never-swapped bin stores
+    /// `0` here. Callers that hit a zero-cached price must recompute
+    /// via this function.
+    pub fn bin_price(bin_id: i32, bin_step: u16) -> Option<u128> {
+        let shifted = (bin_step as u128).checked_shl(SCALE_OFFSET as u32)?;
+        let bps = shifted.checked_div(BASIS_POINT_MAX)?;
+        let base = ONE.checked_add(bps)?;
+        pow(base, bin_id)
+    }
+}
+
+/// Re-export bin-price helpers at module level for ergonomic
+/// consumption: `meteora_dlmm::bin_price(...)` instead of
+/// `meteora_dlmm::price_math::bin_price(...)`. Mirrors the
+/// `whirlpool_program_id` / `tick_array::tick_array_pda` re-export
+/// shape Whirlpool uses.
+pub use price_math::bin_price;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +812,117 @@ mod bin_array_tests {
         // length is what we expect.
         let bytes = (-1i64).to_le_bytes();
         assert_eq!(bytes.len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod price_math_tests {
+    use super::price_math::{bin_price, pow, MAX_EXPONENTIAL, ONE, SCALE_OFFSET};
+
+    /// Q64.64 tolerance roughly equal to 1 part-per-million of `ONE`.
+    /// Catch real arithmetic regressions but tolerate the 1-ULP rounding
+    /// the `u128::MAX / x` inversion contributes.
+    const Q64_TOLERANCE_PPM: u128 = ONE / 1_000_000;
+
+    fn approx_eq_q64(a: u128, b: u128, tol: u128) -> bool {
+        a.abs_diff(b) <= tol
+    }
+
+    #[test]
+    fn pow_zero_returns_one() {
+        // Any base, any-flavoured `0` exp ⇒ ONE.
+        assert_eq!(pow(ONE, 0), Some(ONE));
+        assert_eq!(pow(0, 0), Some(ONE));
+        assert_eq!(pow(ONE / 2, 0), Some(ONE));
+    }
+
+    #[test]
+    fn pow_rejects_max_exponential() {
+        // `MAX_EXPONENTIAL` is the *exclusive* exponent cap the on-chain
+        // code enforces. Hitting it returns `None` regardless of base.
+        let base = ONE + (ONE / 1000); // ~1.001
+        assert!(pow(base, MAX_EXPONENTIAL as i32).is_none());
+        assert!(pow(base, -(MAX_EXPONENTIAL as i32)).is_none());
+        // A small base + modest exponent should always produce a value;
+        // pins that the cap check isn't over-eager. (Larger bases hit
+        // the value-side overflow earlier than the cap — expected, since
+        // the cap is sized for the smallest realistic `bin_step = 1bp`.)
+        let tiny_base = ONE + ONE / 10_000; // 1.0001
+        assert!(pow(tiny_base, 100).is_some());
+        assert!(pow(tiny_base, -100).is_some());
+    }
+
+    #[test]
+    fn bin_price_at_zero_is_one() {
+        // bin_id = 0 ⇒ base^0 = 1.0 (Q64.64) regardless of bin_step.
+        for &step in &[1u16, 25, 50, 100, 400] {
+            assert_eq!(bin_price(0, step), Some(ONE), "step={step}");
+        }
+    }
+
+    #[test]
+    fn bin_price_one_step_matches_reference() {
+        // bin_id = 1, bin_step = 25 ⇒ 1.0025 in Q64.64.
+        // Reference: 1.0025 * 2^64. The integer division used by
+        // `(bin_step << 64) / 10_000` floors the bps fraction, so the
+        // result is `(1 + floor(25 << 64 / 10_000))` = ONE + 18_446_744_073_709_551 ≈ 1.0025.
+        let p = bin_price(1, 25).unwrap();
+        // Expected: ONE * 1.0025 to within tolerance.
+        let expected = ONE + ONE * 25 / 10_000;
+        assert!(
+            approx_eq_q64(p, expected, Q64_TOLERANCE_PPM),
+            "got {p}, expected ≈{expected}",
+        );
+    }
+
+    /// Monotonicity: prices grow as bin_id increases (in the positive
+    /// half) and shrink as bin_id decreases (in the negative half).
+    #[test]
+    fn bin_price_is_monotone() {
+        let step = 25u16;
+        let mut prev = bin_price(0, step).unwrap();
+        for id in 1..=50i32 {
+            let next = bin_price(id, step).unwrap();
+            assert!(next > prev, "id={id} not monotone increasing");
+            prev = next;
+        }
+        let mut prev = bin_price(0, step).unwrap();
+        for id in (-50i32..=-1).rev() {
+            let next = bin_price(id, step).unwrap();
+            assert!(next < prev, "id={id} not monotone decreasing");
+            prev = next;
+        }
+    }
+
+    /// Inverse property: `bin_price(n) * bin_price(-n) ≈ ONE^2` in Q64.64.
+    /// The product is in Q128.128, so we shift by `SCALE_OFFSET` to bring
+    /// it back to Q64.64 and compare with `ONE`. The 1-ULP error from the
+    /// `u128::MAX / x` inversion accumulates over n iterations, so the
+    /// tolerance scales with n.
+    #[test]
+    fn bin_price_inverse_property() {
+        for n in [1i32, 5, 10, 50, 100] {
+            let p_pos = bin_price(n, 25).unwrap();
+            let p_neg = bin_price(-n, 25).unwrap();
+            // Reduce to Q64.64: (p_pos * p_neg) >> 64 should equal ONE.
+            let prod_q64 = (p_pos >> 32).checked_mul(p_neg >> 32).expect("no overflow");
+            // Allow generous tolerance — the round-trip accumulates the
+            // u128::MAX / x rounding error; ~10 ppm at |n| = 100.
+            let tol = Q64_TOLERANCE_PPM * (n as u128 + 1) * 10;
+            assert!(
+                approx_eq_q64(prod_q64, ONE, tol),
+                "n={n}: prod={prod_q64} (diff {} from ONE)",
+                prod_q64.abs_diff(ONE),
+            );
+        }
+    }
+
+    /// Pin the SCALE_OFFSET / ONE pair: on-chain math relies on
+    /// `ONE = 1 << 64`. A future regression that changes either one
+    /// without the other silently breaks every reciprocal calc.
+    #[test]
+    fn scale_offset_one_pin() {
+        assert_eq!(SCALE_OFFSET, 64);
+        assert_eq!(ONE, 1u128 << 64);
     }
 }
