@@ -8,6 +8,19 @@
 //! basis points. A small gap is the strongest single piece of evidence that
 //! every step of the replay (frontrun, victim, backrun) lined up with chain
 //! reality, which is what `victim_loss` and `attacker_profit_real` rely on.
+//!
+//! ## Whirlpool extension (archival)
+//!
+//! ConstantProduct's diff stays inside a single transaction's meta because
+//! vault reserves are observable in `post_token_balances`. Whirlpool's
+//! dynamic state (sqrt_price, liquidity, tick) **isn't** in tx meta — V3
+//! AMMs encode it on the pool account. To diff a Whirlpool replay against
+//! chain truth, we have to fetch the pool account *at the slot after the
+//! sandwich*. That fetch is provider-specific (archival RPC), so the
+//! comparison is split into a pure function
+//! ([`compare_whirlpool_replay_to_archival`]) and an async wrapper
+//! ([`diff_attack_against_archival`]) that takes an
+//! [`AccountFetcher`](crate::AccountFetcher).
 
 /// Maximum side-wise relative gap between predicted and observed reserves
 /// before [`Signal::ReservesMatchPostState`](swap_events::types::Signal)
@@ -39,6 +52,105 @@ fn side_divergence_bps(predicted: u64, observed: u64) -> u32 {
     let delta = (predicted as i128 - observed as i128).unsigned_abs();
     let scaled = delta.saturating_mul(10_000) / observed as u128;
     scaled.min(u32::MAX as u128) as u32
+}
+
+/// Per-component divergence between a Whirlpool replay's post-back
+/// checkpoint and the chain-observed post-state. Returned by
+/// [`compare_whirlpool_replay_to_archival`] / [`diff_attack_against_archival`].
+///
+/// `*_diff_bps` fields use the same relative-bps convention as
+/// [`reserves_divergence_bps`]. `tick_diff` is a signed absolute gap
+/// (predicted - observed) — ticks are integers and small absolute
+/// differences carry direct meaning ("we're 1 tick high"), so a relative
+/// metric would be misleading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WhirlpoolDiffReport {
+    pub sqrt_price_diff_bps: u32,
+    pub liquidity_diff_bps: u32,
+    pub tick_diff: i32,
+}
+
+/// Compare a Whirlpool replay's post-back checkpoint against an observed
+/// chain state. Pure function — caller is responsible for sourcing the
+/// observation (typically via [`diff_attack_against_archival`] which
+/// pulls it from an [`AccountFetcher`](crate::AccountFetcher)).
+///
+/// Returns `None` when `observed` isn't the Whirlpool variant — the
+/// concentrated-liquidity comparison surface only makes sense for
+/// concentrated-liquidity AMMs.
+pub fn compare_whirlpool_replay_to_archival(
+    predicted: &swap_events::types::WhirlpoolReplayTrace,
+    observed: &crate::lookup::DynamicPoolState,
+) -> Option<WhirlpoolDiffReport> {
+    let crate::lookup::DynamicPoolState::Whirlpool {
+        sqrt_price_q64,
+        liquidity,
+        tick_current_index,
+        ..
+    } = observed;
+    Some(WhirlpoolDiffReport {
+        sqrt_price_diff_bps: u128_divergence_bps(predicted.sqrt_price_post_back, *sqrt_price_q64),
+        liquidity_diff_bps: u128_divergence_bps(predicted.liquidity_post_back, *liquidity),
+        tick_diff: predicted.tick_current_post_back - tick_current_index,
+    })
+}
+
+/// Run the Whirlpool replay-vs-archival diff for a single sandwich
+/// attack. Fetches the pool account at `attack.slot + slot_offset` via
+/// the supplied fetcher and feeds the result into
+/// [`compare_whirlpool_replay_to_archival`].
+///
+/// `slot_offset` is typically `1` — the state at the start of the slot
+/// *after* the sandwich is what we want to compare against the
+/// post-backrun trace. Providers that serve "state at exactly slot N
+/// (= after slot N-1's apply)" need offset `1`; providers that serve
+/// "state after slot N" need offset `0`. Caller picks per provider.
+///
+/// Returns `None` when:
+///   * `attack.dex` isn't [`DexType::OrcaWhirlpool`](swap_events::types::DexType::OrcaWhirlpool),
+///   * the attack carries no [`WhirlpoolReplayTrace`] (enrichment
+///     didn't run or it bailed),
+///   * the archival fetch fails or the account doesn't parse as a
+///     Whirlpool pool account.
+pub async fn diff_attack_against_archival(
+    attack: &swap_events::types::SandwichAttack,
+    fetcher: &dyn crate::AccountFetcher,
+    slot_offset: u64,
+) -> Option<WhirlpoolDiffReport> {
+    if attack.dex != swap_events::types::DexType::OrcaWhirlpool {
+        return None;
+    }
+    let predicted = attack.whirlpool_replay.as_ref()?;
+    let pubkey = attack.pool.parse::<solana_sdk::pubkey::Pubkey>().ok()?;
+    let account = fetcher
+        .fetch_account(&pubkey, attack.slot.saturating_add(slot_offset))
+        .await?;
+    let pool_state = crate::orca_whirlpool::parse_pool_state(&account.data)?;
+    let observed = crate::lookup::DynamicPoolState::Whirlpool {
+        sqrt_price_q64: pool_state.sqrt_price_q64,
+        liquidity: pool_state.liquidity,
+        tick_current_index: pool_state.tick_current_index,
+        tick_spacing: pool_state.tick_spacing,
+    };
+    compare_whirlpool_replay_to_archival(predicted, &observed)
+}
+
+/// u128 analogue of [`side_divergence_bps`]. Whirlpool sqrt_price
+/// (Q64.64, sits around 2^64) and liquidity (deep pools reach 2^70+)
+/// don't fit in u64, so the bps-relative diff math runs in u128 here
+/// and saturates to u32 on the way out.
+fn u128_divergence_bps(predicted: u128, observed: u128) -> u32 {
+    if observed == 0 {
+        return if predicted == 0 { 0 } else { u32::MAX };
+    }
+    let delta = predicted.abs_diff(observed);
+    // delta * 10_000 fits in u128 for any sqrt_price / liquidity
+    // value Whirlpool actually uses; the saturating_mul guards
+    // against pathological inputs (e.g. corrupt archival blobs)
+    // rather than typical state.
+    let scaled = delta.saturating_mul(10_000);
+    let bps = scaled / observed;
+    bps.min(u32::MAX as u128) as u32
 }
 
 #[cfg(test)]
@@ -86,5 +198,258 @@ mod tests {
         // Sanity: the const fits comfortably in i32 too, in case a downstream
         // consumer does signed math on the bps value.
         assert!(PASS_THRESHOLD_BPS < i32::MAX as u32);
+    }
+
+    // ----- Whirlpool archival diff (Tier 3.1 archival extension) ----
+
+    use crate::lookup::DynamicPoolState;
+    use swap_events::types::WhirlpoolReplayTrace;
+
+    fn make_trace(sp: u128, liq: u128, tick: i32) -> WhirlpoolReplayTrace {
+        WhirlpoolReplayTrace {
+            sqrt_price_pre: sp,
+            sqrt_price_post_front: sp,
+            sqrt_price_post_victim: sp,
+            sqrt_price_post_back: sp,
+            liquidity_pre: liq,
+            liquidity_post_front: liq,
+            liquidity_post_victim: liq,
+            liquidity_post_back: liq,
+            tick_current_pre: tick,
+            tick_current_post_front: tick,
+            tick_current_post_victim: tick,
+            tick_current_post_back: tick,
+            counterfactual_victim_out: 0,
+            actual_victim_out: 0,
+            fee_num: 3_000,
+            fee_den: 1_000_000,
+        }
+    }
+
+    fn make_observed(sp: u128, liq: u128, tick: i32) -> DynamicPoolState {
+        DynamicPoolState::Whirlpool {
+            sqrt_price_q64: sp,
+            liquidity: liq,
+            tick_current_index: tick,
+            tick_spacing: 64,
+        }
+    }
+
+    #[test]
+    fn whirlpool_diff_zero_on_exact_match() {
+        let sp = 1u128 << 64;
+        let predicted = make_trace(sp, 1_000_000_000, 10);
+        let observed = make_observed(sp, 1_000_000_000, 10);
+        let diff =
+            compare_whirlpool_replay_to_archival(&predicted, &observed).expect("diff computed");
+        assert_eq!(diff.sqrt_price_diff_bps, 0);
+        assert_eq!(diff.liquidity_diff_bps, 0);
+        assert_eq!(diff.tick_diff, 0);
+    }
+
+    #[test]
+    fn whirlpool_diff_relative_bps_on_sqrt_price() {
+        // Clean numbers to avoid integer-floor noise in the bps math.
+        // observed = 1_000_000, predicted = 1_050_000 ⇒ delta = 50_000
+        // ⇒ 50_000 * 10_000 / 1_000_000 = 500 bps exactly.
+        let predicted = make_trace(1_050_000, 1_000_000, 0);
+        let observed = make_observed(1_000_000, 1_000_000, 0);
+        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        assert_eq!(
+            diff.sqrt_price_diff_bps, 500,
+            "predicted 5% above observed should be exactly 500 bps",
+        );
+        assert_eq!(diff.liquidity_diff_bps, 0);
+        assert_eq!(diff.tick_diff, 0);
+    }
+
+    #[test]
+    fn whirlpool_diff_signed_tick_gap() {
+        let sp = 1u128 << 64;
+        // predicted tick = 100, observed = 95 ⇒ tick_diff = +5 (we're high).
+        let predicted = make_trace(sp, 1_000_000, 100);
+        let observed = make_observed(sp, 1_000_000, 95);
+        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        assert_eq!(diff.tick_diff, 5);
+        // Reversed: predicted low.
+        let predicted = make_trace(sp, 1_000_000, 90);
+        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        assert_eq!(diff.tick_diff, -5);
+    }
+
+    #[test]
+    fn whirlpool_diff_observed_zero_saturates() {
+        // observed liquidity = 0, predicted nonzero ⇒ saturates to MAX.
+        // (A pool with 0 chain liquidity but a non-zero replay trace is
+        // a strong signal that the replay model diverged catastrophically.)
+        let sp = 1u128 << 64;
+        let predicted = make_trace(sp, 1, 0);
+        let observed = make_observed(sp, 0, 0);
+        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        assert_eq!(diff.liquidity_diff_bps, u32::MAX);
+    }
+
+    /// Fetcher that records the slot it was called with and returns
+    /// `None` for the account body. Lets us pin slot propagation
+    /// without standing up a Whirlpool blob fixture.
+    struct OffsetRecordingFetcher {
+        captured_slot: std::sync::Mutex<Option<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::AccountFetcher for OffsetRecordingFetcher {
+        async fn fetch_account(
+            &self,
+            _pubkey: &solana_sdk::pubkey::Pubkey,
+            slot: u64,
+        ) -> Option<solana_sdk::account::Account> {
+            *self.captured_slot.lock().unwrap() = Some(slot);
+            None
+        }
+        async fn fetch_multiple_accounts(
+            &self,
+            pubkeys: &[solana_sdk::pubkey::Pubkey],
+            _slot: u64,
+        ) -> Vec<Option<solana_sdk::account::Account>> {
+            pubkeys.iter().map(|_| None).collect()
+        }
+    }
+
+    fn whirlpool_attack_at_slot(slot: u64) -> swap_events::types::SandwichAttack {
+        use swap_events::types::{
+            DexType, SandwichAttack, SwapDirection, SwapEvent, WhirlpoolReplayTrace,
+        };
+        let pool_pubkey = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+        fn ev(sig: &str, signer: &str, dir: SwapDirection, pool: &str) -> SwapEvent {
+            SwapEvent {
+                signature: sig.into(),
+                signer: signer.into(),
+                dex: DexType::OrcaWhirlpool,
+                pool: pool.into(),
+                direction: dir,
+                token_mint: "M".into(),
+                amount_in: 0,
+                amount_out: 0,
+                tx_index: 0,
+                slot: Some(0),
+                fee: None,
+            }
+        }
+        SandwichAttack {
+            slot,
+            attacker: "atk".into(),
+            pool: pool_pubkey.clone(),
+            dex: DexType::OrcaWhirlpool,
+            frontrun: ev("f", "atk", SwapDirection::Buy, &pool_pubkey),
+            victim: ev("v", "vic", SwapDirection::Buy, &pool_pubkey),
+            backrun: ev("b", "atk", SwapDirection::Sell, &pool_pubkey),
+            estimated_attacker_profit: None,
+            victim_loss_lamports: None,
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
+            frontrun_slot: None,
+            backrun_slot: None,
+            detection_method: None,
+            bundle_provenance: None,
+            confidence: None,
+            net_profit: None,
+            attacker_profit: None,
+            price_impact_bps: None,
+            evidence: None,
+            amm_replay: None,
+            whirlpool_replay: Some(WhirlpoolReplayTrace {
+                sqrt_price_pre: 1u128 << 64,
+                sqrt_price_post_front: 1u128 << 64,
+                sqrt_price_post_victim: 1u128 << 64,
+                sqrt_price_post_back: 1u128 << 64,
+                liquidity_pre: 1_000_000,
+                liquidity_post_front: 1_000_000,
+                liquidity_post_victim: 1_000_000,
+                liquidity_post_back: 1_000_000,
+                tick_current_pre: 0,
+                tick_current_post_front: 0,
+                tick_current_post_victim: 0,
+                tick_current_post_back: 0,
+                counterfactual_victim_out: 0,
+                actual_victim_out: 0,
+                fee_num: 3_000,
+                fee_den: 1_000_000,
+            }),
+            attack_signature: None,
+            timestamp_ms: None,
+            attack_type: None,
+            severity: None,
+            confidence_level: None,
+            slot_leader: None,
+            is_wide_sandwich: false,
+            receipts: vec![],
+            victim_signer: None,
+            victim_amount_in: None,
+            victim_amount_out: None,
+            victim_amount_out_expected: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_attack_against_archival_propagates_slot_offset() {
+        let fetcher = OffsetRecordingFetcher {
+            captured_slot: std::sync::Mutex::new(None),
+        };
+        let attack = whirlpool_attack_at_slot(1_234_567);
+        // Fetcher returns None for the body, so the diff itself is None
+        // — but we only care that the slot reaches the fetcher.
+        let _ = diff_attack_against_archival(&attack, &fetcher, 1).await;
+        let slot = fetcher.captured_slot.lock().unwrap().unwrap();
+        assert_eq!(
+            slot, 1_234_568,
+            "attack.slot + slot_offset should reach the fetcher",
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_attack_against_archival_skips_non_whirlpool() {
+        let fetcher = OffsetRecordingFetcher {
+            captured_slot: std::sync::Mutex::new(None),
+        };
+        let mut attack = whirlpool_attack_at_slot(100);
+        attack.dex = swap_events::types::DexType::RaydiumV4;
+        let result = diff_attack_against_archival(&attack, &fetcher, 1).await;
+        assert!(result.is_none(), "non-Whirlpool dex should short-circuit");
+        assert!(
+            fetcher.captured_slot.lock().unwrap().is_none(),
+            "fetcher should not be called when dex doesn't match",
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_attack_against_archival_skips_when_no_trace() {
+        let fetcher = OffsetRecordingFetcher {
+            captured_slot: std::sync::Mutex::new(None),
+        };
+        let mut attack = whirlpool_attack_at_slot(100);
+        attack.whirlpool_replay = None;
+        let result = diff_attack_against_archival(&attack, &fetcher, 1).await;
+        assert!(
+            result.is_none(),
+            "missing whirlpool_replay should short-circuit",
+        );
+        assert!(
+            fetcher.captured_slot.lock().unwrap().is_none(),
+            "fetcher should not be called when there's no trace to compare",
+        );
+    }
+
+    #[test]
+    fn u128_divergence_handles_huge_values() {
+        // sqrt_price near u128::MAX shouldn't trigger overflow paths
+        // catastrophically — saturation is fine, but the function
+        // must not panic.
+        let huge = u128::MAX / 20_000;
+        let bps = u128_divergence_bps(huge, huge);
+        assert_eq!(bps, 0);
+        // Predicted vs zero observed → saturated (already covered above
+        // for the public function, this is the helper's contract).
+        assert_eq!(u128_divergence_bps(1, 0), u32::MAX);
+        assert_eq!(u128_divergence_bps(0, 0), 0);
     }
 }

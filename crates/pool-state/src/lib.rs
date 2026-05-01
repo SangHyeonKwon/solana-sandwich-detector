@@ -31,6 +31,10 @@ pub use counterfactual::{
     compute_loss, compute_loss_whirlpool, compute_loss_whirlpool_with_trace,
     compute_loss_with_trace, LossEstimate,
 };
+pub use diff_test::{
+    compare_whirlpool_replay_to_archival, diff_attack_against_archival, reserves_divergence_bps,
+    WhirlpoolDiffReport, PASS_THRESHOLD_BPS,
+};
 pub use enrichment::{enrich_attack, EnrichmentResult};
 pub use lookup::{
     AmmKind, DynamicPoolState, NoPoolLookup, NoSlotLeaderLookup, PoolConfig, PoolStateLookup,
