@@ -637,7 +637,7 @@ pub mod swap_math {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct BinSwapStep {
         /// Gross input consumed (`amount_in_after_fee + fee`). Always
-        /// `<= caller's amount_in_remaining`.
+        /// `<= caller's amount_in`.
         pub amount_in_with_fees: u64,
         /// Token-out delivered. For `swap_for_y` this is in token Y;
         /// otherwise token X.
@@ -649,6 +649,13 @@ pub mod swap_math {
         /// the entire `amount_in` was consumed within this bin and the
         /// caller's swap is complete.
         pub bin_drained: bool,
+        /// Input not consumed by this bin. Always `0` on partial-fill
+        /// (`bin_drained = false`); on drain it equals
+        /// `amount_in - amount_in_with_fees`, which the cross-bin
+        /// walker passes into the next active bin. Phase 1 callers
+        /// can ignore this — they bail on `bin_drained = true` before
+        /// the leftover matters.
+        pub amount_in_remaining: u64,
     }
 
     /// `(x * y) >> offset` rounded floor / ceil, in U256 to dodge
@@ -723,6 +730,9 @@ pub mod swap_math {
                 amount_out: 0,
                 fee: 0,
                 bin_drained: true,
+                // Bin can't absorb anything ⇒ the entire input is
+                // leftover for the next bin.
+                amount_in_remaining: amount_in,
             });
         }
 
@@ -758,6 +768,7 @@ pub mod swap_math {
                 amount_out: max_amount_out,
                 fee: max_fee,
                 bin_drained: true,
+                amount_in_remaining: amount_in - max_amount_in,
             });
         }
 
@@ -792,6 +803,9 @@ pub mod swap_math {
             amount_out,
             fee,
             bin_drained: false,
+            // Partial fill ⇒ caller's swap is complete; nothing
+            // leftover for downstream bins.
+            amount_in_remaining: 0,
         })
     }
 }
@@ -1248,7 +1262,43 @@ mod swap_math_tests {
                 amount_out: 0,
                 fee: 0,
                 bin_drained: true,
+                // Empty bin can't absorb anything ⇒ caller's full
+                // input remains for the next bin.
+                amount_in_remaining: 1_000_000,
             }
+        );
+    }
+
+    /// Partial fill ⇒ no leftover. Pin the contract that
+    /// `amount_in_remaining = 0` is the cross-bin walker's "stop"
+    /// signal — a regression that returns non-zero here would cause
+    /// the walker to re-enter the same bin and either spin or
+    /// double-charge.
+    #[test]
+    fn partial_fill_leaves_zero_remaining() {
+        let pool = pool_8000_25();
+        let big = 1_000_000_000u64;
+        let step = swap_within_bin(1_000_000, big, big, ONE, true, &pool).unwrap();
+        assert_eq!(step.amount_in_remaining, 0);
+        assert!(!step.bin_drained);
+    }
+
+    /// Drain path ⇒ leftover = `amount_in - max_amount_in` (the gross
+    /// amount the bin actually absorbed). The cross-bin walker
+    /// (Phase 2 step 2) uses this to seed the next bin's swap.
+    #[test]
+    fn drain_path_returns_correct_leftover() {
+        let pool = pool_8000_25();
+        // Reserves of 100 Y vs huge X input (1B). The bin's
+        // max_amount_in is small (≈101 from the cross-bin test);
+        // leftover ≈ 1B - 101.
+        let step = swap_within_bin(1_000_000_000, 999_999, 100, ONE, true, &pool).unwrap();
+        assert!(step.bin_drained);
+        // Sum invariant: amount_in_with_fees + amount_in_remaining
+        // == caller's gross amount_in.
+        assert_eq!(
+            step.amount_in_with_fees as u128 + step.amount_in_remaining as u128,
+            1_000_000_000,
         );
     }
 
