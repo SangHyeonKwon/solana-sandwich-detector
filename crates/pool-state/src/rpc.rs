@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLookup};
+use crate::meteora_dlmm::bin_array::ParsedBinArray;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::{meteora_dlmm, orca_whirlpool, raydium_cpmm, raydium_v4};
 
@@ -213,9 +214,6 @@ impl PoolStateLookup for RpcPoolLookup {
         dex: DexType,
         slot: u64,
     ) -> Option<DynamicPoolState> {
-        if !matches!(dex, DexType::OrcaWhirlpool) {
-            return None;
-        }
         let pubkey = match pool.parse::<Pubkey>() {
             Ok(p) => p,
             Err(e) => {
@@ -223,14 +221,24 @@ impl PoolStateLookup for RpcPoolLookup {
                 return None;
             }
         };
-        let account = self.fetcher.fetch_account(&pubkey, slot).await?;
-        let pool_state = orca_whirlpool::parse_pool_state(&account.data)?;
-        Some(DynamicPoolState::Whirlpool {
-            sqrt_price_q64: pool_state.sqrt_price_q64,
-            liquidity: pool_state.liquidity,
-            tick_current_index: pool_state.tick_current_index,
-            tick_spacing: pool_state.tick_spacing,
-        })
+        match dex {
+            DexType::OrcaWhirlpool => {
+                let account = self.fetcher.fetch_account(&pubkey, slot).await?;
+                let pool_state = orca_whirlpool::parse_pool_state(&account.data)?;
+                Some(DynamicPoolState::Whirlpool {
+                    sqrt_price_q64: pool_state.sqrt_price_q64,
+                    liquidity: pool_state.liquidity,
+                    tick_current_index: pool_state.tick_current_index,
+                    tick_spacing: pool_state.tick_spacing,
+                })
+            }
+            DexType::MeteoraDlmm => {
+                let account = self.fetcher.fetch_account(&pubkey, slot).await?;
+                let dlmm_pool = meteora_dlmm::parse_pool_state(&account.data)?;
+                Some(DynamicPoolState::Dlmm(dlmm_pool))
+            }
+            _ => None,
+        }
     }
 
     /// Fetch one or more Whirlpool TickArray accounts via the
@@ -281,6 +289,48 @@ impl PoolStateLookup for RpcPoolLookup {
         accounts
             .into_iter()
             .map(|opt| opt.and_then(|a| orca_whirlpool::tick_array::parse_tick_array(&a.data)))
+            .collect()
+    }
+
+    /// Fetch one or more Meteora DLMM `BinArray` accounts. Mirrors
+    /// [`Self::tick_arrays`] in shape: 1:1 alignment with `array_indices`,
+    /// `None` at index `i` for missing accounts, defensive re-pad on
+    /// fetcher misbehaviour. Indices are `i64` per the on-chain
+    /// PDA-seed encoding.
+    async fn bin_arrays(
+        &self,
+        pool: &str,
+        dex: DexType,
+        array_indices: &[i64],
+        slot: u64,
+    ) -> Vec<Option<ParsedBinArray>> {
+        if !matches!(dex, DexType::MeteoraDlmm) || array_indices.is_empty() {
+            return Vec::new();
+        }
+        let pool_pubkey = match pool.parse::<Pubkey>() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(pool, error = %e, "invalid pool pubkey for bin arrays");
+                return array_indices.iter().map(|_| None).collect();
+            }
+        };
+        let pdas: Vec<Pubkey> = array_indices
+            .iter()
+            .map(|&idx| meteora_dlmm::bin_array::bin_array_pda(&pool_pubkey, idx).0)
+            .collect();
+        let accounts = self.fetcher.fetch_multiple_accounts(&pdas, slot).await;
+        if accounts.len() != pdas.len() {
+            warn!(
+                pool,
+                expected = pdas.len(),
+                got = accounts.len(),
+                "fetcher returned mismatched account count for bin arrays",
+            );
+            return array_indices.iter().map(|_| None).collect();
+        }
+        accounts
+            .into_iter()
+            .map(|opt| opt.and_then(|a| meteora_dlmm::bin_array::parse_bin_array(&a.data)))
             .collect()
     }
 }

@@ -87,7 +87,10 @@ pub fn compare_whirlpool_replay_to_archival(
         liquidity,
         tick_current_index,
         ..
-    } = observed;
+    } = observed
+    else {
+        return None;
+    };
     Some(WhirlpoolDiffReport {
         sqrt_price_diff_bps: u128_divergence_bps(predicted.sqrt_price_post_back, *sqrt_price_q64),
         liquidity_diff_bps: u128_divergence_bps(predicted.liquidity_post_back, *liquidity),

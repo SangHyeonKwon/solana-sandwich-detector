@@ -16,12 +16,16 @@ use swap_events::types::{
 };
 
 use crate::lookup::{AmmKind, DynamicPoolState};
+use crate::meteora_dlmm::bin_array::{
+    bin_id_to_bin_array_index, bin_index_in_array, ParsedBinArray,
+};
+use crate::meteora_dlmm::{bin_price, DlmmPool};
 use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
 use crate::{
-    compute_loss_whirlpool_with_trace, compute_loss_with_trace, diff_test, reserves,
-    ConstantProduct, PoolStateLookup,
+    compute_loss_dlmm, compute_loss_whirlpool_with_trace, compute_loss_with_trace, diff_test,
+    reserves, ConstantProduct, PoolStateLookup,
 };
 
 /// Outcome of an enrichment attempt. Signals *why* it failed so callers can
@@ -131,6 +135,10 @@ pub async fn enrich_attack(
                     // field — leave it at 0.
                     fee_rate_hundredths_bps: 0,
                 },
+                // Mismatched variant (DLMM dynamic state for a Whirlpool
+                // dex) is a contract violation; ReplayFailed is the
+                // safest exit since it doesn't poison the metrics.
+                _ => return EnrichmentResult::ReplayFailed,
             };
             // Fetch a TickArray window centered on the pool's current
             // tick — 5 arrays (center ±2 spans) covers every realistic
@@ -179,11 +187,75 @@ pub async fn enrich_attack(
             (loss, None, Some(whirlpool_trace), pool_quote_tvl)
         }
         AmmKind::MeteoraDlmm => {
-            // Phase 1 step 1 lands the LbPair config / dynamic-state
-            // parser; bin math + within-bin swap step + replay arrive
-            // in subsequent steps. Until then DLMM detections short-
-            // circuit even though `pool_config` now succeeds.
-            return EnrichmentResult::UnsupportedDex;
+            // Phase 1 within-bin DLMM replay. Fetch dynamic state
+            // (active_id + fee parameters) + the BinArray containing
+            // the active bin, then run `compute_loss_dlmm`. Cross-bin
+            // legs bail with `CrossTickUnsupported` for Phase 2 follow-up.
+            let Some(state) = lookup
+                .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
+                .await
+            else {
+                return EnrichmentResult::ReplayFailed;
+            };
+            let dlmm_pool: DlmmPool = match state {
+                DynamicPoolState::Dlmm(p) => p,
+                // Mismatched variant (Whirlpool returned for a DLMM
+                // dex) is a contract violation; treat as ReplayFailed.
+                _ => return EnrichmentResult::ReplayFailed,
+            };
+
+            let array_index = bin_id_to_bin_array_index(dlmm_pool.active_id) as i64;
+            let arrays = lookup
+                .bin_arrays(&attack.pool, attack.dex, &[array_index], attack.slot)
+                .await;
+            // Empty `Vec` from a lookup that doesn't speak BinArray is
+            // the "not supported" signal — same convention as Whirlpool's
+            // tick_arrays. Phase 1 needs the active bin's reserves to
+            // do anything, so bail.
+            let active_array: ParsedBinArray = match arrays.into_iter().next() {
+                Some(Some(arr)) => arr,
+                _ => return EnrichmentResult::CrossTickUnsupported,
+            };
+
+            let bin_idx = match bin_index_in_array(array_index as i32, dlmm_pool.active_id) {
+                Some(i) => i,
+                None => return EnrichmentResult::ReplayFailed,
+            };
+            let active_bin = active_array.bins[bin_idx];
+
+            // On-chain `Bin.price` is lazy-cached: zero until the bin's
+            // first swap. Recompute via `bin_price` when zero.
+            let price = if active_bin.price != 0 {
+                active_bin.price
+            } else {
+                match bin_price(dlmm_pool.active_id, dlmm_pool.bin_step) {
+                    Some(p) => p,
+                    None => return EnrichmentResult::ReplayFailed,
+                }
+            };
+
+            let Some(loss) = compute_loss_dlmm(
+                attack,
+                &dlmm_pool,
+                active_bin.amount_x,
+                active_bin.amount_y,
+                price,
+                config.base_is_token_a,
+            ) else {
+                // None ⇒ cross-bin or direction violation; map to
+                // CrossTickUnsupported so Phase 2 follow-up sees the
+                // count separately from invariant-violation cases.
+                return EnrichmentResult::CrossTickUnsupported;
+            };
+
+            // Severity TVL: same shape as the other paths — frontrun
+            // tx's quote-vault balance, when extractable.
+            let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
+                .map(|r| r.pre.1)
+                .unwrap_or(0);
+            // No DLMM-specific replay trace yet; that ships in a
+            // Phase 1 follow-up alongside vigil-v1 schema bumps.
+            (loss, None, None, pool_quote_tvl)
         }
     };
 
