@@ -7,6 +7,8 @@
 use async_trait::async_trait;
 use swap_events::types::DexType;
 
+use crate::meteora_dlmm::bin_array::ParsedBinArray;
+use crate::meteora_dlmm::DlmmPool;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
 
 /// Kind of AMM that backs a pool — determines which math to apply.
@@ -16,21 +18,26 @@ pub enum AmmKind {
     RaydiumCpmm,
     /// Orca Whirlpool concentrated-liquidity AMM. Config (vault / mint /
     /// fee) and pool-state (sqrt_price / liquidity / tick) parsing are
-    /// in [`crate::orca_whirlpool`]; replay support lands in a follow-up
-    /// — `enrich_attack` currently routes this kind to
-    /// [`EnrichmentResult::UnsupportedDex`](crate::EnrichmentResult).
+    /// in [`crate::orca_whirlpool`].
     OrcaWhirlpool,
+    /// Meteora DLMM (Liquidity Book) bin-based concentrated-liquidity AMM.
+    /// Config + dynamic-state parsing are in [`crate::meteora_dlmm`]; bin
+    /// math, swap step, and replay land in subsequent steps. Until then,
+    /// `enrich_attack` short-circuits this kind to
+    /// [`EnrichmentResult::UnsupportedDex`](crate::EnrichmentResult).
+    MeteoraDlmm,
 }
 
 impl AmmKind {
     /// Map a [`DexType`] to an AMM kind this crate can recognise. Returns
     /// `None` for DEXes we have neither config parsing nor replay for
-    /// (Pump.fun, Phoenix, Jupiter, Meteora DLMM, Raydium CLMM).
+    /// (Pump.fun, Phoenix, Jupiter, Raydium CLMM).
     pub fn from_dex(dex: DexType) -> Option<Self> {
         match dex {
             DexType::RaydiumV4 => Some(AmmKind::RaydiumV4),
             DexType::RaydiumCpmm => Some(AmmKind::RaydiumCpmm),
             DexType::OrcaWhirlpool => Some(AmmKind::OrcaWhirlpool),
+            DexType::MeteoraDlmm => Some(AmmKind::MeteoraDlmm),
             _ => None,
         }
     }
@@ -70,7 +77,7 @@ pub struct PoolConfig {
 /// (vault reserves) is already extractable from the tx's
 /// `pre_token_balances` via [`crate::reserves`], so they don't need a
 /// separate slot-anchored fetch path. New variants land alongside new
-/// concentrated-liquidity DEXes (e.g. DLMM bin price math).
+/// concentrated-liquidity DEXes (DLMM bin price math, etc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicPoolState {
     /// Whirlpool concentrated-liquidity snapshot. Mirrors the subset of
@@ -82,6 +89,10 @@ pub enum DynamicPoolState {
         tick_current_index: i32,
         tick_spacing: u16,
     },
+    /// Meteora DLMM (Liquidity Book) snapshot. Carries the active bin
+    /// id plus the static fee-parameter triple so the replay layer can
+    /// compute fees without re-parsing the LbPair blob.
+    Dlmm(DlmmPool),
 }
 
 /// Resolve pool configuration. Typically backed by a cached RPC client.
@@ -131,6 +142,27 @@ pub trait PoolStateLookup: Send + Sync {
         _start_indices: &[i32],
         _slot: u64,
     ) -> Vec<Option<ParsedTickArray>> {
+        Vec::new()
+    }
+
+    /// Fetch one or more `BinArray` accounts for a Meteora DLMM pool.
+    /// Same alignment + opt-in contract as [`Self::tick_arrays`]:
+    /// `result.len() == array_indices.len()` on success, `None` at
+    /// index `i` for a missing/failed individual fetch, empty `Vec`
+    /// when the implementation doesn't speak the BinArray protocol.
+    ///
+    /// On-chain BinArray indices are signed 64-bit (`derive_bin_array_pda`
+    /// in the SDK encodes them that way), so `array_indices` is `i64`
+    /// — callers translating from `bin_id` (i32) must widen first via
+    /// [`crate::meteora_dlmm::bin_array::bin_id_to_bin_array_index`]
+    /// + `as i64`.
+    async fn bin_arrays(
+        &self,
+        _pool: &str,
+        _dex: DexType,
+        _array_indices: &[i64],
+        _slot: u64,
+    ) -> Vec<Option<ParsedBinArray>> {
         Vec::new()
     }
 }

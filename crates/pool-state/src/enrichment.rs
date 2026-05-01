@@ -16,12 +16,16 @@ use swap_events::types::{
 };
 
 use crate::lookup::{AmmKind, DynamicPoolState};
+use crate::meteora_dlmm::bin_array::{
+    bin_id_to_bin_array_index, bin_index_in_array, ParsedBinArray,
+};
+use crate::meteora_dlmm::{bin_price, DlmmPool};
 use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
 use crate::{
-    compute_loss_whirlpool_with_trace, compute_loss_with_trace, diff_test, reserves,
-    ConstantProduct, PoolStateLookup,
+    compute_loss_dlmm, compute_loss_whirlpool_with_trace, compute_loss_with_trace, diff_test,
+    reserves, ConstantProduct, PoolStateLookup,
 };
 
 /// Outcome of an enrichment attempt. Signals *why* it failed so callers can
@@ -131,6 +135,10 @@ pub async fn enrich_attack(
                     // field — leave it at 0.
                     fee_rate_hundredths_bps: 0,
                 },
+                // Mismatched variant (DLMM dynamic state for a Whirlpool
+                // dex) is a contract violation; ReplayFailed is the
+                // safest exit since it doesn't poison the metrics.
+                _ => return EnrichmentResult::ReplayFailed,
             };
             // Fetch a TickArray window centered on the pool's current
             // tick — 5 arrays (center ±2 spans) covers every realistic
@@ -177,6 +185,84 @@ pub async fn enrich_attack(
                 .map(|r| r.pre.1)
                 .unwrap_or(0);
             (loss, None, Some(whirlpool_trace), pool_quote_tvl)
+        }
+        AmmKind::MeteoraDlmm => {
+            // Phase 1 within-bin DLMM replay. Fetch dynamic state
+            // (active_id + fee parameters) + the BinArray containing
+            // the active bin, then run `compute_loss_dlmm`. Cross-bin
+            // legs bail with `CrossTickUnsupported` for Phase 2 follow-up.
+            let Some(state) = lookup
+                .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
+                .await
+            else {
+                return EnrichmentResult::ReplayFailed;
+            };
+            let dlmm_pool: DlmmPool = match state {
+                DynamicPoolState::Dlmm(p) => p,
+                // Mismatched variant (Whirlpool returned for a DLMM
+                // dex) is a contract violation; treat as ReplayFailed.
+                _ => return EnrichmentResult::ReplayFailed,
+            };
+
+            let array_index = bin_id_to_bin_array_index(dlmm_pool.active_id) as i64;
+            let arrays = lookup
+                .bin_arrays(&attack.pool, attack.dex, &[array_index], attack.slot)
+                .await;
+            // Empty `Vec` from a lookup that doesn't speak BinArray is
+            // the "not supported" signal — same convention as Whirlpool's
+            // tick_arrays. Phase 1 needs the active bin's reserves to
+            // do anything, so bail.
+            let active_array: ParsedBinArray = match arrays.into_iter().next() {
+                Some(Some(arr)) => arr,
+                _ => return EnrichmentResult::CrossTickUnsupported,
+            };
+
+            // Unreachable in practice: array_index came from
+            // bin_id_to_bin_array_index(active_id), the inverse of
+            // bin_array_lower_upper_bin_id, so `active_id` is by
+            // construction in this array's range. Defend against a
+            // future regression in either helper by mapping to the
+            // same CrossTickUnsupported bail the rest of this arm
+            // uses, rather than silently bypassing the metrics.
+            let bin_idx = match bin_index_in_array(array_index as i32, dlmm_pool.active_id) {
+                Some(i) => i,
+                None => return EnrichmentResult::CrossTickUnsupported,
+            };
+            let active_bin = active_array.bins[bin_idx];
+
+            // On-chain `Bin.price` is lazy-cached: zero until the bin's
+            // first swap. Recompute via `bin_price` when zero.
+            let price = if active_bin.price != 0 {
+                active_bin.price
+            } else {
+                match bin_price(dlmm_pool.active_id, dlmm_pool.bin_step) {
+                    Some(p) => p,
+                    None => return EnrichmentResult::ReplayFailed,
+                }
+            };
+
+            let Some(loss) = compute_loss_dlmm(
+                attack,
+                &dlmm_pool,
+                active_bin.amount_x,
+                active_bin.amount_y,
+                price,
+                config.base_is_token_a,
+            ) else {
+                // None ⇒ cross-bin or direction violation; map to
+                // CrossTickUnsupported so Phase 2 follow-up sees the
+                // count separately from invariant-violation cases.
+                return EnrichmentResult::CrossTickUnsupported;
+            };
+
+            // Severity TVL: same shape as the other paths — frontrun
+            // tx's quote-vault balance, when extractable.
+            let pool_quote_tvl = reserves::extract(frontrun_tx, &config)
+                .map(|r| r.pre.1)
+                .unwrap_or(0);
+            // No DLMM-specific replay trace yet; that ships in a
+            // Phase 1 follow-up alongside vigil-v1 schema bumps.
+            (loss, None, None, pool_quote_tvl)
         }
     };
 
@@ -291,15 +377,18 @@ mod tests {
 
     struct MockLookup {
         config: PoolConfig,
-        /// `Some` lets tests exercise the Whirlpool dispatch path; the
-        /// constant-product tests leave it at `None` and never call
-        /// `pool_dynamic_state`.
+        /// `Some` lets tests exercise the Whirlpool / DLMM dispatch
+        /// path; constant-product tests leave it at `None`.
         dynamic_state: Option<DynamicPoolState>,
         /// Tests that exercise cross-tick replay populate this; the
         /// trait impl returns it verbatim, ignoring the start_indices
         /// the caller asked for. Default is empty — every test that
         /// doesn't care about cross-tick keeps within-tick behaviour.
         tick_arrays: Vec<Option<ParsedTickArray>>,
+        /// Tests that exercise DLMM replay populate this. Same opt-in
+        /// shape as `tick_arrays`: returned verbatim regardless of
+        /// the requested `array_indices`.
+        bin_arrays: Vec<Option<ParsedBinArray>>,
     }
 
     #[async_trait]
@@ -325,6 +414,16 @@ mod tests {
             _slot: u64,
         ) -> Vec<Option<ParsedTickArray>> {
             self.tick_arrays.clone()
+        }
+
+        async fn bin_arrays(
+            &self,
+            _pool: &str,
+            _dex: DexType,
+            _array_indices: &[i64],
+            _slot: u64,
+        ) -> Vec<Option<ParsedBinArray>> {
+            self.bin_arrays.clone()
         }
     }
 
@@ -447,6 +546,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -476,6 +576,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -496,6 +597,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -514,6 +616,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -556,6 +659,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -623,6 +727,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -659,6 +764,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -682,6 +788,7 @@ mod tests {
             config,
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -711,6 +818,7 @@ mod tests {
             config,
             dynamic_state: Some(dynamic_state),
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -798,6 +906,7 @@ mod tests {
             config,
             dynamic_state: Some(dynamic_state),
             tick_arrays,
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -835,6 +944,7 @@ mod tests {
             config,
             dynamic_state: Some(dynamic_state),
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -851,6 +961,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -918,6 +1029,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         let result = enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -952,6 +1064,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -986,6 +1099,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, None, &lookup).await;
@@ -1021,6 +1135,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1041,6 +1156,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1068,6 +1184,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1103,6 +1220,7 @@ mod tests {
             config: make_config(),
             dynamic_state: None,
             tick_arrays: vec![],
+            bin_arrays: vec![],
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1116,6 +1234,152 @@ mod tests {
         assert!(
             !any,
             "should be silent when backrun tx has no vault balances",
+        );
+    }
+
+    // ----- DLMM (Phase 1) Tier 4 corpus ---------------------------------
+    //
+    // The Phase 1 within-bin DLMM replay produces `victim_loss = 0` by
+    // construction (constant-sum mechanic ⇒ frontrun doesn't move price).
+    // These integration fixtures pin the end-to-end flow:
+    //   1. within-bin sandwich ⇒ Enriched, victim_loss = 0;
+    //   2. cross-bin sandwich (bin gets drained) ⇒ CrossTickUnsupported;
+    //   3. missing BinArray ⇒ CrossTickUnsupported.
+
+    use crate::meteora_dlmm::bin_array::{ParsedBin, ParsedBinArray, MAX_BIN_PER_ARRAY};
+    use crate::meteora_dlmm::price_math::ONE as DLMM_ONE;
+    use crate::meteora_dlmm::DlmmPool;
+    use solana_sdk::pubkey::Pubkey;
+
+    fn dlmm_config() -> PoolConfig {
+        PoolConfig {
+            kind: AmmKind::MeteoraDlmm,
+            pool: "POOL".into(),
+            vault_base: "VAULT_BASE".into(),
+            vault_quote: "VAULT_QUOTE".into(),
+            base_mint: "BASE_MINT".into(),
+            quote_mint: "QUOTE_MINT".into(),
+            // base_factor=8000 * bin_step=25 * 10 = 2_000_000 ⇒ 0.2% in 1e9.
+            fee_num: 2_000_000,
+            fee_den: 1_000_000_000,
+            // base = x ⇒ swap_for_y = Sell, !swap_for_y = Buy.
+            base_is_token_a: true,
+        }
+    }
+
+    fn make_dlmm_attack(amount: u64) -> SandwichAttack {
+        let frontrun = make_swap("f", "atk", SwapDirection::Buy, amount, 0);
+        let mut victim = make_swap("v", "vic", SwapDirection::Buy, amount / 2, 0);
+        let mut backrun = make_swap("b", "atk", SwapDirection::Sell, amount, 0);
+        // Override DEX so AmmKind::from_dex picks MeteoraDlmm.
+        let frontrun = SwapEvent {
+            dex: DexType::MeteoraDlmm,
+            ..frontrun
+        };
+        victim.dex = DexType::MeteoraDlmm;
+        backrun.dex = DexType::MeteoraDlmm;
+        SandwichAttack {
+            dex: DexType::MeteoraDlmm,
+            frontrun,
+            victim,
+            backrun,
+            ..make_attack()
+        }
+    }
+
+    /// Build a synthetic ParsedBinArray whose active bin (id = 0) has
+    /// the supplied `(amount_x, amount_y)`. Array index 0 covers
+    /// bins `[0, 69]`, so bin 0 lands at `bins[0]`.
+    fn dlmm_active_array(amount_x: u64, amount_y: u64) -> ParsedBinArray {
+        let mut bins = vec![
+            ParsedBin {
+                amount_x: 0,
+                amount_y: 0,
+                price: 0,
+                liquidity_supply: 0,
+            };
+            MAX_BIN_PER_ARRAY
+        ];
+        bins[0] = ParsedBin {
+            amount_x,
+            amount_y,
+            price: DLMM_ONE,
+            liquidity_supply: 1_000_000_000,
+        };
+        ParsedBinArray {
+            index: 0,
+            version: 1,
+            lb_pair: Pubkey::new_unique(),
+            bins,
+        }
+    }
+
+    fn dlmm_state() -> DynamicPoolState {
+        DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 0,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+        })
+    }
+
+    /// Within-bin sandwich: comfortable bin reserves, modest swap
+    /// amounts. Replay should succeed with `victim_loss = 0` (the
+    /// constant-sum invariant) and `Enriched` outcome.
+    #[tokio::test]
+    async fn dlmm_within_bin_corpus_yields_zero_loss_enriched() {
+        let mut attack = make_dlmm_attack(100_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![Some(dlmm_active_array(1_000_000_000, 1_000_000_000))],
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert_eq!(attack.victim_loss_lamports, Some(0));
+    }
+
+    /// Cross-bin sandwich: tiny bin reserves (100 each) vs. a much
+    /// larger frontrun (1B). First leg drains the bin ⇒
+    /// `compute_loss_dlmm` returns `None` ⇒ enrich reports
+    /// `CrossTickUnsupported`. Phase 2 will pick this up.
+    #[tokio::test]
+    async fn dlmm_cross_bin_corpus_returns_cross_tick_unsupported() {
+        let mut attack = make_dlmm_attack(1_000_000_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![Some(dlmm_active_array(100, 100))],
+        };
+        assert_eq!(
+            enrich_attack(&mut attack, &tx, None, &lookup).await,
+            EnrichmentResult::CrossTickUnsupported,
+        );
+    }
+
+    /// Missing BinArray (lookup returns empty Vec) ⇒ enrich can't see
+    /// the active bin's reserves and bails with
+    /// `CrossTickUnsupported`. Same convention as Whirlpool when
+    /// tick_arrays come back empty.
+    #[tokio::test]
+    async fn dlmm_missing_bin_array_corpus_returns_cross_tick_unsupported() {
+        let mut attack = make_dlmm_attack(100_000);
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+        };
+        assert_eq!(
+            enrich_attack(&mut attack, &tx, None, &lookup).await,
+            EnrichmentResult::CrossTickUnsupported,
         );
     }
 }
