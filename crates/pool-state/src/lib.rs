@@ -26,6 +26,7 @@ pub mod raydium_cpmm;
 pub mod raydium_v4;
 pub mod reserves;
 pub mod rpc;
+pub mod spl_mint;
 
 pub use constant_product::ConstantProduct;
 pub use counterfactual::{
