@@ -35,7 +35,7 @@ pub use counterfactual::{
 };
 pub use diff_test::{
     compare_whirlpool_replay_to_archival, diff_attack_against_archival, reserves_divergence_bps,
-    WhirlpoolDiffReport, PASS_THRESHOLD_BPS,
+    BalanceDiffReport, WhirlpoolDiffReport, PASS_THRESHOLD_BPS,
 };
 pub use enrichment::{enrich_attack, EnrichmentResult};
 pub use lookup::{

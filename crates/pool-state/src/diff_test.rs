@@ -156,6 +156,52 @@ fn u128_divergence_bps(predicted: u128, observed: u128) -> u32 {
     bps.min(u32::MAX as u128) as u32
 }
 
+// ----- Balance cross-check (parser-vs-RPC sanity) -----
+
+/// Divergence between a sandwich attack's recorded victim `amount_out`
+/// (extracted by the swap-events parser at detection time) and the
+/// on-chain ground truth observed by re-walking the victim transaction's
+/// `pre_token_balances` / `post_token_balances` via a fresh
+/// `getTransaction` RPC.
+///
+/// Unlike [`WhirlpoolDiffReport`] which validates *replay math* against
+/// archival pool state, this report validates the *parser* end-to-end:
+/// it doesn't re-run any AMM math, just confirms the parser's victim
+/// `amount_out` matches what the chain says the victim wallet actually
+/// received. A non-zero diff points to a parser bug (wrong account
+/// index, missed inner instruction, Token-2022 transfer-fee mishandling)
+/// rather than a replay bug. Standard `getTransaction` is fully archival
+/// on every major Solana RPC provider, so this surface works on
+/// historical sandwich corpora without an account-state archival service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BalanceDiffReport {
+    /// `amount_out` recorded by the swap-events parser — the same value
+    /// carried in `attack.victim.amount_out`.
+    pub recorded_amount_out: u64,
+    /// `amount_out` observed by re-walking the victim tx's token-balance
+    /// deltas at validation time. Authoritative chain truth.
+    pub observed_amount_out: u64,
+    /// Relative gap between recorded and observed, in bps of
+    /// `observed_amount_out`. Same convention as
+    /// [`reserves_divergence_bps`]: an exact match is `0`; `observed == 0`
+    /// with non-zero `recorded` saturates to `u32::MAX`.
+    pub diff_bps: u32,
+}
+
+impl BalanceDiffReport {
+    /// Construct a report from an observed (chain truth) and recorded
+    /// (parser output) `amount_out` pair. The bps math reuses
+    /// [`side_divergence_bps`] so the scale matches the reserves-side
+    /// reconciliation surface.
+    pub fn new(observed_amount_out: u64, recorded_amount_out: u64) -> Self {
+        Self {
+            observed_amount_out,
+            recorded_amount_out,
+            diff_bps: side_divergence_bps(recorded_amount_out, observed_amount_out),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +501,48 @@ mod tests {
         // for the public function, this is the helper's contract).
         assert_eq!(u128_divergence_bps(1, 0), u32::MAX);
         assert_eq!(u128_divergence_bps(0, 0), 0);
+    }
+
+    // ----- Balance cross-check -----
+
+    #[test]
+    fn balance_diff_zero_on_exact_match() {
+        let report = BalanceDiffReport::new(1_000_000, 1_000_000);
+        assert_eq!(report.observed_amount_out, 1_000_000);
+        assert_eq!(report.recorded_amount_out, 1_000_000);
+        assert_eq!(report.diff_bps, 0);
+    }
+
+    #[test]
+    fn balance_diff_five_percent_off_returns_500_bps() {
+        // Parser recorded 5% high vs chain truth.
+        let high = BalanceDiffReport::new(1_000_000, 1_050_000);
+        assert_eq!(high.diff_bps, 500);
+        // Parser recorded 5% low — same magnitude (abs_diff is symmetric).
+        let low = BalanceDiffReport::new(1_000_000, 950_000);
+        assert_eq!(low.diff_bps, 500);
+    }
+
+    #[test]
+    fn balance_diff_saturates_when_observed_zero_and_recorded_nonzero() {
+        // Chain says victim received nothing but parser recorded a swap —
+        // the relative gap is ill-defined, surface it as the maximum so a
+        // consumer can't accidentally read the absence as a small diff.
+        assert_eq!(BalanceDiffReport::new(0, 1).diff_bps, u32::MAX);
+    }
+
+    #[test]
+    fn balance_diff_zero_when_both_zero() {
+        // Degenerate but legal — neither parser nor chain saw output.
+        assert_eq!(BalanceDiffReport::new(0, 0).diff_bps, 0);
+    }
+
+    #[test]
+    fn balance_diff_no_overflow_on_max_amounts() {
+        // Single-unit gap on a u64::MAX position rounds to 0 bps without
+        // panicking. amount_out is a token-smallest-unit u64 so this is
+        // pathological but the math should still be safe.
+        let huge = u64::MAX;
+        assert_eq!(BalanceDiffReport::new(huge, huge - 1).diff_bps, 0);
     }
 }
