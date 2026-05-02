@@ -33,7 +33,7 @@
 
 샌드위치 공격은 솔라나에서 가장 흔한 MEV 추출 패턴입니다. 공격자는 피해자의 swap을 앞질러 frontrun으로 가격을 밀고, 뒤이은 backrun으로 차익을 회수합니다 — 같은 블록 안에서, 또는 인접한 슬롯에 걸쳐서.
 
-**solana-sandwich-detector**는 솔라나 블록 스트림을 탐지된 공격의 스트림으로 변환하는 Rust 라이브러리입니다. **same-block 탐지**(고전적 단일 슬롯 패턴)와 **cross-slot 윈도우 탐지**(여러 슬롯에 걸친 공격, Jito 번들 출처·경제적 타당성·피해자 그럴듯함 필터 포함)를 모두 지원합니다. AMM 재연 enrichment는 단순 `amount_out - amount_in` 휴리스틱이 아닌 *실제 victim loss*를 계산합니다. 스트리밍 CLI(`sandwich-detect`), 평가 프레임워크(`sandwich-eval`), 두 개의 diff 도구(`balance-diff`로 parser-vs-RPC victim 교차검증, `archival-diff`로 replay-vs-chain pool-state 비교)가 함께 제공됩니다.
+**solana-sandwich-detector**는 솔라나 블록 스트림을 탐지된 공격의 스트림으로 변환하는 Rust 라이브러리입니다. **same-block 탐지**(고전적 단일 슬롯 패턴)와 **cross-slot 윈도우 탐지**(여러 슬롯에 걸친 공격, Jito 번들 출처·경제적 타당성·피해자 그럴듯함 필터 포함)를 모두 지원합니다. AMM 재연 enrichment는 단순 `amount_out - amount_in` 휴리스틱이 아닌 *실제 victim loss*를 계산합니다. 스트리밍 CLI(`sandwich-detect`), 평가 프레임워크(`sandwich-eval`), 두 개의 diff 도구(`balance-diff`로 parser-vs-RPC victim 교차검증; `archival-diff`로 replay-vs-chain pool-state 비교 — 현재 placeholder, Solana RPC가 노출하지 않는 archival account fetcher 대기 중)가 함께 제공됩니다.
 
 > [Vigil](https://github.com/EarthIsMine/Vigil-RPC) — 솔라나 MEV 투명성 플랫폼 — 의 탐지 primitive로 사용됩니다. 검증인 점수·영속성·알림·대시보드는 Vigil에 살고, 이 저장소는 **stream-in → stream-out**에 집중합니다. [범위](#범위) 및 [Vigil 통합](#vigil-통합) 참조.
 

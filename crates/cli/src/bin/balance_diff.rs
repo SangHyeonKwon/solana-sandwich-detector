@@ -35,19 +35,22 @@
 //!   "diff": { "recorded_amount_out": 500, "observed_amount_out": 500, "diff_bps": 0 } }
 //! ```
 //!
-//! Skipped records carry a `skipped` reason (`cross_check_failed`)
-//! plus an `eprintln!` describing the underlying cause so the caller
-//! can audit coverage.
+//! Skipped records carry one of three `skipped` reasons mirroring the
+//! library's [`pool_state::CrossCheckError`] variants — `bad_signature`
+//! (malformed input sig), `rpc_fetch_failed` (transient / archival
+//! horizon — retryable on a different endpoint), or
+//! `unobservable` (heuristic couldn't classify — multi-leg route,
+//! signer mismatch — not retryable). Each carries an `eprintln!` with
+//! the underlying cause so the caller can audit coverage.
 
 use std::io::{self, BufRead, Write};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use pool_state::{cross_check_victim_balance, BalanceDiffReport};
+use pool_state::{cross_check_victim_balance, BalanceDiffReport, CrossCheckError};
 use sandwich_detector::types::SandwichAttack;
 use serde::Serialize;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
 
 #[derive(Parser)]
 #[command(name = "balance-diff")]
@@ -74,7 +77,12 @@ struct DiffRecord {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = RpcClient::new_with_commitment(cli.rpc.clone(), CommitmentConfig::confirmed());
+    // Per-call commitment is set to `Finalized` inside
+    // `cross_check_victim_balance`, so the client-level commitment
+    // here is unused for `getTransaction`. Keep the constructor
+    // simple — `RpcClient::new` defaults to `Finalized` too which
+    // happens to align.
+    let client = RpcClient::new(cli.rpc.clone());
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -127,26 +135,40 @@ async fn process_attack(attack: &SandwichAttack, client: &RpcClient) -> DiffReco
         .unwrap_or_else(|| attack.victim.signature.clone());
     let victim_signature = attack.victim.signature.clone();
     match cross_check_victim_balance(attack, client).await {
-        Some(diff) => DiffRecord {
+        Ok(diff) => DiffRecord {
             attack_signature,
             victim_signature,
             diff: Some(diff),
             skipped: None,
         },
-        None => {
-            // `cross_check_victim_balance` collapses sig-parse / fetch /
-            // observation failures into a single `None`. Surface a
-            // single-reason skip plus the victim sig on stderr so the
-            // operator can re-run individual attacks for diagnosis.
-            eprintln!(
-                "skip: cross-check failed for victim sig {} (signature parse, RPC fetch, or observation)",
-                victim_signature,
-            );
+        Err(err) => {
+            // Map each variant to a distinct skip reason so a downstream
+            // pipeline can split "retry on a different RPC" cases
+            // (rpc_fetch_failed) from "real diagnostic" cases
+            // (unobservable). bad_signature points at upstream input
+            // shape and is rare in practice.
+            let (reason, log_msg): (&'static str, String) = match &err {
+                CrossCheckError::BadSignature => (
+                    "bad_signature",
+                    format!("victim sig {victim_signature} failed to parse"),
+                ),
+                CrossCheckError::RpcFetch(e) => (
+                    "rpc_fetch_failed",
+                    format!("getTransaction({victim_signature}) failed: {e}"),
+                ),
+                CrossCheckError::Unobservable => (
+                    "unobservable",
+                    format!(
+                        "tx {victim_signature} fetched but observation heuristic couldn't classify (multi-leg route, signer mismatch, non-Json encoding)",
+                    ),
+                ),
+            };
+            eprintln!("skip: {log_msg}");
             DiffRecord {
                 attack_signature,
                 victim_signature,
                 diff: None,
-                skipped: Some("cross_check_failed"),
+                skipped: Some(reason),
             }
         }
     }

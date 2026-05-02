@@ -168,11 +168,20 @@ fn u128_divergence_bps(predicted: u128, observed: u128) -> u32 {
 /// archival pool state, this report validates the *parser* end-to-end:
 /// it doesn't re-run any AMM math, just confirms the parser's victim
 /// `amount_out` matches what the chain says the victim wallet actually
-/// received. A non-zero diff points to a parser bug (wrong account
-/// index, missed inner instruction, Token-2022 transfer-fee mishandling)
-/// rather than a replay bug. Standard `getTransaction` is fully archival
-/// on every major Solana RPC provider, so this surface works on
-/// historical sandwich corpora without an account-state archival service.
+/// received. A non-zero diff points to a parser-stable failure mode
+/// (account-key drift between block snapshot and tx fetch, lookup-table
+/// updates, RPC-side serialisation differences) rather than a replay
+/// bug. Standard `getTransaction` is fully archival on every major
+/// Solana RPC provider, so this surface works on historical sandwich
+/// corpora without an account-state archival service.
+///
+/// **Known blind spot — Token-2022 transfer-fee mints.** Both sides
+/// of the diff read the *net-of-fee* received amount (the parser
+/// computes it from `post_token_balance - pre_token_balance`; the
+/// observation re-runs the same heuristic), so on transfer-fee mints
+/// the diff is structurally zero and does *not* validate whether the
+/// parser correctly accounted for the gross/net distinction. Use the
+/// enrichment-side Token-2022 paths for that audit instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BalanceDiffReport {
     /// `amount_out` recorded by the swap-events parser — the same value
@@ -202,24 +211,56 @@ impl BalanceDiffReport {
     }
 }
 
+/// Why the balance cross-check bailed. Three orthogonal failure modes
+/// the operator wants to distinguish at a glance: a malformed signature
+/// in the input record (data-shape bug), an RPC fetch error (transient
+/// or provider archival-horizon issue — retryable on a different
+/// endpoint), or a successful fetch whose tx the observation heuristic
+/// can't classify (multi-leg route, signer mismatch, non-Json encoding —
+/// real diagnostic, not retryable).
+///
+/// `RpcFetch` carries the upstream error string so the operator can
+/// triage rate limits / 404s / network errors without re-running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossCheckError {
+    /// `attack.victim.signature` didn't parse as a
+    /// [`solana_sdk::signature::Signature`]. Indicates a malformed
+    /// JSONL input or upstream parser bug, not an on-chain condition.
+    BadSignature,
+    /// The `getTransaction` RPC call returned an error. The string is
+    /// the upstream `solana_client` error, suitable for diagnostic
+    /// logging. Common causes: rate limit, missing tx beyond the
+    /// provider's archival horizon, transient network failure.
+    RpcFetch(String),
+    /// The fetch succeeded but the observation heuristic
+    /// ([`swap_events::observe::observe_swap_from_tx`]) couldn't
+    /// classify the swap — e.g. multi-leg Jupiter route, victim
+    /// signer mismatch, non-Json encoding, or no signer-side balance
+    /// change. Real diagnostic, not retryable.
+    Unobservable,
+}
+
 /// Compare a sandwich attack's recorded `victim.amount_out` against an
 /// already-fetched victim transaction. Pure function — caller is
 /// responsible for sourcing the transaction (typically via
 /// [`cross_check_victim_balance`] which pulls it from an
 /// [`solana_client::nonblocking::rpc_client::RpcClient`]).
 ///
-/// Returns `None` when [`swap_events::observe::observe_swap_from_tx`]
-/// can't classify the deltas — for example when the transaction is not
-/// JSON-encoded, the tx's first signer doesn't match
-/// `attack.victim.signer`, or the balance deltas don't match the
-/// detector's swap heuristic (multi-leg route, no signer-side change,
-/// etc.).
+/// Returns [`CrossCheckError::Unobservable`] when
+/// [`swap_events::observe::observe_swap_from_tx`] can't classify the
+/// deltas — for example when the transaction is not JSON-encoded, the
+/// tx's first signer doesn't match `attack.victim.signer`, or the
+/// balance deltas don't match the detector's swap heuristic (multi-leg
+/// route, no signer-side change, etc.). Sig-parse and RPC-fetch
+/// failures don't apply at this layer — they're surfaced by the async
+/// wrapper.
 pub fn diff_against_observed_tx(
     attack: &swap_events::types::SandwichAttack,
     tx: &solana_transaction_status::EncodedTransactionWithStatusMeta,
-) -> Option<BalanceDiffReport> {
-    let observed = swap_events::observe::observe_swap_from_tx(tx, &attack.victim.signer)?;
-    Some(BalanceDiffReport::new(
+) -> Result<BalanceDiffReport, CrossCheckError> {
+    let observed = swap_events::observe::observe_swap_from_tx(tx, &attack.victim.signer)
+        .ok_or(CrossCheckError::Unobservable)?;
+    Ok(BalanceDiffReport::new(
         observed.amount_out,
         attack.victim.amount_out,
     ))
@@ -230,32 +271,35 @@ pub fn diff_against_observed_tx(
 /// (fully archival on every major Solana RPC provider — no slot-aware
 /// fetcher needed) and feeds it into [`diff_against_observed_tx`].
 ///
-/// Defaults: `Json` encoding, `Confirmed` commitment, v0 transaction
-/// version support. These match the rest of the workspace's RPC use
-/// (`source::rpc::RpcBlockSource`) so a Helius / Triton / QuickNode
-/// archival endpoint configured for block streaming also works here
-/// without further setup.
+/// Defaults: `Json` encoding, `Finalized` commitment, v0 transaction
+/// version support. `Finalized` (not `Confirmed`) so the cross-check
+/// can't accidentally read a forked tx — at archival ages the
+/// distinction is moot for non-forked txs but rules out noise on the
+/// rare edge case.
 ///
-/// Returns `None` when:
-///   * `attack.victim.signature` doesn't parse as a [`solana_sdk::signature::Signature`],
-///   * the `getTransaction` call errors (network, rate limit, missing
-///     tx beyond the provider's archival horizon),
-///   * the inner [`diff_against_observed_tx`] short-circuits.
+/// Returns:
+///   * [`CrossCheckError::BadSignature`] when `attack.victim.signature`
+///     doesn't parse as a [`solana_sdk::signature::Signature`],
+///   * [`CrossCheckError::RpcFetch`] (with upstream error string) when
+///     the `getTransaction` call fails,
+///   * [`CrossCheckError::Unobservable`] when the observation heuristic
+///     can't classify the resulting tx (see [`diff_against_observed_tx`]).
 pub async fn cross_check_victim_balance(
     attack: &swap_events::types::SandwichAttack,
     client: &solana_client::nonblocking::rpc_client::RpcClient,
-) -> Option<BalanceDiffReport> {
+) -> Result<BalanceDiffReport, CrossCheckError> {
     use std::str::FromStr;
-    let sig = solana_sdk::signature::Signature::from_str(&attack.victim.signature).ok()?;
+    let sig = solana_sdk::signature::Signature::from_str(&attack.victim.signature)
+        .map_err(|_| CrossCheckError::BadSignature)?;
     let config = solana_client::rpc_config::RpcTransactionConfig {
         encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
-        commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+        commitment: Some(solana_sdk::commitment_config::CommitmentConfig::finalized()),
         max_supported_transaction_version: Some(0),
     };
     let result = client
         .get_transaction_with_config(&sig, config)
         .await
-        .ok()?;
+        .map_err(|e| CrossCheckError::RpcFetch(e.to_string()))?;
     diff_against_observed_tx(attack, &result.transaction)
 }
 
@@ -729,13 +773,17 @@ mod tests {
     }
 
     #[test]
-    fn diff_against_observed_tx_returns_none_on_signer_mismatch() {
+    fn diff_against_observed_tx_returns_unobservable_on_signer_mismatch() {
         // Tx is signed by "user" but we're checking against an attack
         // attributing the victim to "alien" — observation should bail
-        // and the cross-check is reported as missing rather than
-        // silently producing a misleading diff.
+        // and the cross-check is reported as `Unobservable` rather than
+        // silently producing a misleading diff. `BadSignature` /
+        // `RpcFetch` only fire in the async wrapper.
         let attack = attack_with_victim("alien", 500);
         let tx = buy_tx_payload(1_000, 500);
-        assert!(diff_against_observed_tx(&attack, &tx).is_none());
+        assert_eq!(
+            diff_against_observed_tx(&attack, &tx),
+            Err(CrossCheckError::Unobservable),
+        );
     }
 }
