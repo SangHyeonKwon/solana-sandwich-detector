@@ -201,7 +201,8 @@ This repo is the upstream detection primitive for [Vigil](https://github.com/Ear
 // Heartbeat — every 30s while running. Includes enrichment metric snapshot,
 // bucketed per `DexType` so ops can tell which DEX's 5-array fetch window
 // is under-fetching. All 8 DexType keys are always present (zero-filled).
-{ "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
+// `_heartbeat` itself is the unix-ms timestamp (not a bool).
+{ "_heartbeat": 1730000030000, "metrics": {
     "raydium_v4":     { "enriched": 90, "unsupported_dex": 0, "config_unavailable": 1,
                         "reserves_missing": 0, "replay_failed": 0, "cross_boundary_unsupported": 0 },
     "orca_whirlpool": { "enriched": 32, "unsupported_dex": 0, "config_unavailable": 1,

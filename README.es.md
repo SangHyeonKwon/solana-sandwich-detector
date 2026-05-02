@@ -201,7 +201,8 @@ Este repositorio es la primitiva de detección upstream de [Vigil](https://githu
 // Heartbeat — cada 30s mientras corre. Snapshot de métricas de enriquecimiento,
 // bucketed por `DexType` para que ops vean qué DEX está sub-buscando su ventana
 // de 5-array. Las 8 claves DexType siempre están presentes (rellenadas con cero).
-{ "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
+// `_heartbeat` es el timestamp unix-ms (no un booleano).
+{ "_heartbeat": 1730000030000, "metrics": {
     "raydium_v4":     { "enriched": 90, "unsupported_dex": 0, "config_unavailable": 1,
                         "reserves_missing": 0, "replay_failed": 0, "cross_boundary_unsupported": 0 },
     "orca_whirlpool": { "enriched": 32, "unsupported_dex": 0, "config_unavailable": 1,
