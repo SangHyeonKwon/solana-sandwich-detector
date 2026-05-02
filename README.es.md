@@ -198,10 +198,17 @@ Este repositorio es la primitiva de detección upstream de [Vigil](https://githu
 // Header — emitido una vez al iniciar.
 { "_header": true, "schema_version": "vigil-v1", "tool_version": "0.x.y", "started_at_ms": 1730000000000 }
 
-// Heartbeat — cada 30s mientras corre. Incluye snapshot de métricas de enriquecimiento.
+// Heartbeat — cada 30s mientras corre. Snapshot de métricas de enriquecimiento,
+// bucketed por `DexType` para que ops vean qué DEX está sub-buscando su ventana
+// de 5-array. Las 8 claves DexType siempre están presentes (rellenadas con cero).
 { "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
-    "enriched": 142, "unsupported_dex": 18, "config_unavailable": 3,
-    "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 4 } }
+    "raydium_v4":     { "enriched": 90, "unsupported_dex": 0, "config_unavailable": 1,
+                        "reserves_missing": 0, "replay_failed": 0, "cross_boundary_unsupported": 0 },
+    "orca_whirlpool": { "enriched": 32, "unsupported_dex": 0, "config_unavailable": 1,
+                        "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 3 },
+    "meteora_dlmm":   { "enriched": 20, "unsupported_dex": 0, "config_unavailable": 1,
+                        "reserves_missing": 0, "replay_failed": 0, "cross_boundary_unsupported": 1 },
+    /* raydium_clmm, raydium_cpmm, jupiter_v6, pump_fun, phoenix omitidos */ } }
 
 // SandwichAttack — uno por detección. Esquema completo en vigil-v1.json.
 { "slot": 285012345, "attacker": "...", "frontrun": {...}, "victim": {...}, ... }

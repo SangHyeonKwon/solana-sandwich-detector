@@ -29,18 +29,27 @@ export interface JsonlHeader {
 export interface JsonlHeartbeat {
   /** Detector wall-clock unix epoch ms; emitted periodically in `--follow`. */
   _heartbeat: number;
-  /** Process-lifetime counters for enrichment outcomes. Lets ops watch
-   *  the concentrated-liquidity fetch window (Whirlpool TickArray /
-   *  DLMM BinArray) — `cross_boundary_unsupported` climbing relative
-   *  to `enriched` means the 5-array center-±2 fetch window is
-   *  starting to under-fetch and the bracket should widen. */
+  /** Process-lifetime counters for enrichment outcomes, bucketed by
+   *  `DexType`. Lets ops watch the concentrated-liquidity fetch
+   *  window (Whirlpool TickArray / DLMM BinArray) on the actual DEX
+   *  where it's under-fetching — e.g. `meteora_dlmm.cross_boundary_unsupported`
+   *  climbing without `orca_whirlpool.cross_boundary_unsupported`
+   *  moving means the DLMM bracket needs widening, not Whirlpool's.
+   *  Buckets are pre-populated for every `DexType` so a missing key
+   *  is a bug, not "no events yet". */
   metrics: EnrichmentMetricsSnapshot;
 }
 
-export interface EnrichmentMetricsSnapshot {
+/** Heartbeat metrics object. Each top-level key is a `DexType`
+ *  (snake_case); each bucket carries the same six counters. */
+export type EnrichmentMetricsSnapshot = Record<DexType, EnrichmentMetricsBucket>;
+
+export interface EnrichmentMetricsBucket {
   /** Replay landed; victim_loss / attacker_profit / signals populated. */
   enriched: number;
-  /** DEX never spoken (Jupiter, Phoenix, Pump.fun, etc.). */
+  /** DEX never spoken (Jupiter, Phoenix, Pump.fun, etc.). With per-DEX
+   *  bucketing this counter only fires inside the bucket of an
+   *  unsupported DEX — supported DEXes never increment it. */
   unsupported_dex: number;
   /** Pool config fetch failed (bad pubkey, RPC error, unknown layout). */
   config_unavailable: number;
@@ -54,7 +63,9 @@ export interface EnrichmentMetricsSnapshot {
    *  Whirlpool exhausted within-tick + cross-tick (or `liquidity_net`
    *  pushed active liquidity below zero mid-walk), or DLMM walked
    *  past the BinArray bracket. Watch this counter: it's the
-   *  leading signal that the 5-array fetch bracket needs widening. */
+   *  leading signal that the 5-array fetch bracket needs widening.
+   *  Per-DEX bucketing means a single climbing counter pinpoints
+   *  which DEX's bracket is the culprit. */
   cross_boundary_unsupported: number;
 }
 
