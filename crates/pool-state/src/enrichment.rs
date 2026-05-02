@@ -1603,6 +1603,58 @@ mod tests {
         );
     }
 
+    /// Phase 3 dynamic-fee corpus: a pool with `variable_fee_control = 40_000`
+    /// (mainnet SOL/USDC ballpark) drives the trace to surface a
+    /// non-zero `volatility_accumulator_post_front` and
+    /// `variable_fee_rate_post_front` once the frontrun walks bins.
+    /// Pin that the surface flows through enrich → trace, not just
+    /// the unit-level path.
+    #[tokio::test]
+    async fn dlmm_corpus_variable_fee_surfaces_in_trace() {
+        let mut attack = make_dlmm_attack(5_000);
+        let dynamic_state = DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 60,
+            bin_step: 10,
+            base_factor: 10_000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+            variable_fee_control: 40_000,
+            max_volatility_accumulator: 350_000,
+            ..Default::default()
+        });
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                None,
+            ],
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        assert!(
+            trace.volatility_accumulator_post_front > 0,
+            "frontrun walk must drive vol_acc up: post={}",
+            trace.volatility_accumulator_post_front,
+        );
+        assert!(
+            trace.variable_fee_rate_post_front > 0,
+            "post-front variable rate must be positive: rate={}",
+            trace.variable_fee_rate_post_front,
+        );
+        assert_eq!(trace.variable_fee_rate_pre, 0);
+        // Transfer fee surfaces stay null — enrichment passes None
+        // pending the mint-fetch follow-up.
+        assert_eq!(trace.token_x_transfer_fee_bps, None);
+        assert_eq!(trace.token_y_transfer_fee_bps, None);
+    }
+
     /// Partial-peripheral window: the walker should bail when it
     /// steps into a `None` slot mid-walk, even if other peripherals
     /// are populated. Configures `[Some(-2), None, Some(0), None,

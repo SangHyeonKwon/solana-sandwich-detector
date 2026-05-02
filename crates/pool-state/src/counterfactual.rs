@@ -1689,6 +1689,47 @@ mod tests {
         assert!(loss.price_impact_bps > 0);
     }
 
+    /// Variable fee (`variable_fee_control > 0`) raises the per-bin
+    /// fee that the victim's cross-bin walk pays — the frontrun
+    /// already drove `volatility_accumulator` up. The counterfactual
+    /// victim runs against the pre-frontrun pool snapshot (vol_acc
+    /// near zero), so the dynamic-fee leg loses *more* than the
+    /// static-fee leg ⇒ trace surfaces a non-zero
+    /// `variable_fee_rate_post_front` and a non-zero
+    /// `volatility_accumulator_post_front`.
+    #[test]
+    fn dlmm_variable_fee_surfaces_in_trace() {
+        use crate::compute_loss_dlmm_with_trace;
+        let mut pool = dlmm_pool();
+        // Match mainnet SOL/USDC dynamic-fee shape.
+        pool.variable_fee_control = 40_000;
+        pool.max_volatility_accumulator = 350_000;
+        pool.bin_step = 10;
+        let arrays = dlmm_uniform_window(1_000, 1_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 5_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 5_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 5_000, 0),
+        );
+        let (_loss, trace) =
+            compute_loss_dlmm_with_trace(&attack, &pool, &arrays, true, 0, None, None).unwrap();
+        // Frontrun walked bins ⇒ accumulator rose from 0.
+        assert!(
+            trace.volatility_accumulator_post_front > trace.volatility_accumulator_pre,
+            "vol_acc must rise across frontrun: pre={}, post={}",
+            trace.volatility_accumulator_pre,
+            trace.volatility_accumulator_post_front,
+        );
+        // With non-zero accumulator + variable_fee_control, the
+        // post-front variable-fee rate must be > 0.
+        assert!(
+            trace.variable_fee_rate_post_front > 0,
+            "post-front variable rate must be positive when vol_acc > 0"
+        );
+        // Pre-front vol_acc was 0 ⇒ pre-front variable rate is 0.
+        assert_eq!(trace.variable_fee_rate_pre, 0);
+    }
+
     /// Token-2022 transfer fee on the *output* mint shrinks
     /// `actual_victim_out` and `counterfactual_victim_out` by the
     /// same proportional amount. Pin that the fee is applied to both
