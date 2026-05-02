@@ -879,6 +879,103 @@ pub mod bitmap_extension {
     }
 }
 
+/// On-pool inline `bin_array_bitmap: [u64; 16]` from `LbPair`.
+///
+/// 1024 bits covering bin array indices `[-512, 511]` — the inner band
+/// the [`bitmap_extension`] explicitly excludes. Bit position `b` maps
+/// to bin array index `b - 512`, so:
+///   * limb 0 LSB  → index -512,
+///   * limb 8 LSB  → index 0,
+///   * limb 15 MSB → index 511.
+///
+/// Mirrors `bin_array_bitmap` on `LbPair` plus the
+/// `is_bin_array_initialized_in_bitmap` / `get_bin_array_offset` helpers
+/// in `MeteoraAg/dlmm-sdk/programs/lb_clmm/src/state/bin_array_bitmap.rs`.
+/// The SDK wraps the limbs in a `U1024` bigint and calls `.bit(offset)`;
+/// we bit-test the limbs directly to avoid pulling the dep.
+///
+/// # Account placement
+///
+/// Lives at offset 584 within the `LbPair` account body (including the
+/// 8-byte discriminator). The full LbPair stretches well past this — we
+/// only need the bitmap for fast-forward, so [`parse_internal_bitmap`]
+/// only checks `data.len() >= 712` rather than the full account size.
+/// `parse_pool_state` keeps its existing 216-byte minimum so its
+/// synthetic-blob tests don't pay for the larger fixture.
+pub mod internal_bitmap {
+    use super::read_u64;
+
+    /// Half-width of the inline bitmap in bin array indices. Mirrors
+    /// `BIN_ARRAY_BITMAP_SIZE` in `commons/src/constants.rs`. The
+    /// extension reuses the same constant as its per-row coverage —
+    /// the extension is structured as 12 of these stacked outward in
+    /// each direction.
+    pub const BITS_HALF: i32 = 512;
+
+    /// `u64` limbs in the inline bitmap (`16 * 64 = 1024 = 2 * BITS_HALF`).
+    pub const LIMBS: usize = 16;
+
+    /// Byte size of the inline bitmap (`16 * 8`).
+    pub const BITMAP_BYTES: usize = LIMBS * 8;
+
+    /// Offset of `bin_array_bitmap` within the `LbPair` account body
+    /// (including the 8-byte discriminator). Derived from the running
+    /// totals through `oracle`:
+    /// `216 (reserve_y end) + 16 (protocol_fee) + 32 (_padding1)
+    /// + 288 (reward_infos) + 32 (oracle) = 584`.
+    pub const BIN_ARRAY_BITMAP_OFFSET: usize = 584;
+
+    /// Minimum LbPair length needed to read the inline bitmap end-to-end.
+    pub const MIN_LBPAIR_LEN_WITH_BITMAP: usize = BIN_ARRAY_BITMAP_OFFSET + BITMAP_BYTES; // 712
+
+    /// Inclusive bin array index range the inline bitmap covers.
+    /// Pinned `(-512, 511)`.
+    pub const fn coverage_range() -> (i32, i32) {
+        (-BITS_HALF, BITS_HALF - 1)
+    }
+
+    /// `true` iff `bin_array_index` is inside the inline bitmap's
+    /// `[-512, 511]` band. Outside this band, callers must consult the
+    /// `BinArrayBitmapExtension`.
+    pub fn covers_index(bin_array_index: i32) -> bool {
+        let (lo, hi) = coverage_range();
+        (lo..=hi).contains(&bin_array_index)
+    }
+
+    /// Read the inline bitmap from an `LbPair` account blob. Returns
+    /// `None` for short data; over-tolerates trailing bytes.
+    pub fn parse_internal_bitmap(account_data: &[u8]) -> Option<[u64; LIMBS]> {
+        if account_data.len() < MIN_LBPAIR_LEN_WITH_BITMAP {
+            return None;
+        }
+        let mut bitmap = [0u64; LIMBS];
+        for (i, limb) in bitmap.iter_mut().enumerate() {
+            *limb = read_u64(account_data, BIN_ARRAY_BITMAP_OFFSET + i * 8)?;
+        }
+        Some(bitmap)
+    }
+
+    /// Whether the bin array at `bin_array_index` is initialised
+    /// (= has open positions). Returns:
+    ///   * `Some(true)`  — bit set, array is initialised,
+    ///   * `Some(false)` — bit unset, array is confirmed empty,
+    ///   * `None`        — `bin_array_index` is outside `[-512, 511]`
+    ///     (caller must consult the extension).
+    ///
+    /// Bit mapping mirrors the SDK's `get_bin_array_offset`: bit
+    /// position = `bin_array_index + 512`, addressed LSB-first within
+    /// `bitmap[0]` carrying through to `bitmap[15]`'s MSB.
+    pub fn is_array_initialized(bitmap: &[u64; LIMBS], bin_array_index: i32) -> Option<bool> {
+        if !covers_index(bin_array_index) {
+            return None;
+        }
+        let bit_pos = (bin_array_index + BITS_HALF) as usize;
+        let limb_idx = bit_pos / 64;
+        let bit_in_limb = bit_pos % 64;
+        Some((bitmap[limb_idx] >> bit_in_limb) & 1 == 1)
+    }
+}
+
 /// Q64.64 fixed-point bin price math.
 ///
 /// DLMM bin prices follow `price(bin_id, bin_step) = (1 + bin_step / 10_000)^bin_id`,
@@ -1220,6 +1317,7 @@ pub use swap_math::{swap_within_bin, BinSwapStep};
 /// empty bins between liquidity" pools.
 pub mod cross_bin {
     use super::bitmap_extension::ParsedBitmapExtension;
+    use super::internal_bitmap;
     use super::price_math::bin_price;
     use super::swap_math::swap_within_bin;
     use super::{
@@ -1259,12 +1357,18 @@ pub mod cross_bin {
         /// loaded array in the walk direction without re-scanning
         /// the `bins` map.
         loaded_array_indices: Vec<i32>,
+        /// Optional on-pool inline `bin_array_bitmap` from `LbPair`.
+        /// Covers the inner `[-512, 511]` band that the extension
+        /// excludes. With both bitmaps present, the walker can
+        /// fast-forward across confirmed-empty gaps anywhere in
+        /// `[-6656, 6655]`.
+        internal_bitmap: Option<[u64; internal_bitmap::LIMBS]>,
         /// Optional `BinArrayBitmapExtension`. When present and the
         /// gap between consecutive loaded arrays falls inside the
         /// extension's coverage envelope (`[-6656, -513] ∪ [512, 6655]`),
         /// the walker can confirm the gap is empty and skip across.
-        /// `None` (or a gap touching the on-pool internal bitmap range)
-        /// ⇒ walker bails on the first miss, matching pre-extension
+        /// Without an extension AND without an internal bitmap, the
+        /// walker bails on the first miss, matching pre-bitmap
         /// behaviour.
         bitmap_extension: Option<ParsedBitmapExtension>,
     }
@@ -1281,25 +1385,40 @@ pub mod cross_bin {
         /// the arrays' range. Recomputes price for any lazy-cached
         /// (on-chain `Bin.price = 0`) bin via [`bin_price`].
         ///
-        /// No bitmap extension ⇒ walker bails on the first miss; use
-        /// [`from_arrays_with_bitmap_extension`](Self::from_arrays_with_bitmap_extension)
+        /// No bitmaps ⇒ walker bails on the first miss; use
+        /// [`from_arrays_with_bitmaps`](Self::from_arrays_with_bitmaps)
         /// for sparse-window support.
         pub fn from_arrays(arrays: &[ParsedBinArray], bin_step: u16) -> Option<Self> {
-            Self::from_arrays_with_bitmap_extension(arrays, bin_step, None)
+            Self::from_arrays_with_bitmaps(arrays, bin_step, None, None)
         }
 
-        /// Build the map from a BinArray window plus an optional
-        /// `BinArrayBitmapExtension`. The walker uses the extension to
-        /// fast-forward across gaps between loaded arrays when the
-        /// bitmap confirms the intervening arrays carry no liquidity.
+        /// Convenience wrapper that supplies only the
+        /// `BinArrayBitmapExtension` (gap fast-forward limited to the
+        /// outer `[-6656, -513] ∪ [512, 6655]` band). Use
+        /// [`from_arrays_with_bitmaps`](Self::from_arrays_with_bitmaps)
+        /// to also plumb the on-pool inline bitmap.
+        pub fn from_arrays_with_bitmap_extension(
+            arrays: &[ParsedBinArray],
+            bin_step: u16,
+            bitmap_extension: Option<ParsedBitmapExtension>,
+        ) -> Option<Self> {
+            Self::from_arrays_with_bitmaps(arrays, bin_step, None, bitmap_extension)
+        }
+
+        /// Build the map from a BinArray window plus the two optional
+        /// bitmap sources. The walker uses whichever bitmap covers a
+        /// given gap array index — internal for `[-512, 511]`,
+        /// extension for `[-6656, -513] ∪ [512, 6655]` — to confirm
+        /// the gap is empty before skipping across.
         ///
         /// `arrays` may be non-contiguous (caller-fetched windows often
         /// drop unloadable PDAs); `loaded_array_indices` is captured in
         /// ascending order so the fast-forward can find the next-loaded
         /// array by direction without rescanning `bins`.
-        pub fn from_arrays_with_bitmap_extension(
+        pub fn from_arrays_with_bitmaps(
             arrays: &[ParsedBinArray],
             bin_step: u16,
+            internal_bitmap: Option<[u64; internal_bitmap::LIMBS]>,
             bitmap_extension: Option<ParsedBitmapExtension>,
         ) -> Option<Self> {
             if arrays.is_empty() {
@@ -1339,6 +1458,7 @@ pub mod cross_bin {
                 bin_step,
                 range: (min_id, max_id),
                 loaded_array_indices,
+                internal_bitmap,
                 bitmap_extension,
             })
         }
@@ -1391,25 +1511,31 @@ pub mod cross_bin {
         /// by the walker to skip across sparse windows without paying
         /// the per-empty-bin iteration cost.
         ///
+        /// Consults the internal `[-512, 511]` bitmap and the
+        /// extension `[-6656, -513] ∪ [512, 6655]` bitmap together —
+        /// whichever covers each gap array. A gap straddling both
+        /// ranges only fast-forwards if both bitmaps were supplied
+        /// AND each confirms its half empty.
+        ///
         /// Returns `None` when:
-        ///   * no bitmap extension was supplied (caller can't verify
-        ///     the gap),
+        ///   * neither bitmap source was supplied,
         ///   * no further loaded array exists in the walk direction
         ///     (the walker has truly exited the window),
-        ///   * any gap array is reported initialised (`Some(true)`)
-        ///     by the extension — its data isn't loaded so we can't
+        ///   * any gap array is reported initialised (`Some(true)`) by
+        ///     the relevant bitmap — its data isn't loaded so we can't
         ///     legally swap against it,
-        ///   * any gap array falls outside the extension's coverage
-        ///     (returned `None` by `is_array_initialized`) — the
-        ///     on-pool internal bitmap might say it's initialised, and
-        ///     we don't yet plumb that.
+        ///   * any gap array falls outside *both* bitmaps' coverage
+        ///     (e.g. an extension-only build hitting an inner-band
+        ///     gap, or a gap past `±6655`).
         ///
         /// Returned bin id is the array's *upper* bin when walking
         /// down (`swap_for_y = true`) or *lower* bin when walking up,
         /// so the next iteration's `state.get` lands on the first
         /// reachable bin of the new array.
         pub(super) fn fast_forward(&self, active_id: i32, swap_for_y: bool) -> Option<i32> {
-            let bitmap = self.bitmap_extension.as_ref()?;
+            if self.internal_bitmap.is_none() && self.bitmap_extension.is_none() {
+                return None;
+            }
             let current_array = bin_id_to_bin_array_index(active_id);
             let next_loaded = if swap_for_y {
                 self.loaded_array_indices
@@ -1435,13 +1561,30 @@ pub mod cross_bin {
                 (current_array, next_loaded - 1)
             };
             for idx in gap_lo..=gap_hi {
-                match bitmap.is_array_initialized(idx) {
-                    Some(false) => continue,
-                    Some(true) | None => return None,
+                if self.is_array_initialized(idx)? {
+                    return None;
                 }
             }
             let (lower, upper) = bin_array_lower_upper_bin_id(next_loaded);
             Some(if swap_for_y { upper } else { lower })
+        }
+
+        /// Look up `bin_array_index` against whichever bitmap covers
+        /// it. Internal bitmap owns `[-512, 511]`; extension owns the
+        /// outer band. Returns `None` if the relevant bitmap wasn't
+        /// supplied OR the index is outside both ranges — in either
+        /// case the walker can't prove the array is empty and must
+        /// bail.
+        fn is_array_initialized(&self, bin_array_index: i32) -> Option<bool> {
+            if internal_bitmap::covers_index(bin_array_index) {
+                self.internal_bitmap
+                    .as_ref()
+                    .and_then(|b| internal_bitmap::is_array_initialized(b, bin_array_index))
+            } else {
+                self.bitmap_extension
+                    .as_ref()
+                    .and_then(|b| b.is_array_initialized(bin_array_index))
+            }
         }
     }
 
@@ -2267,6 +2410,108 @@ mod bitmap_extension_tests {
 }
 
 #[cfg(test)]
+mod internal_bitmap_tests {
+    use super::internal_bitmap::{
+        coverage_range, covers_index, is_array_initialized, parse_internal_bitmap,
+        BIN_ARRAY_BITMAP_OFFSET, BITMAP_BYTES, BITS_HALF, LIMBS, MIN_LBPAIR_LEN_WITH_BITMAP,
+    };
+
+    /// `coverage_range()` pins the inline bitmap's `[-512, 511]` band.
+    /// `covers_index` is inclusive on both edges; one past either edge
+    /// returns `false` so the caller routes to the extension.
+    #[test]
+    fn coverage_range_pins_inner_band() {
+        assert_eq!(coverage_range(), (-512, 511));
+        assert!(covers_index(-512));
+        assert!(covers_index(0));
+        assert!(covers_index(511));
+        assert!(!covers_index(-513));
+        assert!(!covers_index(512));
+    }
+
+    /// Bit-mapping pin. `bit_pos = bin_array_index + 512`, addressed
+    /// LSB-first across `bitmap[0..16]`. So index -512 ↔ limb 0 bit 0,
+    /// index 0 ↔ limb 8 bit 0, index 511 ↔ limb 15 bit 63. Out-of-band
+    /// indices return `None` (the extension's territory).
+    #[test]
+    fn is_array_initialized_maps_to_correct_bit() {
+        let mut bm = [0u64; LIMBS];
+        // -512 ↔ limb 0 bit 0
+        bm[0] |= 1u64 << 0;
+        // 0 ↔ limb 8 bit 0
+        bm[8] |= 1u64 << 0;
+        // 511 ↔ limb 15 bit 63
+        bm[15] |= 1u64 << 63;
+        // -1 ↔ limb 7 bit 63 (bit_pos = 511)
+        bm[7] |= 1u64 << 63;
+
+        assert_eq!(is_array_initialized(&bm, -512), Some(true));
+        assert_eq!(is_array_initialized(&bm, 0), Some(true));
+        assert_eq!(is_array_initialized(&bm, 511), Some(true));
+        assert_eq!(is_array_initialized(&bm, -1), Some(true));
+
+        // Unset bit ⇒ Some(false).
+        assert_eq!(is_array_initialized(&bm, 1), Some(false));
+        assert_eq!(is_array_initialized(&bm, -511), Some(false));
+
+        // Outside coverage ⇒ None (caller falls back to extension).
+        assert_eq!(is_array_initialized(&bm, -513), None);
+        assert_eq!(is_array_initialized(&bm, 512), None);
+    }
+
+    /// Synthetic LbPair-shaped blob: zero through `BIN_ARRAY_BITMAP_OFFSET`,
+    /// distinguishing limbs at the bitmap window. Pins both
+    /// `parse_internal_bitmap` end-to-end *and* the offset constant —
+    /// a regression that bumps the offset would land the parser on
+    /// padding bytes and silently produce an all-zero bitmap.
+    #[test]
+    fn parse_synthetic_internal_bitmap() {
+        let mut data = vec![0u8; MIN_LBPAIR_LEN_WITH_BITMAP];
+        // limb 0 LSB ⇒ index -512.
+        data[BIN_ARRAY_BITMAP_OFFSET..BIN_ARRAY_BITMAP_OFFSET + 8]
+            .copy_from_slice(&1u64.to_le_bytes());
+        // limb 8 LSB ⇒ index 0.
+        let limb8 = BIN_ARRAY_BITMAP_OFFSET + 8 * 8;
+        data[limb8..limb8 + 8].copy_from_slice(&1u64.to_le_bytes());
+        // limb 15 MSB ⇒ index 511.
+        let limb15 = BIN_ARRAY_BITMAP_OFFSET + 15 * 8;
+        data[limb15..limb15 + 8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+
+        let bm = parse_internal_bitmap(&data).unwrap();
+        assert_eq!(is_array_initialized(&bm, -512), Some(true));
+        assert_eq!(is_array_initialized(&bm, 0), Some(true));
+        assert_eq!(is_array_initialized(&bm, 511), Some(true));
+        // Adjacent unset bits.
+        assert_eq!(is_array_initialized(&bm, -511), Some(false));
+        assert_eq!(is_array_initialized(&bm, 1), Some(false));
+        assert_eq!(is_array_initialized(&bm, 510), Some(false));
+    }
+
+    /// Short data ⇒ `None`. The parser's minimum is the offset + 128
+    /// bytes (= 712); anything shorter can't yield a complete bitmap.
+    #[test]
+    fn parse_rejects_short_blob() {
+        let short = vec![0u8; MIN_LBPAIR_LEN_WITH_BITMAP - 1];
+        assert!(parse_internal_bitmap(&short).is_none());
+    }
+
+    /// Layout pin. A future regression that bumped any of these
+    /// (`oracle` length, `_padding1`, `reward_infos` count) would
+    /// shift `BIN_ARRAY_BITMAP_OFFSET` and silently break fast-forward;
+    /// pinning the constants surfaces the breakage at compile/test time.
+    #[test]
+    fn layout_constants_pinned() {
+        assert_eq!(BITS_HALF, 512);
+        assert_eq!(LIMBS, 16);
+        assert_eq!(BITMAP_BYTES, 128);
+        // 216 (reserve_y end) + 16 (protocol_fee) + 32 (_padding1)
+        // + 288 (reward_infos) + 32 (oracle) = 584.
+        assert_eq!(BIN_ARRAY_BITMAP_OFFSET, 584);
+        assert_eq!(MIN_LBPAIR_LEN_WITH_BITMAP, 712);
+    }
+}
+
+#[cfg(test)]
 mod price_math_tests {
     use super::price_math::{bin_price, pow, MAX_EXPONENTIAL, ONE, SCALE_OFFSET};
 
@@ -2822,6 +3067,85 @@ mod cross_bin_tests {
         assert!(
             r.is_none(),
             "should bail when bitmap reports gap as initialised but unloaded",
+        );
+    }
+
+    /// Bitmap-aware fast-forward across an *inner-band* gap (the
+    /// `[-512, 511]` region that the extension explicitly excludes).
+    /// Loaded arrays at indices -1 and 1; array 0 is the gap, marked
+    /// unset in the on-pool inline bitmap. Walker starts at the top
+    /// of array 1 and swaps X→Y, drains array 1, fast-forwards across
+    /// array 0, partial-fills array -1.
+    #[test]
+    fn cross_bin_walk_skips_via_internal_bitmap() {
+        // Two loaded arrays straddling the inner-band hole at index 0.
+        let arrays = vec![uniform_array(-1, 0, 100), uniform_array(1, 0, 100)];
+
+        // bit_pos = bin_array_index + 512, addressed across `bm[0..16]`.
+        // index -1 ↔ limb 7 bit 63 (set), 0 ↔ limb 8 bit 0 (UNSET ⇒
+        // confirmed empty), 1 ↔ limb 8 bit 1 (set).
+        let mut bm = [0u64; 16];
+        bm[7] |= 1u64 << 63;
+        bm[8] |= 1u64 << 1;
+
+        // bin_step=1 keeps prices near 1.0 across [-70, 139] so the
+        // walk stays representable end-to-end.
+        let mut state = DlmmBinState::from_arrays_with_bitmaps(&arrays, 1, Some(bm), None).unwrap();
+        let mut pool = pool();
+        pool.bin_step = 1;
+
+        // Top of array 1: array_index * MAX_BIN_PER_ARRAY + slot 69.
+        let initial_active_id = MAX_BIN_PER_ARRAY as i32 + 69;
+        pool.active_id = initial_active_id;
+
+        // 10_000 X drains array 1 (~7000 Y) and partial-fills array -1.
+        let r = cross_bin_swap(10_000, initial_active_id, &mut state, true, &mut pool).unwrap();
+
+        // Fast-forwarded into array -1 (`[-70, -1]`).
+        assert!(
+            (-70..=-1).contains(&r.final_active_id),
+            "expected fast-forward into array -1; got final_active_id={}",
+            r.final_active_id,
+        );
+        // Drained 70 bins of array 1 (≈7_000 Y) plus partial array -1.
+        assert!(
+            r.amount_out > 7_000,
+            "expected amount_out > 7_000 (full array 1 + partial -1); got {}",
+            r.amount_out,
+        );
+        // 70 (drain array 1) + 1 (fast-forward across 0) + N ≥ 1 (partial -1).
+        assert!(
+            r.iterations > 70,
+            "expected fast-forward iteration after array 1 drain; got {}",
+            r.iterations,
+        );
+    }
+
+    /// Inner-band fast-forward bails when the bitmap reports the gap
+    /// array as initialised. Mirrors the extension test on the inner
+    /// `[-512, 511]` band — pins the symmetry: same dispatch path,
+    /// same bail semantics, just consulting the inline bitmap instead
+    /// of the extension PDA.
+    #[test]
+    fn cross_bin_walk_bails_when_internal_bitmap_says_gap_is_initialized() {
+        let arrays = vec![uniform_array(-1, 0, 100), uniform_array(1, 0, 100)];
+
+        // index 0 (the gap) ↔ limb 8 bit 0 is now SET — bitmap claims
+        // array 0 is initialised, but its data isn't loaded.
+        let mut bm = [0u64; 16];
+        bm[7] |= 1u64 << 63; // index -1
+        bm[8] |= (1u64 << 0) | (1u64 << 1); // indices 0 (gap) + 1
+
+        let mut state = DlmmBinState::from_arrays_with_bitmaps(&arrays, 1, Some(bm), None).unwrap();
+        let mut pool = pool();
+        pool.bin_step = 1;
+
+        let initial_active_id = MAX_BIN_PER_ARRAY as i32 + 69;
+        pool.active_id = initial_active_id;
+        let r = cross_bin_swap(10_000, initial_active_id, &mut state, true, &mut pool);
+        assert!(
+            r.is_none(),
+            "should bail when internal bitmap reports gap as initialised but unloaded",
         );
     }
 
