@@ -33,7 +33,7 @@
 
 Los ataques sandwich son la forma más común de extracción de MEV en Solana. Un atacante adelanta el swap de la víctima, empuja el precio y luego ejecuta un backrun para obtener ganancias — dentro del mismo bloque o a través de slots cercanos.
 
-**solana-sandwich-detector** es una librería en Rust que convierte un stream de bloques de Solana en un stream de ataques detectados. Soporta **detección same-block** (patrón clásico de un solo slot) y **detección cross-slot** (ataques que abarcan múltiples slots, con filtros de procedencia de bundles Jito, factibilidad económica y plausibilidad de la víctima). El enriquecimiento por replay AMM calcula la *pérdida real de la víctima* — no la heurística ingenua `amount_out - amount_in`. Se incluyen un CLI streaming (`sandwich-detect`), un framework de evaluación (`sandwich-eval`) y un harness de diff archival (`archival-diff`).
+**solana-sandwich-detector** es una librería en Rust que convierte un stream de bloques de Solana en un stream de ataques detectados. Soporta **detección same-block** (patrón clásico de un solo slot) y **detección cross-slot** (ataques que abarcan múltiples slots, con filtros de procedencia de bundles Jito, factibilidad económica y plausibilidad de la víctima). El enriquecimiento por replay AMM calcula la *pérdida real de la víctima* — no la heurística ingenua `amount_out - amount_in`. Se incluyen un CLI streaming (`sandwich-detect`), un framework de evaluación (`sandwich-eval`) y dos herramientas de diff (`balance-diff` para verificación cruzada parser-vs-RPC de la víctima, `archival-diff` para comparación replay-vs-chain del estado del pool).
 
 > Es la primitiva de detección que alimenta a [Vigil](https://github.com/EarthIsMine/Vigil-RPC) — una plataforma de transparencia MEV en Solana. La puntuación de validadores, la persistencia, las alertas y los dashboards viven en Vigil; este repositorio se centra en **stream-in → stream-out**. Ver [Alcance](#alcance) e [Integración con Vigil](#integración-con-vigil).
 
@@ -310,7 +310,7 @@ crates/
   pool-state/            Matemática AMM + enriquecimiento + diff archival
                          (producto constante / Whirlpool / DLMM)
   detector/              Crate fachada (re-exports para retrocompatibilidad)
-  cli/                   Binarios CLI (sandwich-detect, archival-diff)
+  cli/                   Binarios CLI (sandwich-detect, balance-diff, archival-diff)
   eval/                  Framework de evaluación + agregados económicos
 
 contrib/
