@@ -236,8 +236,8 @@ pub fn compute_loss_with_trace(
         spot_price_post_front: spot_1,
         counterfactual_victim_out,
         actual_victim_out,
-        fee_num: pool_0.fee_num as u32,
-        fee_den: pool_0.fee_den as u32,
+        fee_num: pool_0.fee_num,
+        fee_den: pool_0.fee_den,
     };
 
     Some((loss, trace))
@@ -454,10 +454,10 @@ pub fn compute_loss_whirlpool_with_trace(
         actual_victim_out: narrow_u64(actual_victim_out),
         // fee_num / fee_den come in as u128 to match the swap-math
         // layer; Whirlpool's on-chain fee_rate is u16 of hundredths-
-        // of-bps against a u32 1_000_000 denominator, so narrowing
-        // here is lossless for any legal pool.
-        fee_num: fee_num as u32,
-        fee_den: fee_den as u32,
+        // of-bps against a u32 1_000_000 denominator, so the trace's
+        // u64 surface fits any legal pool with room to spare.
+        fee_num: fee_num as u64,
+        fee_den: fee_den as u64,
     };
 
     Some((loss, trace))
@@ -772,18 +772,21 @@ pub fn compute_loss_dlmm_with_trace(
         SwapDirection::Sell => (raw_profit_no_v as f64 * quote_per_base) as i64,
     };
 
-    // price_impact_bps: first-order approximation, `bins_moved *
-    // bin_step`. The exact spread is `(1 + bin_step/10_000)^n - 1`;
-    // the linearisation drops the (1 + x)^n - 1 ≈ nx Taylor remainder.
-    // For realistic sandwiches (n ≤ 5, bin_step ≤ 25) the relative
-    // error is <0.1%, well below the bps reporting precision. Past
-    // ~50 bins (rare) the linearisation underestimates by a few
-    // percent — exact computation via `bin_price` ratio is a Phase 3
-    // refinement, behind variable-fee plumbing in priority since the
-    // approximation is already within the noise floor for the bps
-    // surface Vigil consumes.
+    // price_impact_bps: exact `(post / pre - 1) * 10_000` against the
+    // Q64.64 bin prices. The previous `bins_moved * bin_step`
+    // linearisation underestimates by ~6% at 50 bins, ~13% at 100
+    // — negligible for typical sandwiches but wrong on the tail
+    // where the bps surface matters most. `bin_price` returns the
+    // same Q64.64 the trace surfaces in `bin_price_pre`, so reader
+    // code can re-derive this number from trace fields alone.
+    //
+    // Falls back to the linearisation if `bin_price(active_after_front,
+    // bin_step)` overflows (only possible near MAX_BIN_ID with large
+    // bin_step, well outside any realistic pool).
     let active_id_diff = (active_after_front - initial_active_id).unsigned_abs();
-    let price_impact_bps = active_id_diff.saturating_mul(pool.bin_step as u32);
+    let price_impact_bps =
+        exact_price_impact_bps_dlmm(bin_price_q64, active_after_front, pool.bin_step)
+            .unwrap_or_else(|| active_id_diff.saturating_mul(pool.bin_step as u32));
 
     // Residuals compare *user-observed* amounts: `attack.*.amount_out`
     // is what the wallet received, so the predicted side uses the
@@ -874,10 +877,102 @@ fn q64_to_f64(price_q64: u128) -> f64 {
     (price_q64 as f64) / (1u128 << 64) as f64
 }
 
+/// Exact `(price_post / price_pre - 1) * 10_000` for DLMM. Both inputs
+/// are Q64.64; staged through U256 so `|post - pre| * 10_000` can't
+/// overflow even for `bin_id` values near `MAX_BIN_ID` with large
+/// `bin_step`. Returns `None` when `bin_price` itself fails or when
+/// `bin_price_pre_q64 == 0` (defensive — `compute_loss_dlmm_with_trace`
+/// already early-returns on zero pre-price, but the helper is
+/// library-shaped so it doesn't trust the caller to filter).
+///
+/// `bin_price_pre_q64` is expected to come from the same `bin_price`
+/// formula (either freshly computed or the on-chain-cached
+/// `Bin.price` written via the identical Q64.64 math); any drift
+/// between the two surfaces here as residual bps.
+fn exact_price_impact_bps_dlmm(
+    bin_price_pre_q64: u128,
+    active_id_post: i32,
+    bin_step: u16,
+) -> Option<u32> {
+    use primitive_types::U256;
+    if bin_price_pre_q64 == 0 {
+        return None;
+    }
+    let price_post = crate::meteora_dlmm::bin_price(active_id_post, bin_step)?;
+    let pre = U256::from(bin_price_pre_q64);
+    let post = U256::from(price_post);
+    let abs_diff = if post > pre { post - pre } else { pre - post };
+    let bps_u256 = abs_diff
+        .checked_mul(U256::from(10_000u64))?
+        .checked_div(pre)?;
+    Some(u32::try_from(bps_u256).unwrap_or(u32::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use swap_events::types::{DexType, SwapDirection, SwapEvent};
+
+    /// `exact_price_impact_bps_dlmm` returns 0 when `active_id_post`
+    /// matches the bin whose price went into `bin_price_pre_q64`.
+    /// Pins the no-swap edge (frontrun didn't move the active bin).
+    #[test]
+    fn dlmm_exact_price_impact_zero_diff_returns_zero() {
+        let pre = crate::meteora_dlmm::bin_price(0, 25).unwrap();
+        assert_eq!(exact_price_impact_bps_dlmm(pre, 0, 25), Some(0));
+    }
+
+    /// One-bin move with `bin_step=25` ⇒ analytic exact is 25 bps but
+    /// the Q64.64 `bin_price` helper floors `(25 << 64) / 10_000`,
+    /// shaving sub-bp off the price ratio. The helper therefore
+    /// reports 24 — the on-chain math agrees, since on-chain DLMM
+    /// uses the same Q64.64 representation. Pin the actual value so
+    /// any future precision change (e.g. moving to a wider scale or
+    /// rounding policy) trips this test rather than silently shifting
+    /// the bps surface.
+    #[test]
+    fn dlmm_exact_price_impact_one_bin_matches_q64_floor() {
+        let pre = crate::meteora_dlmm::bin_price(0, 25).unwrap();
+        assert_eq!(exact_price_impact_bps_dlmm(pre, 1, 25), Some(24));
+    }
+
+    /// Large-diff case (`bin_step=100`, diff=10) where the linearised
+    /// answer (`10 * 100 = 1000`) underestimates the exact answer
+    /// (`(1.01)^10 - 1 ≈ 1046 bps`). Pin the exact direction explicitly:
+    /// if the helper ever regresses to linearisation, this fails by
+    /// ~5%.
+    #[test]
+    fn dlmm_exact_price_impact_large_diff_beats_linearisation() {
+        let pre = crate::meteora_dlmm::bin_price(0, 100).unwrap();
+        let exact = exact_price_impact_bps_dlmm(pre, 10, 100).unwrap();
+        let linearised = 10 * 100;
+        assert!(
+            exact > linearised,
+            "exact {exact} must exceed linearised {linearised} at diff=10",
+        );
+        // (1.01)^10 = 1.10462... ⇒ floor((1.10462 - 1) * 10_000) = 1046.
+        // Allow ±2 bps for Q64.64 rounding noise.
+        assert!(
+            (1044..=1048).contains(&exact),
+            "exact {exact} not within Q64.64 rounding band of analytic 1046",
+        );
+    }
+
+    /// Helper handles negative `active_id_post` (Sell-side sandwiches
+    /// move the active bin downward). The ratio in the two directions
+    /// is the multiplicative inverse — `|ratio - 1|` is *not* the
+    /// same on both sides — but both must be positive and finite, not
+    /// signed/wrapped. Pins that the unsigned-bps surface comes back
+    /// non-zero in either direction.
+    #[test]
+    fn dlmm_exact_price_impact_handles_negative_active_id() {
+        let pre_at_neg = crate::meteora_dlmm::bin_price(-5, 100).unwrap();
+        let pre_at_zero = crate::meteora_dlmm::bin_price(0, 100).unwrap();
+        let down = exact_price_impact_bps_dlmm(pre_at_zero, -5, 100).unwrap();
+        let up = exact_price_impact_bps_dlmm(pre_at_neg, 0, 100).unwrap();
+        assert!(down > 0);
+        assert!(up > 0);
+    }
 
     fn swap(
         sig: &str,
@@ -1696,8 +1791,8 @@ mod tests {
             loss.actual_victim_out,
             loss.counterfactual_victim_out,
         );
-        // price_impact_bps = bins_moved * bin_step. With bin_step=25
-        // and a handful of bins moved, expect >0.
+        // price_impact_bps from the exact bin_price ratio. With
+        // bin_step=25 and a handful of bins moved, expect >0.
         assert!(loss.price_impact_bps > 0);
     }
 
