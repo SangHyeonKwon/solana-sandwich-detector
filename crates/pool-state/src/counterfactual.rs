@@ -23,7 +23,22 @@ use crate::meteora_dlmm::{cross_bin_swap, DlmmBinState, DlmmPool};
 use crate::orca_whirlpool::swap_math;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::orca_whirlpool::WhirlpoolPool;
+use crate::spl_mint::TransferFee;
 use crate::ConstantProduct;
+
+/// Apply a Token-2022 transfer fee to either an input or output
+/// amount. `None` (legacy SPL Token mint or no `TransferFeeConfig`
+/// extension) is the noop. `Some` returns `amount - calculate_fee`,
+/// matching on-chain `calculate_transfer_fee_excluded_amount`.
+fn transfer_fee_excluded_amount(amount: u64, fee: Option<TransferFee>) -> Option<u64> {
+    match fee {
+        Some(f) => {
+            let take = f.calculate_fee(amount)?;
+            amount.checked_sub(take)
+        }
+        None => Some(amount),
+    }
+}
 
 /// Result of replaying a sandwich through AMM math.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,9 +572,19 @@ pub fn compute_loss_dlmm(
     arrays: &[ParsedBinArray],
     base_is_token_a: bool,
     swap_timestamp: i64,
+    transfer_fee_x: Option<TransferFee>,
+    transfer_fee_y: Option<TransferFee>,
 ) -> Option<LossEstimate> {
-    compute_loss_dlmm_with_trace(attack, pool, arrays, base_is_token_a, swap_timestamp)
-        .map(|(loss, _trace)| loss)
+    compute_loss_dlmm_with_trace(
+        attack,
+        pool,
+        arrays,
+        base_is_token_a,
+        swap_timestamp,
+        transfer_fee_x,
+        transfer_fee_y,
+    )
+    .map(|(loss, _trace)| loss)
 }
 
 /// Like [`compute_loss_dlmm`] but also returns a
@@ -577,6 +602,8 @@ pub fn compute_loss_dlmm_with_trace(
     arrays: &[ParsedBinArray],
     base_is_token_a: bool,
     swap_timestamp: i64,
+    transfer_fee_x: Option<TransferFee>,
+    transfer_fee_y: Option<TransferFee>,
 ) -> Option<(LossEstimate, MeteoraDlmmReplayTrace)> {
     if attack.victim.direction != attack.frontrun.direction {
         return None;
@@ -620,32 +647,50 @@ pub fn compute_loss_dlmm_with_trace(
     let victim_swap_for_y = frontrun_swap_for_y;
     let backrun_swap_for_y = !frontrun_swap_for_y;
 
+    // Token-2022 transfer-fee routing per leg: `swap_for_y = true`
+    // means token X is the input (and token Y is the output); flip
+    // for the other direction. None on either side ⇒ legacy SPL
+    // Token mint, no fee adjustment.
+    let (front_fee_in, front_fee_out) = if frontrun_swap_for_y {
+        (transfer_fee_x, transfer_fee_y)
+    } else {
+        (transfer_fee_y, transfer_fee_x)
+    };
+    let (victim_fee_in, victim_fee_out) = (front_fee_in, front_fee_out);
+    let (back_fee_in, back_fee_out) = (front_fee_out, front_fee_in); // backrun reverses
+
     // 1. Frontrun on initial state → state_1. Pool snapshot reflects
     //    "first swap of the block": vol_acc starts from the on-chain
-    //    snapshot and grows with each bin crossed.
+    //    snapshot and grows with each bin crossed. Apply transfer fee
+    //    to the gross input before handing it to the swap math; the
+    //    swap output is then transfer-fee-adjusted post-walk.
+    let frontrun_in_net = transfer_fee_excluded_amount(attack.frontrun.amount_in, front_fee_in)?;
     let mut state_1 = initial_state.clone();
     let mut pool_front = pool_initial;
     let fr = cross_bin_swap(
-        attack.frontrun.amount_in,
+        frontrun_in_net,
         initial_active_id,
         &mut state_1,
         frontrun_swap_for_y,
         &mut pool_front,
     )?;
     let active_after_front = fr.final_active_id;
+    let frontrun_out_net = transfer_fee_excluded_amount(fr.amount_out, front_fee_out)?;
 
     // 2. Victim on state_1 → state_2. Pool inherits the post-frontrun
     //    `volatility_accumulator` so the victim's per-bin fee reflects
     //    the elevated volatility — same as on-chain.
+    let victim_in_net = transfer_fee_excluded_amount(attack.victim.amount_in, victim_fee_in)?;
     let mut state_2 = state_1.clone();
     let mut pool_victim = pool_front;
     let v = cross_bin_swap(
-        attack.victim.amount_in,
+        victim_in_net,
         active_after_front,
         &mut state_2,
         victim_swap_for_y,
         &mut pool_victim,
     )?;
+    let victim_out_net = transfer_fee_excluded_amount(v.amount_out, victim_fee_out)?;
 
     // 3. Counterfactual victim on initial state — frontrun never
     //    happened. Pool restarts from `pool_initial` so vol_acc = the
@@ -653,35 +698,42 @@ pub fn compute_loss_dlmm_with_trace(
     let mut state_counter = initial_state.clone();
     let mut pool_victim_counter = pool_initial;
     let v_counter = cross_bin_swap(
-        attack.victim.amount_in,
+        victim_in_net,
         initial_active_id,
         &mut state_counter,
         victim_swap_for_y,
         &mut pool_victim_counter,
     )?;
+    let victim_counter_out_net =
+        transfer_fee_excluded_amount(v_counter.amount_out, victim_fee_out)?;
 
     // 4. Backrun on state_2. Pool inherits post-victim accumulator.
+    //    Backrun direction is the *opposite* axis, so its fee routing
+    //    is the inverse of frontrun's.
+    let backrun_in_net = transfer_fee_excluded_amount(attack.backrun.amount_in, back_fee_in)?;
     let mut state_3 = state_2.clone();
     let mut pool_back = pool_victim;
     let b = cross_bin_swap(
-        attack.backrun.amount_in,
+        backrun_in_net,
         v.final_active_id,
         &mut state_3,
         backrun_swap_for_y,
         &mut pool_back,
     )?;
+    let backrun_out_net = transfer_fee_excluded_amount(b.amount_out, back_fee_out)?;
 
     // 5. Counterfactual: backrun on state_1 (no victim). Pool inherits
     //    post-frontrun (no victim) accumulator.
     let mut state_no_v = state_1.clone();
     let mut pool_back_no_v = pool_front;
     let b_no_v = cross_bin_swap(
-        attack.backrun.amount_in,
+        backrun_in_net,
         active_after_front,
         &mut state_no_v,
         backrun_swap_for_y,
         &mut pool_back_no_v,
     )?;
+    let backrun_no_v_out_net = transfer_fee_excluded_amount(b_no_v.amount_out, back_fee_out)?;
 
     // Quote-axis conversion. Initial bin price is the spot at the
     // pre-frontrun moment — same convention as Whirlpool's
@@ -693,21 +745,28 @@ pub fn compute_loss_dlmm_with_trace(
         1.0 / price_f64
     };
 
-    let actual_victim_out = v.amount_out;
-    let counterfactual_victim_out = v_counter.amount_out;
+    // All output amounts surfaced for loss/profit accounting are
+    // *transfer-fee-excluded*: the user's wallet only sees the net
+    // post-Token-2022-fee delivery, so victim_loss and attacker_profit
+    // must be measured in the same units. Inputs (`frontrun.amount_in`,
+    // `backrun.amount_in`) are the gross amounts the user spent —
+    // transfer fees on the input side are part of the user's cost,
+    // already baked into `amount_in`.
+    let actual_victim_out = victim_out_net;
+    let counterfactual_victim_out = victim_counter_out_net;
     let raw_victim_delta = (counterfactual_victim_out as i64 - actual_victim_out as i64).max(0);
     let victim_loss = match attack.victim.direction {
         SwapDirection::Buy => (raw_victim_delta as f64 * quote_per_base) as i64,
         SwapDirection::Sell => raw_victim_delta,
     };
 
-    let raw_profit = b.amount_out as i64 - attack.frontrun.amount_in as i64;
+    let raw_profit = backrun_out_net as i64 - attack.frontrun.amount_in as i64;
     let attacker_profit_real = match attack.frontrun.direction {
         SwapDirection::Buy => raw_profit,
         SwapDirection::Sell => (raw_profit as f64 * quote_per_base) as i64,
     };
 
-    let raw_profit_no_v = b_no_v.amount_out as i64 - attack.frontrun.amount_in as i64;
+    let raw_profit_no_v = backrun_no_v_out_net as i64 - attack.frontrun.amount_in as i64;
     let counterfactual_attacker_profit_no_victim = match attack.frontrun.direction {
         SwapDirection::Buy => raw_profit_no_v,
         SwapDirection::Sell => (raw_profit_no_v as f64 * quote_per_base) as i64,
@@ -726,9 +785,12 @@ pub fn compute_loss_dlmm_with_trace(
     let active_id_diff = (active_after_front - initial_active_id).unsigned_abs();
     let price_impact_bps = active_id_diff.saturating_mul(pool.bin_step as u32);
 
-    let residual_bps_frontrun = residual_bps(fr.amount_out, attack.frontrun.amount_out);
-    let residual_bps_victim = residual_bps(v.amount_out, attack.victim.amount_out);
-    let residual_bps_backrun = residual_bps(b.amount_out, attack.backrun.amount_out);
+    // Residuals compare *user-observed* amounts: `attack.*.amount_out`
+    // is what the wallet received, so the predicted side uses the
+    // transfer-fee-excluded net values too.
+    let residual_bps_frontrun = residual_bps(frontrun_out_net, attack.frontrun.amount_out);
+    let residual_bps_victim = residual_bps(victim_out_net, attack.victim.amount_out);
+    let residual_bps_backrun = residual_bps(backrun_out_net, attack.backrun.amount_out);
 
     let max_abs_residual_bps = [
         residual_bps_frontrun,
@@ -1532,7 +1594,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true, 0).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, None).unwrap();
         assert_eq!(
             loss.victim_loss, 0,
             "within-bin replay must yield zero loss"
@@ -1556,7 +1618,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 1_000_000_000, 0),
         );
-        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true, 0).is_none());
+        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, None).is_none());
     }
 
     /// Direction mismatch bails before any cross-bin work.
@@ -1569,7 +1631,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Sell, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true, 0).is_none());
+        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, None).is_none());
     }
 
     /// `base_is_token_a = false` (base on y-axis): exercise the
@@ -1584,7 +1646,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, &arrays, false, 0).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, false, 0, None, None).unwrap();
         assert_eq!(loss.victim_loss, 0);
         assert_eq!(loss.actual_victim_out, loss.counterfactual_victim_out);
     }
@@ -1606,7 +1668,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 5_000, 0),
             swap("b", "atk", SwapDirection::Sell, 5_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true, 0).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, None).unwrap();
         // Cross-bin walk: active_id moved, victim ate worse prices.
         // The exact loss depends on the price progression, but it
         // must be non-zero.
@@ -1619,5 +1681,43 @@ mod tests {
         // price_impact_bps = bins_moved * bin_step. With bin_step=25
         // and a handful of bins moved, expect >0.
         assert!(loss.price_impact_bps > 0);
+    }
+
+    /// Token-2022 transfer fee on the *output* mint shrinks
+    /// `actual_victim_out` and `counterfactual_victim_out` by the
+    /// same proportional amount. Pin that the fee is applied to both
+    /// the actual and counterfactual victim, so `victim_loss` (a
+    /// difference) shrinks proportionally rather than disappearing
+    /// or doubling.
+    #[test]
+    fn dlmm_transfer_fee_shrinks_victim_outputs() {
+        use crate::spl_mint::TransferFee;
+        let pool = dlmm_pool();
+        let arrays = dlmm_uniform_window(1_000, 1_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 5_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 5_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 5_000, 0),
+        );
+        let no_fee = compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, None).unwrap();
+
+        // 200 bp transfer fee on token X (the output mint for Buy
+        // when base_is_token_a). Sell-side backrun output is token Y
+        // ⇒ unaffected. Use a high cap so the per-bp formula bites.
+        let fee_x = TransferFee {
+            epoch: 0,
+            maximum_fee: u64::MAX,
+            transfer_fee_basis_points: 200,
+        };
+        let with_fee =
+            compute_loss_dlmm(&attack, &pool, &arrays, true, 0, Some(fee_x), None).unwrap();
+
+        // Both victim outputs shrink (≈2% off). Both must be smaller
+        // than the no-fee outputs, but their ordering is preserved.
+        assert!(with_fee.actual_victim_out < no_fee.actual_victim_out);
+        assert!(with_fee.counterfactual_victim_out < no_fee.counterfactual_victim_out);
+        // Loss is still positive (fee shrinks both halves of the diff,
+        // not just one).
+        assert!(with_fee.victim_loss > 0);
     }
 }

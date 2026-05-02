@@ -250,12 +250,22 @@ pub async fn enrich_attack(
                 .timestamp_ms
                 .map(|ms| ms / 1_000)
                 .unwrap_or(dlmm_pool.last_update_timestamp);
+            // Token-2022 transfer-fee plumbing surface: when the
+            // pool's mints carry a TransferFeeConfig extension, the
+            // caller supplies it here. Step 6 wires the surface; an
+            // upcoming follow-up adds the actual mint fetch via
+            // PoolStateLookup, at which point these `None`s become
+            // `Some` for Token-2022 mints. Phase 1/2 corpus pools all
+            // use legacy SPL Token mints ⇒ `None` matches existing
+            // behaviour.
             let Some((loss, dlmm_trace)) = compute_loss_dlmm_with_trace(
                 attack,
                 &dlmm_pool,
                 &arrays,
                 config.base_is_token_a,
                 swap_timestamp,
+                None,
+                None,
             ) else {
                 // None ⇒ cross-bin walked off the window, iteration
                 // cap fired, or direction-mismatch invariant violation.
