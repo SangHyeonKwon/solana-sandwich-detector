@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "archival-diff"
 path = "src/bin/archival_diff.rs"
 
+[[bin]]
+name = "balance-diff"
+path = "src/bin/balance_diff.rs"
+
 [dependencies]
 sandwich-detector = { workspace = true }
 sandwich-eval = { workspace = true }
