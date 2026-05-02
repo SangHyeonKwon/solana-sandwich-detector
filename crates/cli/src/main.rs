@@ -1275,6 +1275,89 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_json_preserves_per_dex_dispatch_with_zero_filled_untouched_buckets() {
+        // End-to-end pin on the contract Vigil's BE consumes: record
+        // events on two DEXes, then serialize the snapshot to JSON and
+        // verify (a) the per-DEX dispatch lands the right counter in
+        // the right bucket, (b) the same counter under different DEXes
+        // stays separate (the entire reason this refactor exists —
+        // distinguishing DLMM bracket walk-offs from Whirlpool ones),
+        // and (c) untouched DEXes still emit a zero-filled bucket so
+        // Vigil's BE never has to handle a missing key.
+        let metrics = EnrichmentMetrics::default();
+        metrics.record(DexType::OrcaWhirlpool, EnrichmentResult::Enriched);
+        metrics.record(
+            DexType::OrcaWhirlpool,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+        metrics.record(
+            DexType::MeteoraDlmm,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+        metrics.record(
+            DexType::MeteoraDlmm,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+
+        let json = serde_json::to_value(metrics.snapshot()).unwrap();
+
+        // (a) Whirlpool bucket reflects only Whirlpool events.
+        assert_eq!(json["orca_whirlpool"]["enriched"], 1);
+        assert_eq!(json["orca_whirlpool"]["cross_boundary_unsupported"], 1);
+
+        // (b) Same counter, different DEX, different total. Pre-#4
+        // this would have been a single `cross_boundary_unsupported: 3`
+        // with no way to attribute the DLMM half from operator-side.
+        assert_eq!(json["meteora_dlmm"]["cross_boundary_unsupported"], 2);
+        assert_eq!(json["meteora_dlmm"]["enriched"], 0);
+
+        // (c) Pre-population guarantee: every `DexType` variant emits
+        // a bucket even with zero events. Picks one untouched
+        // supported DEX (raydium_v4) and one unsupported one
+        // (pump_fun) to spot-check the contract.
+        assert_eq!(json["raydium_v4"]["enriched"], 0);
+        assert_eq!(json["raydium_v4"]["cross_boundary_unsupported"], 0);
+        assert_eq!(json["pump_fun"]["enriched"], 0);
+        assert_eq!(json["pump_fun"]["unsupported_dex"], 0);
+    }
+
+    #[test]
+    fn all_dex_types_constant_covers_every_dextype_variant() {
+        // Pin: `ALL_DEX_TYPES` and the `DexType` enum stay in sync.
+        // Adding a variant to `DexType` without adding it to
+        // `ALL_DEX_TYPES` means `record(new_variant, ...)` panics in
+        // production (the `expect` on the HashMap lookup). The
+        // exhaustive match below forces a compile error if a new
+        // variant is added — the runtime length check is just a
+        // double-check the array literal didn't drift.
+        fn _exhaustive_dex_check(d: DexType) -> &'static str {
+            match d {
+                DexType::RaydiumV4 => "raydium_v4",
+                DexType::RaydiumClmm => "raydium_clmm",
+                DexType::RaydiumCpmm => "raydium_cpmm",
+                DexType::OrcaWhirlpool => "orca_whirlpool",
+                DexType::JupiterV6 => "jupiter_v6",
+                DexType::MeteoraDlmm => "meteora_dlmm",
+                DexType::PumpFun => "pump_fun",
+                DexType::Phoenix => "phoenix",
+            }
+        }
+        assert_eq!(ALL_DEX_TYPES.len(), 8);
+
+        // Belt-and-braces: actually exercise `record` against every
+        // variant in the constant. If the constant ever gets out of
+        // sync with the enum (via an erroneous edit) this panics.
+        let metrics = EnrichmentMetrics::default();
+        for dex in ALL_DEX_TYPES {
+            metrics.record(dex, EnrichmentResult::Enriched);
+        }
+        let snap = metrics.snapshot();
+        for dex in ALL_DEX_TYPES {
+            assert_eq!(snap.by_dex[&dex].enriched, 1);
+        }
+    }
+
+    #[test]
     fn sandwich_line_round_trips_through_serde() {
         let mut attack = fixture_attack();
         let ctx = EmitContext {
