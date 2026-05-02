@@ -184,13 +184,23 @@ pub fn parse_mint(account_data: &[u8]) -> Option<MintInfo> {
     })
 }
 
+/// Hard cap on TLV iteration count. Real Token-2022 mints carry at
+/// most a handful of extensions (the [`ExtensionType`] enum has ~30
+/// variants); a malformed blob with all-zero `length` fields would
+/// otherwise let the walker grind through the entire 10MB account
+/// in 4-byte steps. 64 is generous (2x the enum size).
+const MAX_TLV_ITERATIONS: usize = 64;
+
 /// Walk the TLV chain at offset 166 looking for a
 /// `TransferFeeConfig` (extension type 1). Returns `None` if the
 /// extension isn't present, the blob is malformed (length runs past
 /// the buffer), or the payload is shorter than the expected 108 bytes.
 fn find_transfer_fee_config(data: &[u8]) -> Option<TransferFeeConfig> {
     let mut cursor = EXTENSION_TLV_START;
-    while cursor + 4 <= data.len() {
+    for _ in 0..MAX_TLV_ITERATIONS {
+        if cursor + 4 > data.len() {
+            return None;
+        }
         let ext_type = u16::from_le_bytes(data[cursor..cursor + 2].try_into().ok()?);
         let length = u16::from_le_bytes(data[cursor + 2..cursor + 4].try_into().ok()?) as usize;
         let payload_start = cursor + 4;

@@ -1077,10 +1077,14 @@ pub struct MeteoraDlmmReplayTrace {
     pub fee_num: u64,
     pub fee_den: u64,
 
-    /// Volatility accumulator at the pre-frontrun moment, post
-    /// `update_references` (i.e. the entry-time value the on-chain
-    /// quote would see). Phase 3 plumbing — `0` for pools with
-    /// `variable_fee_control = 0` or freshly-decayed accumulators.
+    /// Volatility accumulator carried by the pool snapshot
+    /// (`v_parameters.volatility_accumulator`). On-chain
+    /// `update_references` does *not* mutate this field — it only
+    /// resets `volatility_reference` based on elapsed time — so this
+    /// surfaces the raw account-snapshot value. The first bin of the
+    /// cross-bin walk reads it indirectly through
+    /// `update_volatility_accumulator`'s `delta_id = |index_reference
+    /// - active_id|` formula; subsequent bins overwrite it.
     pub volatility_accumulator_pre: u32,
     /// Volatility accumulator after the frontrun walk. Equals
     /// `pre + bins_crossed * 10_000` (capped at

@@ -274,9 +274,12 @@ export interface MeteoraDlmmReplayTrace {
   fee_num: number;
   fee_den: number;
 
-  /** Volatility accumulator at the pre-frontrun moment, post
-   *  `update_references` (entry-time). `0` for `variable_fee_control = 0`
-   *  pools or freshly-decayed accumulators. */
+  /** Volatility accumulator carried by the pool snapshot
+   *  (`v_parameters.volatility_accumulator`). On-chain
+   *  `update_references` only mutates `volatility_reference`, so the
+   *  snapshot accumulator is surfaced as-is. The first bin's
+   *  `update_volatility_accumulator` reads it indirectly via the
+   *  `delta_id = |index_reference - active_id|` formula. */
   volatility_accumulator_pre: number;
   /** Volatility accumulator after the frontrun walk. Capped at the
    *  pool's `max_volatility_accumulator`. */
@@ -291,10 +294,11 @@ export interface MeteoraDlmmReplayTrace {
   variable_fee_rate_post_front: number;
 
   /** Token-2022 transfer fee on token X (basis points over 10_000).
-   *  `null` for legacy SPL Token mints. */
-  token_x_transfer_fee_bps?: number | null;
-  /** Token-2022 transfer fee on token Y. */
-  token_y_transfer_fee_bps?: number | null;
+   *  `null` for legacy SPL Token mints. Always present (never
+   *  `undefined`) — Rust serialises Option<u16> as `null` not omit. */
+  token_x_transfer_fee_bps: number | null;
+  /** Token-2022 transfer fee on token Y. Always present, see above. */
+  token_y_transfer_fee_bps: number | null;
 }
 
 // ---------------------------------------------------------------------------

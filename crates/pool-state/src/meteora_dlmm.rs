@@ -1222,6 +1222,16 @@ pub mod cross_bin {
                     iterations: iter,
                 });
             }
+            // Look up the bin first; missing bin (window edge) fails
+            // the walk without mutating pool state. On-chain mirror:
+            // `quote_exact_in` only calls `update_volatility_accumulator`
+            // once it has confirmed the bin is in-range and about to
+            // be swapped — we do the same so a `None` here returns a
+            // clean failure path instead of leaving `pool.active_id`
+            // and `pool.volatility_accumulator` mutated for a bin we
+            // never traded against.
+            let snap = state.get(active_id)?;
+
             // Per-bin variable-fee refresh: sync active_id and update
             // the accumulator so `swap_within_bin`'s fee read sees the
             // accumulator value at *this bin's start*. Mirrors on-chain
@@ -1230,7 +1240,6 @@ pub mod cross_bin {
             pool.active_id = active_id;
             pool.update_volatility_accumulator()?;
 
-            let snap = state.get(active_id)?;
             let step = swap_within_bin(
                 amount_left,
                 snap.amount_x,
@@ -1548,6 +1557,21 @@ mod tests {
         // volatility_accumulator (20_000) * reduction_factor (5_000) /
         // BASIS_POINT_MAX (10_000) = 10_000.
         assert_eq!(pool.volatility_reference, 10_000);
+    }
+
+    /// Boundary: `reduction_factor = 10_000` ⇒ the decay multiplier
+    /// is exactly `1.0`, so the volatility_reference equals the
+    /// previous accumulator with no decay. Pins that the integer
+    /// `*reduction_factor / BASIS_POINT_MAX` math doesn't pick up an
+    /// off-by-one (e.g. `(vol * 10_001 / 10_000)` from a stray `+1`).
+    #[test]
+    fn update_references_full_decay_factor_preserves_accumulator() {
+        let mut pool = pool_with_dyn_fee();
+        pool.reduction_factor = 10_000;
+        pool.volatility_accumulator = 33_333;
+        // Inside decay window.
+        pool.update_references(1_000_000 + 100).unwrap();
+        assert_eq!(pool.volatility_reference, 33_333);
     }
 
     /// Decay window also passed — volatility_reference fully resets

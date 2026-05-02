@@ -829,6 +829,18 @@ pub fn compute_loss_dlmm_with_trace(
     // surfaced separately so a reader can decompose the total rate.
     // Phase 1/2 corpus pools (`variable_fee_control = 0`) see
     // `variable_fee_rate_* = 0` ⇒ `fee_num` value is unchanged.
+    //
+    // The base-rate is min-clamped at `DLMM_MAX_FEE_RATE` even though
+    // it's the "static base" component: on-chain `get_total_fee` caps
+    // *post-sum*, but Vigil consumers expecting `fee_num / fee_den`
+    // to fall in `[0, 0.1]` would see invalid percentages for pools
+    // whose raw `base_factor * bin_step * 10 * 10^bf_power` exceeds
+    // 10% (rare but configurable). Capping here preserves the
+    // `[0, 0.1]` invariant downstream; the (uncommon) excess can
+    // always be re-derived from `bin_step * base_factor` if needed.
+    let base_capped = pool_initial
+        .base_fee_rate()?
+        .min(crate::meteora_dlmm::DLMM_MAX_FEE_RATE);
     let trace = MeteoraDlmmReplayTrace {
         active_id_pre: initial_active_id,
         active_id_post_front: active_after_front,
@@ -838,7 +850,7 @@ pub fn compute_loss_dlmm_with_trace(
         counterfactual_victim_out,
         actual_victim_out,
         bin_step: pool.bin_step,
-        fee_num: pool_initial.base_fee_rate()? as u64,
+        fee_num: base_capped as u64,
         fee_den: crate::meteora_dlmm::DLMM_FEE_PRECISION,
         volatility_accumulator_pre: pool_initial.volatility_accumulator,
         volatility_accumulator_post_front: pool_front.volatility_accumulator,
@@ -1766,5 +1778,79 @@ mod tests {
         // Loss is still positive (fee shrinks both halves of the diff,
         // not just one).
         assert!(with_fee.victim_loss > 0);
+    }
+
+    /// Per-axis transfer-fee routing: setting `Some(fee)` on token X
+    /// only versus token Y only must produce *distinct* outcomes —
+    /// the two axes touch different legs (frontrun input vs output,
+    /// backrun input vs output). A regression that applied any
+    /// non-`None` fee symmetrically to all legs would yield identical
+    /// results between the two configurations. Pin that the routing
+    /// distinguishes the axes.
+    #[test]
+    fn dlmm_per_axis_transfer_fees_yield_distinct_results() {
+        use crate::spl_mint::TransferFee;
+        let pool = dlmm_pool();
+        let arrays = dlmm_uniform_window(1_000, 1_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 5_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 5_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 5_000, 0),
+        );
+        let fee = TransferFee {
+            epoch: 0,
+            maximum_fee: u64::MAX,
+            transfer_fee_basis_points: 200,
+        };
+        let no_fee = compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, None).unwrap();
+        let with_fee_x =
+            compute_loss_dlmm(&attack, &pool, &arrays, true, 0, Some(fee), None).unwrap();
+        let with_fee_y =
+            compute_loss_dlmm(&attack, &pool, &arrays, true, 0, None, Some(fee)).unwrap();
+
+        // Both per-axis configurations differ from no-fee.
+        assert_ne!(with_fee_x.attacker_profit_real, no_fee.attacker_profit_real);
+        assert_ne!(with_fee_y.attacker_profit_real, no_fee.attacker_profit_real);
+
+        // The two axes produce distinct outcomes — confirms routing
+        // doesn't collapse "any fee present" into a symmetric
+        // adjustment. Compare on at least one surfaced field that
+        // differs: backrun output fee (fee_y on Y output for
+        // backrun) vs victim output fee (fee_x on X output for
+        // victim).
+        assert_ne!(with_fee_x.actual_victim_out, with_fee_y.actual_victim_out);
+    }
+
+    /// Combined variable fee + transfer fee: trace surfaces both
+    /// independently. `volatility_accumulator_post_front > 0` (frontrun
+    /// drove the accumulator up); `token_y_transfer_fee_bps == 200`
+    /// flows through. Pins that step 6 (transfer fee) and step 4
+    /// (variable fee) compose correctly without one masking the other.
+    #[test]
+    fn dlmm_combined_variable_and_transfer_fee_surfaces() {
+        use crate::compute_loss_dlmm_with_trace;
+        use crate::spl_mint::TransferFee;
+        let mut pool = dlmm_pool();
+        pool.variable_fee_control = 40_000;
+        pool.max_volatility_accumulator = 350_000;
+        pool.bin_step = 10;
+        let arrays = dlmm_uniform_window(1_000, 1_000);
+        let attack = make_attack(
+            swap("f", "atk", SwapDirection::Buy, 5_000, 0),
+            swap("v", "vic", SwapDirection::Buy, 5_000, 0),
+            swap("b", "atk", SwapDirection::Sell, 5_000, 0),
+        );
+        let fee_y = TransferFee {
+            epoch: 0,
+            maximum_fee: u64::MAX,
+            transfer_fee_basis_points: 200,
+        };
+        let (_loss, trace) =
+            compute_loss_dlmm_with_trace(&attack, &pool, &arrays, true, 0, None, Some(fee_y))
+                .unwrap();
+        assert!(trace.volatility_accumulator_post_front > 0);
+        assert!(trace.variable_fee_rate_post_front > 0);
+        assert_eq!(trace.token_x_transfer_fee_bps, None);
+        assert_eq!(trace.token_y_transfer_fee_bps, Some(200));
     }
 }
