@@ -74,8 +74,7 @@ struct DiffRecord {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client =
-        RpcClient::new_with_commitment(cli.rpc.clone(), CommitmentConfig::confirmed());
+    let client = RpcClient::new_with_commitment(cli.rpc.clone(), CommitmentConfig::confirmed());
 
     let stdin = io::stdin();
     let stdout = io::stdout();
