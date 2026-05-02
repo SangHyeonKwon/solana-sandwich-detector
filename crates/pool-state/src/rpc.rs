@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLookup};
 use crate::meteora_dlmm::bin_array::ParsedBinArray;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
+use crate::spl_mint::{self, MintInfo};
 use crate::{meteora_dlmm, orca_whirlpool, raydium_cpmm, raydium_v4};
 
 /// Slot-aware account-fetch surface for archival providers.
@@ -297,6 +298,55 @@ impl PoolStateLookup for RpcPoolLookup {
     /// `None` at index `i` for missing accounts, defensive re-pad on
     /// fetcher misbehaviour. Indices are `i64` per the on-chain
     /// PDA-seed encoding.
+    /// Fetch SPL Token / Token-2022 mint accounts via the configured
+    /// fetcher and parse each blob through [`crate::spl_mint::parse_mint`].
+    /// Owner gating: only accounts owned by either the legacy SPL
+    /// Token program or Token-2022 are accepted; foreign owners come
+    /// back as `None` (a malformed fixture or a stray address typo
+    /// shouldn't pretend to be a mint).
+    ///
+    /// `slot` propagates to the fetcher exactly as in
+    /// [`Self::tick_arrays`]; archival providers that respect the
+    /// slot serve pre-frontrun mint state.
+    async fn mint_accounts(&self, mints: &[&str], slot: u64) -> Vec<Option<MintInfo>> {
+        if mints.is_empty() {
+            return Vec::new();
+        }
+        let mut pubkeys: Vec<Pubkey> = Vec::with_capacity(mints.len());
+        for s in mints {
+            match s.parse::<Pubkey>() {
+                Ok(p) => pubkeys.push(p),
+                Err(e) => {
+                    warn!(mint = s, error = %e, "invalid mint pubkey");
+                    return mints.iter().map(|_| None).collect();
+                }
+            }
+        }
+        let accounts = self.fetcher.fetch_multiple_accounts(&pubkeys, slot).await;
+        if accounts.len() != pubkeys.len() {
+            warn!(
+                expected = pubkeys.len(),
+                got = accounts.len(),
+                "fetcher returned mismatched account count for mint accounts",
+            );
+            return mints.iter().map(|_| None).collect();
+        }
+        let token = spl_mint::spl_token_program_id();
+        let token_2022 = spl_mint::spl_token_2022_program_id();
+        accounts
+            .into_iter()
+            .map(|opt| {
+                opt.and_then(|a| {
+                    if a.owner == token || a.owner == token_2022 {
+                        spl_mint::parse_mint(&a.data)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    }
+
     async fn bin_arrays(
         &self,
         pool: &str,
@@ -512,6 +562,44 @@ mod tests {
             starts.len(),
             "result vec must align 1:1 with start_indices",
         );
+    }
+
+    /// `mint_accounts` must forward the caller-supplied slot to every
+    /// pubkey in the multi-fetch and align the result vec 1:1 with
+    /// `mints`. Pins the slot-propagation contract that archival
+    /// providers rely on for pre-frontrun mint state.
+    #[tokio::test]
+    async fn mint_accounts_forwards_slot_per_pubkey() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let mint_a = Pubkey::new_unique().to_string();
+        let mint_b = Pubkey::new_unique().to_string();
+        let result = lookup
+            .mint_accounts(&[mint_a.as_str(), mint_b.as_str()], 42_000)
+            .await;
+        let calls = fetcher.calls();
+        assert_eq!(calls.len(), 2, "one entry per mint");
+        for (_, slot) in &calls {
+            assert_eq!(*slot, 42_000, "slot must be propagated to every mint");
+        }
+        assert_eq!(result.len(), 2, "result vec aligns 1:1 with input mints");
+    }
+
+    /// Empty input ⇒ empty output, no fetcher call. Pin so a future
+    /// caller passing zero-length doesn't trigger a useless RPC.
+    #[tokio::test]
+    async fn mint_accounts_empty_input_short_circuits() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let result = lookup.mint_accounts(&[], 0).await;
+        assert!(result.is_empty());
+        assert!(fetcher.calls().is_empty(), "fetcher must not be called");
     }
 
     /// Non-Whirlpool DEX short-circuits without invoking the fetcher

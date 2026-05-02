@@ -10,6 +10,7 @@ use swap_events::types::DexType;
 use crate::meteora_dlmm::bin_array::ParsedBinArray;
 use crate::meteora_dlmm::DlmmPool;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
+use crate::spl_mint::MintInfo;
 
 /// Kind of AMM that backs a pool — determines which math to apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +164,21 @@ pub trait PoolStateLookup: Send + Sync {
         _array_indices: &[i64],
         _slot: u64,
     ) -> Vec<Option<ParsedBinArray>> {
+        Vec::new()
+    }
+
+    /// Fetch one or more SPL Token / Token-2022 mint accounts. Result
+    /// aligns 1:1 with `mints` — `None` at index `i` means that mint's
+    /// fetch failed, the account doesn't exist, or it isn't owned by
+    /// either of the two SPL token programs (defensive; a foreign-
+    /// owned account-pretending-to-be-a-mint is a malformed fixture).
+    ///
+    /// Phase 3 uses this to surface Token-2022 `TransferFeeConfig`
+    /// extensions to the DLMM replay so swap inputs/outputs apply the
+    /// transfer fee. Default returns an empty `Vec` so implementations
+    /// stay opt-in and callers detect "not supported" via length
+    /// mismatch.
+    async fn mint_accounts(&self, _mints: &[&str], _slot: u64) -> Vec<Option<MintInfo>> {
         Vec::new()
     }
 }
