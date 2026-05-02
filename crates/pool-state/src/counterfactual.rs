@@ -824,6 +824,11 @@ pub fn compute_loss_dlmm_with_trace(
         victim_loss_upper,
     };
 
+    // Phase 3 trace expansion: `fee_num` now carries the *static
+    // base* component only — variable + transfer-fee components are
+    // surfaced separately so a reader can decompose the total rate.
+    // Phase 1/2 corpus pools (`variable_fee_control = 0`) see
+    // `variable_fee_rate_* = 0` ⇒ `fee_num` value is unchanged.
     let trace = MeteoraDlmmReplayTrace {
         active_id_pre: initial_active_id,
         active_id_post_front: active_after_front,
@@ -833,17 +838,18 @@ pub fn compute_loss_dlmm_with_trace(
         counterfactual_victim_out,
         actual_victim_out,
         bin_step: pool.bin_step,
-        // Caller-friendly numerator/denominator. Phase 1 step 4
-        // restructured fee math so `total_fee_rate / DLMM_FEE_PRECISION`
-        // is the canonical fraction; surface that here so a reader
-        // doesn't have to derive `base_factor * bin_step * 10` from
-        // `bin_step` alone.
-        // Propagate `None` rather than masking with `0`: an
-        // overflow in `total_fee_rate` (only reachable in Phase 3
-        // variable-fee plumbing) shouldn't silently surface a "no
-        // fee" trace.
-        fee_num: pool.total_fee_rate()? as u64,
+        fee_num: pool_initial.base_fee_rate()? as u64,
         fee_den: crate::meteora_dlmm::DLMM_FEE_PRECISION,
+        volatility_accumulator_pre: pool_initial.volatility_accumulator,
+        volatility_accumulator_post_front: pool_front.volatility_accumulator,
+        variable_fee_rate_pre: pool_initial
+            .compute_variable_fee(pool_initial.volatility_accumulator)?
+            as u64,
+        variable_fee_rate_post_front: pool_front
+            .compute_variable_fee(pool_front.volatility_accumulator)?
+            as u64,
+        token_x_transfer_fee_bps: transfer_fee_x.map(|f| f.transfer_fee_basis_points),
+        token_y_transfer_fee_bps: transfer_fee_y.map(|f| f.transfer_fee_basis_points),
     };
 
     Some((loss, trace))

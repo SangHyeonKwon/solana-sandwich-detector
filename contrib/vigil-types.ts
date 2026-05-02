@@ -268,10 +268,33 @@ export interface MeteoraDlmmReplayTrace {
   /** Bin step in basis points (`25` = 0.25%). Static per pool. */
   bin_step: number;
 
-  /** DLMM fee fraction. `fee_num / fee_den` where `fee_den = 1e9`
-   *  (DLMM_FEE_PRECISION). e.g. `2_000_000 / 1e9` = 0.2%. */
+  /** DLMM static-base fee fraction. `fee_num / fee_den` where
+   *  `fee_den = 1e9` (DLMM_FEE_PRECISION). Add `variable_fee_rate_*`
+   *  to recover the total rate at any leg. Capped at 10% post-sum. */
   fee_num: number;
   fee_den: number;
+
+  /** Volatility accumulator at the pre-frontrun moment, post
+   *  `update_references` (entry-time). `0` for `variable_fee_control = 0`
+   *  pools or freshly-decayed accumulators. */
+  volatility_accumulator_pre: number;
+  /** Volatility accumulator after the frontrun walk. Capped at the
+   *  pool's `max_volatility_accumulator`. */
+  volatility_accumulator_post_front: number;
+
+  /** Variable-fee numerator at the pre-frontrun accumulator (over
+   *  `fee_den`). `0` when `variable_fee_control = 0`. */
+  variable_fee_rate_pre: number;
+  /** Variable-fee numerator at the post-frontrun accumulator. Lets
+   *  a reader see how much the frontrun's bin walk inflated the fee
+   *  the victim paid. */
+  variable_fee_rate_post_front: number;
+
+  /** Token-2022 transfer fee on token X (basis points over 10_000).
+   *  `null` for legacy SPL Token mints. */
+  token_x_transfer_fee_bps?: number | null;
+  /** Token-2022 transfer fee on token Y. */
+  token_y_transfer_fee_bps?: number | null;
 }
 
 // ---------------------------------------------------------------------------

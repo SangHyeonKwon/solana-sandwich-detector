@@ -1126,7 +1126,11 @@
         "bin_step",
         "counterfactual_victim_out",
         "fee_den",
-        "fee_num"
+        "fee_num",
+        "variable_fee_rate_post_front",
+        "variable_fee_rate_pre",
+        "volatility_accumulator_post_front",
+        "volatility_accumulator_pre"
       ],
       "properties": {
         "active_id_pre": {
@@ -1172,7 +1176,7 @@
           "minimum": 0.0
         },
         "fee_num": {
-          "description": "LP fee fraction. DLMM uses `fee_num / 1_000_000_000` units (`base_factor * bin_step * 10 * 10^bf_power`), capped at 10%.",
+          "description": "LP fee fraction. DLMM uses `fee_num / 1_000_000_000` units. Phase 1/2: base fee only (`base_factor * bin_step * 10 * 10^bf_power`). Phase 3: this carries the *static base* portion of the rate; the variable component is surfaced separately via `variable_fee_rate_*` so a reader can decompose the total. Capped at 10% post-sum.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -1180,6 +1184,48 @@
         "fee_den": {
           "type": "integer",
           "format": "uint64",
+          "minimum": 0.0
+        },
+        "volatility_accumulator_pre": {
+          "description": "Volatility accumulator at the pre-frontrun moment, post `update_references` (i.e. the entry-time value the on-chain quote would see). Phase 3 plumbing — `0` for pools with `variable_fee_control = 0` or freshly-decayed accumulators.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "volatility_accumulator_post_front": {
+          "description": "Volatility accumulator after the frontrun walk. Equals `pre + bins_crossed * 10_000` (capped at `max_volatility_accumulator`). The biggest accumulator value the victim's per-bin fee will ever see in the standard frontrun→victim→backrun sequence.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "variable_fee_rate_pre": {
+          "description": "Variable-fee numerator at the pre-frontrun accumulator value (over `fee_den`). `0` when the pool's `variable_fee_control` is 0 or the accumulator is 0. Add to `fee_num` to get the pre-frontrun total fee rate.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "variable_fee_rate_post_front": {
+          "description": "Variable-fee numerator at the post-frontrun accumulator. Lets a reader see how much the frontrun's bin walk inflated the fee the victim paid.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "token_x_transfer_fee_bps": {
+          "description": "Token-2022 transfer fee on token X, in basis points over `10_000`. `None` for legacy SPL Token mints (the common case for Phase 1/2 corpus pools). Surfaced symmetrically for X/Y rather than in/out so the trace is direction-agnostic.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "token_y_transfer_fee_bps": {
+          "description": "Token-2022 transfer fee on token Y, in basis points.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
           "minimum": 0.0
         }
       }
