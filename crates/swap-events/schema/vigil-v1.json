@@ -1007,15 +1007,15 @@
           "minimum": 0.0
         },
         "fee_num": {
-          "description": "Numerator of the pool's constant-product fee (e.g. 25 for 25bps).",
+          "description": "Numerator of the pool's constant-product fee (e.g. 25 for 25bps). Matches `PoolConfig::fee_num` source type so no narrowing cast happens en route to the trace.",
           "type": "integer",
-          "format": "uint32",
+          "format": "uint64",
           "minimum": 0.0
         },
         "fee_den": {
           "description": "Denominator of the pool's fee (e.g. 10000).",
           "type": "integer",
-          "format": "uint32",
+          "format": "uint64",
           "minimum": 0.0
         }
       }
@@ -1101,14 +1101,14 @@
           "minimum": 0.0
         },
         "fee_num": {
-          "description": "LP fee fraction. Whirlpool uses `fee_num` in hundredths-of-bps against `fee_den = 1_000_000` (e.g. `3000 / 1_000_000` = 30 bps).",
+          "description": "LP fee fraction. Whirlpool uses `fee_num` in hundredths-of-bps against `fee_den = 1_000_000` (e.g. `3000 / 1_000_000` = 30 bps). `u64` matches `PoolConfig::fee_num` and the DLMM trace, removing a narrowing `as u32` cast at the construction site.",
           "type": "integer",
-          "format": "uint32",
+          "format": "uint64",
           "minimum": 0.0
         },
         "fee_den": {
           "type": "integer",
-          "format": "uint32",
+          "format": "uint64",
           "minimum": 0.0
         }
       }

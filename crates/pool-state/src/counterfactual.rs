@@ -236,8 +236,8 @@ pub fn compute_loss_with_trace(
         spot_price_post_front: spot_1,
         counterfactual_victim_out,
         actual_victim_out,
-        fee_num: pool_0.fee_num as u32,
-        fee_den: pool_0.fee_den as u32,
+        fee_num: pool_0.fee_num,
+        fee_den: pool_0.fee_den,
     };
 
     Some((loss, trace))
@@ -454,10 +454,10 @@ pub fn compute_loss_whirlpool_with_trace(
         actual_victim_out: narrow_u64(actual_victim_out),
         // fee_num / fee_den come in as u128 to match the swap-math
         // layer; Whirlpool's on-chain fee_rate is u16 of hundredths-
-        // of-bps against a u32 1_000_000 denominator, so narrowing
-        // here is lossless for any legal pool.
-        fee_num: fee_num as u32,
-        fee_den: fee_den as u32,
+        // of-bps against a u32 1_000_000 denominator, so the trace's
+        // u64 surface fits any legal pool with room to spare.
+        fee_num: fee_num as u64,
+        fee_den: fee_den as u64,
     };
 
     Some((loss, trace))

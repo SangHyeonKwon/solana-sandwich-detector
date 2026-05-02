@@ -958,9 +958,11 @@ pub struct AmmReplayTrace {
     /// What the victim actually received.
     pub actual_victim_out: u64,
     /// Numerator of the pool's constant-product fee (e.g. 25 for 25bps).
-    pub fee_num: u32,
+    /// Matches `PoolConfig::fee_num` source type so no narrowing cast
+    /// happens en route to the trace.
+    pub fee_num: u64,
     /// Denominator of the pool's fee (e.g. 10000).
-    pub fee_den: u32,
+    pub fee_den: u64,
 }
 
 /// Whirlpool (concentrated-liquidity) replay trace — the analogue of
@@ -1025,8 +1027,10 @@ pub struct WhirlpoolReplayTrace {
 
     /// LP fee fraction. Whirlpool uses `fee_num` in hundredths-of-bps
     /// against `fee_den = 1_000_000` (e.g. `3000 / 1_000_000` = 30 bps).
-    pub fee_num: u32,
-    pub fee_den: u32,
+    /// `u64` matches `PoolConfig::fee_num` and the DLMM trace, removing
+    /// a narrowing `as u32` cast at the construction site.
+    pub fee_num: u64,
+    pub fee_den: u64,
 }
 
 /// Per-step DLMM (Meteora Liquidity Book) replay trace surfaced on
