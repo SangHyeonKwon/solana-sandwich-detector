@@ -42,14 +42,20 @@ pub enum EnrichmentResult {
     ReservesMissing,
     /// Replay returned `None` (direction mismatch or zero reserves).
     ReplayFailed,
-    /// Whirlpool replay exhausted both the within-tick fast path and
-    /// the cross-tick fallback without resolving the sandwich — the
-    /// caller's lookup didn't return enough TickArrays, the swap
-    /// walked off the fetched range, or liquidity drained mid-walk.
+    /// Concentrated-liquidity replay walked off the fetched window:
+    /// Whirlpool exhausted both within-tick and cross-tick paths
+    /// (or `liquidity_net` pushed active liquidity below zero
+    /// mid-walk), or DLMM walked past the supplied BinArray range.
+    /// Both DEXes share the variant because the failure mode and
+    /// the operator response (widen the TickArray/BinArray fetch
+    /// bracket) are identical even though the boundary unit differs
+    /// (tick vs bin).
+    ///
     /// Caller treats this like [`EnrichmentResult::UnsupportedDex`]
     /// (replay-derived fields aren't populated) but the variant is
-    /// distinct so cross-tick rate can be tracked separately.
-    CrossTickUnsupported,
+    /// distinct so the boundary-walk failure rate can be tracked
+    /// separately.
+    CrossBoundaryUnsupported,
 }
 
 /// Attempt to fill `victim_loss_lamports`, `attacker_profit`, and
@@ -149,7 +155,7 @@ pub async fn enrich_attack(
             // Implementations that don't speak the TickArray protocol
             // (`NoPoolLookup`, partial mocks) return `Vec::new()` here;
             // the per-leg fallback then sees no arrays and stays on the
-            // within-tick path — `CrossTickUnsupported` fires only when
+            // within-tick path — `CrossBoundaryUnsupported` fires only when
             // *both* paths fail.
             let span = ticks_per_array_span(pool_0.tick_spacing);
             let center = start_tick_index_for(pool_0.tick_current_index, pool_0.tick_spacing);
@@ -174,7 +180,7 @@ pub async fn enrich_attack(
                 config.base_is_token_a,
                 &tick_arrays,
             ) else {
-                return EnrichmentResult::CrossTickUnsupported;
+                return EnrichmentResult::CrossBoundaryUnsupported;
             };
             // Severity TVL: the frontrun tx's quote-vault balance, when
             // extractable. Whirlpool vaults hold tokens from out-of-range
@@ -190,7 +196,7 @@ pub async fn enrich_attack(
             // Phase 1 within-bin DLMM replay. Fetch dynamic state
             // (active_id + fee parameters) + the BinArray containing
             // the active bin, then run `compute_loss_dlmm`. Cross-bin
-            // legs bail with `CrossTickUnsupported` for Phase 2 follow-up.
+            // legs bail with `CrossBoundaryUnsupported` for Phase 2 follow-up.
             let Some(state) = lookup
                 .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
                 .await
@@ -210,7 +216,7 @@ pub async fn enrich_attack(
             // 350 bins of reach — covers any realistic sandwich
             // amount on a paid-tier pool. Cross-bin walks beyond the
             // window land on `out_of_window_bails` in `cross_bin_swap`
-            // and surface as `CrossTickUnsupported`.
+            // and surface as `CrossBoundaryUnsupported`.
             let array_indices: [i64; 5] = [
                 array_index - 2,
                 array_index - 1,
@@ -225,14 +231,14 @@ pub async fn enrich_attack(
             // the "not supported" signal — same convention as Whirlpool's
             // tick_arrays.
             if arrays_raw.is_empty() {
-                return EnrichmentResult::CrossTickUnsupported;
+                return EnrichmentResult::CrossBoundaryUnsupported;
             }
             // The active array (slot 2 in the request order) is the
             // *minimum* for any DLMM replay — within-bin or otherwise.
             // Missing it means the lookup couldn't serve the most
             // important account in the window.
             if !matches!(arrays_raw.get(2), Some(Some(_))) {
-                return EnrichmentResult::CrossTickUnsupported;
+                return EnrichmentResult::CrossBoundaryUnsupported;
             }
             // Collapse the window to the populated arrays. Cross-bin
             // walker tolerates missing peripherals — it just bails
@@ -302,10 +308,10 @@ pub async fn enrich_attack(
             ) else {
                 // None ⇒ cross-bin walked off the window, iteration
                 // cap fired, or direction-mismatch invariant violation.
-                // Map to CrossTickUnsupported so Phase 3 follow-up
+                // Map to CrossBoundaryUnsupported so Phase 3 follow-up
                 // (variable fee, token-2022) can be tracked separately
                 // from invariant-violation cases.
-                return EnrichmentResult::CrossTickUnsupported;
+                return EnrichmentResult::CrossBoundaryUnsupported;
             };
 
             // Severity TVL: same shape as the other paths — frontrun
@@ -1019,10 +1025,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whirlpool_cross_tick_returns_cross_tick_variant() {
+    async fn whirlpool_cross_tick_returns_cross_boundary_variant() {
         // Tiny liquidity + large frontrun walks past the next tick
         // boundary on the very first leg. apply_swap_within_tick bails,
-        // and enrich_attack maps that to CrossTickUnsupported — distinct
+        // and enrich_attack maps that to CrossBoundaryUnsupported — distinct
         // from ReplayFailed because the failure is a known model
         // limitation, not a parser bug.
         let mut attack = make_attack();
@@ -1048,7 +1054,7 @@ mod tests {
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
-        assert_eq!(result, EnrichmentResult::CrossTickUnsupported);
+        assert_eq!(result, EnrichmentResult::CrossBoundaryUnsupported);
         assert!(attack.victim_loss_lamports.is_none());
     }
 
@@ -1359,8 +1365,8 @@ mod tests {
     // construction (constant-sum mechanic ⇒ frontrun doesn't move price).
     // These integration fixtures pin the end-to-end flow:
     //   1. within-bin sandwich ⇒ Enriched, victim_loss = 0;
-    //   2. cross-bin sandwich (bin gets drained) ⇒ CrossTickUnsupported;
-    //   3. missing BinArray ⇒ CrossTickUnsupported.
+    //   2. cross-bin sandwich (bin gets drained) ⇒ CrossBoundaryUnsupported;
+    //   3. missing BinArray ⇒ CrossBoundaryUnsupported.
 
     use crate::meteora_dlmm::bin_array::{ParsedBin, ParsedBinArray, MAX_BIN_PER_ARRAY};
     use crate::meteora_dlmm::price_math::ONE as DLMM_ONE;
@@ -1475,9 +1481,9 @@ mod tests {
     /// Cross-bin sandwich: tiny bin reserves (100 each) vs. a much
     /// larger frontrun (1B). First leg drains the bin ⇒
     /// `compute_loss_dlmm` returns `None` ⇒ enrich reports
-    /// `CrossTickUnsupported`. Phase 2 will pick this up.
+    /// `CrossBoundaryUnsupported`. Phase 2 will pick this up.
     #[tokio::test]
-    async fn dlmm_cross_bin_corpus_returns_cross_tick_unsupported() {
+    async fn dlmm_cross_bin_corpus_returns_cross_boundary_unsupported() {
         let mut attack = make_dlmm_attack(1_000_000_000);
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
@@ -1493,16 +1499,16 @@ mod tests {
         };
         assert_eq!(
             enrich_attack(&mut attack, &tx, None, &lookup).await,
-            EnrichmentResult::CrossTickUnsupported,
+            EnrichmentResult::CrossBoundaryUnsupported,
         );
     }
 
     /// Missing BinArray (lookup returns empty Vec) ⇒ enrich can't see
     /// the active bin's reserves and bails with
-    /// `CrossTickUnsupported`. Same convention as Whirlpool when
+    /// `CrossBoundaryUnsupported`. Same convention as Whirlpool when
     /// tick_arrays come back empty.
     #[tokio::test]
-    async fn dlmm_missing_bin_array_corpus_returns_cross_tick_unsupported() {
+    async fn dlmm_missing_bin_array_corpus_returns_cross_boundary_unsupported() {
         let mut attack = make_dlmm_attack(100_000);
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
@@ -1515,7 +1521,7 @@ mod tests {
         };
         assert_eq!(
             enrich_attack(&mut attack, &tx, None, &lookup).await,
-            EnrichmentResult::CrossTickUnsupported,
+            EnrichmentResult::CrossBoundaryUnsupported,
         );
     }
 
@@ -1659,7 +1665,7 @@ mod tests {
     /// walker must step *into array 1* to absorb the input. Pins that
     /// the 5-array window's peripheral arrays are actually used —
     /// without array 1's reserves, the walker would bail with
-    /// `CrossTickUnsupported`.
+    /// `CrossBoundaryUnsupported`.
     #[tokio::test]
     async fn dlmm_corpus_walks_across_array_boundary() {
         let mut attack = make_dlmm_attack(10_000);
@@ -1974,7 +1980,7 @@ mod tests {
     /// are populated. Configures `[Some(-2), None, Some(0), None,
     /// Some(2)]` — gap at array indices -1 and +1. Cross-bin walks
     /// from active_id 0 going up should hit bin 70 (array +1, missing)
-    /// and bail with `CrossTickUnsupported`.
+    /// and bail with `CrossBoundaryUnsupported`.
     #[tokio::test]
     async fn dlmm_corpus_partial_peripheral_bails_into_gap() {
         let mut attack = make_dlmm_attack(1_000_000);
@@ -2000,6 +2006,6 @@ mod tests {
         // 1M input ≫ array 0's ~70k worth of reserves ⇒ walker must
         // step into array 1, which is `None` ⇒ bail.
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
-        assert_eq!(result, EnrichmentResult::CrossTickUnsupported);
+        assert_eq!(result, EnrichmentResult::CrossBoundaryUnsupported);
     }
 }

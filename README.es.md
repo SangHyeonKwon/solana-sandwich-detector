@@ -201,7 +201,7 @@ Este repositorio es la primitiva de detección upstream de [Vigil](https://githu
 // Heartbeat — cada 30s mientras corre. Incluye snapshot de métricas de enriquecimiento.
 { "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
     "enriched": 142, "unsupported_dex": 18, "config_unavailable": 3,
-    "reserves_missing": 1, "replay_failed": 0, "cross_tick_unsupported": 4 } }
+    "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 4 } }
 
 // SandwichAttack — uno por detección. Esquema completo en vigil-v1.json.
 { "slot": 285012345, "attacker": "...", "frontrun": {...}, "victim": {...}, ... }

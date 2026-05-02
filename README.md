@@ -201,7 +201,7 @@ This repo is the upstream detection primitive for [Vigil](https://github.com/Ear
 // Heartbeat — every 30s while running. Includes enrichment metric snapshot.
 { "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
     "enriched": 142, "unsupported_dex": 18, "config_unavailable": 3,
-    "reserves_missing": 1, "replay_failed": 0, "cross_tick_unsupported": 4 } }
+    "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 4 } }
 
 // SandwichAttack — one per detection. Full schema in vigil-v1.json.
 { "slot": 285012345, "attacker": "...", "frontrun": {...}, "victim": {...}, ... }
