@@ -1126,7 +1126,7 @@ pub mod cross_bin {
         ///
         /// Both cases produce the same downstream behaviour
         /// (`cross_bin_swap` bails with `None`, enrich reports
-        /// `CrossTickUnsupported`), so the caller doesn't need to
+        /// `CrossBoundaryUnsupported`), so the caller doesn't need to
         /// distinguish them — but they're semantically different
         /// failure modes worth flagging in diagnostics.
         pub fn get(&self, bin_id: i32) -> Option<BinSnapshot> {

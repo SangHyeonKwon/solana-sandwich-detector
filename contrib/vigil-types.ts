@@ -30,9 +30,10 @@ export interface JsonlHeartbeat {
   /** Detector wall-clock unix epoch ms; emitted periodically in `--follow`. */
   _heartbeat: number;
   /** Process-lifetime counters for enrichment outcomes. Lets ops watch
-   *  the cross-tick fetch window — `cross_tick_unsupported` climbing
-   *  relative to `enriched` means the 5-array center-±2 fetch window
-   *  is starting to under-fetch and the bracket should widen. */
+   *  the concentrated-liquidity fetch window (Whirlpool TickArray /
+   *  DLMM BinArray) — `cross_boundary_unsupported` climbing relative
+   *  to `enriched` means the 5-array center-±2 fetch window is
+   *  starting to under-fetch and the bracket should widen. */
   metrics: EnrichmentMetricsSnapshot;
 }
 
@@ -49,10 +50,12 @@ export interface EnrichmentMetricsSnapshot {
   /** Replay returned `None` — direction-invariant break or zero
    *  reserves. Should be vanishingly rare on real sandwiches. */
   replay_failed: number;
-  /** Whirlpool replay exhausted both within-tick and cross-tick paths.
-   *  Watch this counter — it's the leading signal that the fetch
-   *  window needs widening. */
-  cross_tick_unsupported: number;
+  /** Concentrated-liquidity replay walked off the fetched window —
+   *  Whirlpool exhausted within-tick + cross-tick (or `liquidity_net`
+   *  pushed active liquidity below zero mid-walk), or DLMM walked
+   *  past the BinArray bracket. Watch this counter: it's the
+   *  leading signal that the 5-array fetch bracket needs widening. */
+  cross_boundary_unsupported: number;
 }
 
 export type DetectorLine = JsonlHeader | JsonlHeartbeat | SandwichAttack;

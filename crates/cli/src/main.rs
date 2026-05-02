@@ -724,8 +724,10 @@ fn write_heartbeat<W: Write>(out: &mut W, ts_ms: i64) -> Result<()> {
 /// Process-lifetime counter for enrichment outcomes. Updated inside
 /// [`enrich_from_cache`] every time `enrich_attack` returns; emitted in
 /// the JSONL heartbeat under `metrics`. Lets ops monitor when the
-/// 5-array TickArray fetch window starts under-fetching in production
-/// (`cross_tick_unsupported` climbing relative to `enriched`).
+/// concentrated-liquidity fetch window (Whirlpool 5-array TickArray
+/// bracket or DLMM 5-array BinArray bracket) starts under-fetching
+/// in production — `cross_boundary_unsupported` climbing relative
+/// to `enriched` is the leading signal that the bracket should widen.
 #[derive(Debug, Default)]
 struct EnrichmentMetrics {
     enriched: AtomicU64,
@@ -733,7 +735,7 @@ struct EnrichmentMetrics {
     config_unavailable: AtomicU64,
     reserves_missing: AtomicU64,
     replay_failed: AtomicU64,
-    cross_tick_unsupported: AtomicU64,
+    cross_boundary_unsupported: AtomicU64,
 }
 
 impl EnrichmentMetrics {
@@ -748,7 +750,7 @@ impl EnrichmentMetrics {
             EnrichmentResult::ConfigUnavailable => &self.config_unavailable,
             EnrichmentResult::ReservesMissing => &self.reserves_missing,
             EnrichmentResult::ReplayFailed => &self.replay_failed,
-            EnrichmentResult::CrossTickUnsupported => &self.cross_tick_unsupported,
+            EnrichmentResult::CrossBoundaryUnsupported => &self.cross_boundary_unsupported,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -760,7 +762,7 @@ impl EnrichmentMetrics {
             config_unavailable: self.config_unavailable.load(Ordering::Relaxed),
             reserves_missing: self.reserves_missing.load(Ordering::Relaxed),
             replay_failed: self.replay_failed.load(Ordering::Relaxed),
-            cross_tick_unsupported: self.cross_tick_unsupported.load(Ordering::Relaxed),
+            cross_boundary_unsupported: self.cross_boundary_unsupported.load(Ordering::Relaxed),
         }
     }
 }
@@ -775,7 +777,7 @@ struct EnrichmentMetricsSnapshot {
     config_unavailable: u64,
     reserves_missing: u64,
     replay_failed: u64,
-    cross_tick_unsupported: u64,
+    cross_boundary_unsupported: u64,
 }
 
 /// Global metrics accessor — process-lifetime singleton, lazy-init.
@@ -1128,7 +1130,7 @@ mod tests {
             "config_unavailable",
             "reserves_missing",
             "replay_failed",
-            "cross_tick_unsupported",
+            "cross_boundary_unsupported",
         ] {
             assert!(
                 metrics.get(key).is_some(),
@@ -1144,12 +1146,12 @@ mod tests {
         let metrics = EnrichmentMetrics::default();
         metrics.record(EnrichmentResult::Enriched);
         metrics.record(EnrichmentResult::Enriched);
-        metrics.record(EnrichmentResult::CrossTickUnsupported);
+        metrics.record(EnrichmentResult::CrossBoundaryUnsupported);
         metrics.record(EnrichmentResult::UnsupportedDex);
         metrics.record(EnrichmentResult::ReservesMissing);
         let snap = metrics.snapshot();
         assert_eq!(snap.enriched, 2);
-        assert_eq!(snap.cross_tick_unsupported, 1);
+        assert_eq!(snap.cross_boundary_unsupported, 1);
         assert_eq!(snap.unsupported_dex, 1);
         assert_eq!(snap.reserves_missing, 1);
         assert_eq!(snap.config_unavailable, 0);
@@ -1164,12 +1166,12 @@ mod tests {
         // contract.
         let snap = EnrichmentMetricsSnapshot {
             enriched: 7,
-            cross_tick_unsupported: 3,
+            cross_boundary_unsupported: 3,
             ..Default::default()
         };
         let json = serde_json::to_value(snap).unwrap();
         assert_eq!(json["enriched"], 7);
-        assert_eq!(json["cross_tick_unsupported"], 3);
+        assert_eq!(json["cross_boundary_unsupported"], 3);
         assert_eq!(json["unsupported_dex"], 0);
     }
 

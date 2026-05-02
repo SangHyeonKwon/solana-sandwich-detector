@@ -201,7 +201,7 @@ Enrichment 성공 시 각 `SandwichAttack`은 다음을 갖습니다:
 // Heartbeat — 실행 중 30초마다. enrichment 메트릭 스냅샷 포함.
 { "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
     "enriched": 142, "unsupported_dex": 18, "config_unavailable": 3,
-    "reserves_missing": 1, "replay_failed": 0, "cross_tick_unsupported": 4 } }
+    "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 4 } }
 
 // SandwichAttack — 탐지당 1개. 전체 스키마는 vigil-v1.json.
 { "slot": 285012345, "attacker": "...", "frontrun": {...}, "victim": {...}, ... }

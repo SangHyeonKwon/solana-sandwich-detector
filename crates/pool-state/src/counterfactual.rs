@@ -1352,7 +1352,7 @@ mod tests {
     /// Cross-tick attempt: tiny liquidity + huge frontrun ⇒
     /// apply_swap_within_tick bails on the very first leg, and
     /// compute_loss_whirlpool propagates None. Caller (enrich_attack)
-    /// uses this to route the attack to CrossTickUnsupported.
+    /// uses this to route the attack to CrossBoundaryUnsupported.
     #[test]
     fn whirlpool_cross_tick_returns_none() {
         let pool_0 = make_whirlpool(1_000, 10, 64);
@@ -1627,7 +1627,7 @@ mod tests {
     /// Adversarial: a Whirlpool with zero active liquidity can't service
     /// a swap. `cross_tick_swap`'s first guard rejects it (liquidity == 0
     /// short-circuit), so `compute_loss_whirlpool` returns None and the
-    /// caller routes the attack to `CrossTickUnsupported`. Pin the
+    /// caller routes the attack to `CrossBoundaryUnsupported`. Pin the
     /// short-circuit so a future relaxation (e.g. "walk into the next
     /// LP") doesn't silently change behaviour without a corresponding
     /// trace-shape decision.
@@ -1719,7 +1719,7 @@ mod tests {
     /// Cross-bin sandwich whose walker exits the supplied window: tiny
     /// bin reserves + 1B input ⇒ walker drains every bin in the array
     /// and runs out of window ⇒ `cross_bin_swap` returns `None` ⇒
-    /// enrich reports `CrossTickUnsupported`. Replaces the old "any
+    /// enrich reports `CrossBoundaryUnsupported`. Replaces the old "any
     /// drain ⇒ None" Phase 1 contract.
     #[test]
     fn dlmm_cross_bin_out_of_window_returns_none() {
