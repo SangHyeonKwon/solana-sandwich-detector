@@ -337,6 +337,11 @@ pub async fn enrich_attack(
     // post-state metric. Zero quote reserve leaves severity unset rather
     // than forcing a divide-by-zero into Critical.
     if attack.severity.is_none() && pool_quote_tvl > 0 {
+        // Both operands are i64/u64 amounts and may exceed 2^53; the cast
+        // loses absolute precision but the *ratio* settles at ~2^-52
+        // relative — comfortably below the ≥1bps bucket boundaries in
+        // `Severity::from_loss_ratio`, so precision loss never flips a
+        // severity bucket.
         let loss_ratio = (loss.victim_loss.max(0) as f64) / (pool_quote_tvl as f64);
         attack.severity = Some(Severity::from_loss_ratio(loss_ratio));
     }
@@ -346,6 +351,11 @@ pub async fn enrich_attack(
     // anything even without the frontrun (malformed swap); treat as no
     // signal.
     let replay_confidence: f64 = if loss.counterfactual_victim_out > 0 {
+        // `_victim_out` are u64 amounts that may exceed 2^53. The ratio
+        // resolves at ~2^-52 relative; the (1 − ratio) subtraction can
+        // shed bits when ratio≈1, but that case means "no detectable
+        // price impact", and the clamp(0, 1) folds the cancellation
+        // residue into 0.0 — benign for the consumer.
         let ratio = loss.actual_victim_out as f64 / loss.counterfactual_victim_out as f64;
         (1.0f64 - ratio).clamp(0.0, 1.0)
     } else {
