@@ -352,10 +352,11 @@ pub async fn enrich_attack(
     // signal.
     let replay_confidence: f64 = if loss.counterfactual_victim_out > 0 {
         // `_victim_out` are u64 amounts that may exceed 2^53. The ratio
-        // resolves at ~2^-52 relative; the (1 − ratio) subtraction can
-        // shed bits when ratio≈1, but that case means "no detectable
-        // price impact", and the clamp(0, 1) folds the cancellation
-        // residue into 0.0 — benign for the consumer.
+        // resolves at ~2^-52 relative; when ratio≈1 (no detectable
+        // impact) the (1 - ratio) subtraction degenerates to noise.
+        // The clamp pins negative residue to 0 and lets positive
+        // residue through as a low-confidence reading — either landing
+        // is consumer-correct.
         let ratio = loss.actual_victim_out as f64 / loss.counterfactual_victim_out as f64;
         (1.0f64 - ratio).clamp(0.0, 1.0)
     } else {
