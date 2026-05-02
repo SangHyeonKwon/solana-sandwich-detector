@@ -39,6 +39,16 @@ impl ConstantProduct {
 
     /// Spot price = quote / base (in smallest units). Used for price-impact math.
     /// Returns `None` if either reserve is zero.
+    ///
+    /// **Precision contract**: both reserves are `u128` and routinely exceed
+    /// `2^53` (the largest integer f64 represents exactly), so each cast
+    /// loses up to ~`2^-53` of relative precision and the division adds
+    /// another ULP. The quotient is therefore good to ~`3 × 2^-52`
+    /// relative — ~12 orders of magnitude below the bps (~`2^-14`)
+    /// tolerance that the only downstream consumers (`price_impact_bps as
+    /// u32`, `Severity::from_loss_ratio`) operate at, so exact-rational
+    /// arithmetic isn't justified. See `whirlpool_spot_price_b_per_a` /
+    /// `q64_to_f64` for the matching rationale on the Whirlpool side.
     pub fn spot_price(&self) -> Option<f64> {
         if self.base_reserve == 0 || self.quote_reserve == 0 {
             return None;
