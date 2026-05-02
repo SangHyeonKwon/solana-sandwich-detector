@@ -126,6 +126,12 @@ pub const DLMM_MAX_FEE_RATE: u128 = 100_000_000;
 /// as the Raydium V4 / Whirlpool parsers' fallback.
 const DEFAULT_FEE_NUM: u64 = 3_000_000;
 
+/// Basis-point denominator used by DLMM volatility math. Mirrors
+/// `BASIS_POINT_MAX` in `MeteoraAg/dlmm-sdk/commons/src/constants.rs`.
+/// Distinct from the `price_math::BASIS_POINT_MAX` (u128, same value),
+/// kept as `u32` here so the volatility ops avoid widening churn.
+const DLMM_BASIS_POINT_MAX: u32 = 10_000;
+
 /// Meteora DLMM program id — `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
 /// Used by future BinArray PDA derivation. Decoded once per call from the
 /// hardcoded base58 (same pattern as `whirlpool_program_id`).
@@ -253,6 +259,73 @@ impl DlmmPool {
             .checked_add((DLMM_FEE_PRECISION - 1) as u128)?
             .checked_div(den)?;
         u64::try_from(fee).ok()
+    }
+
+    /// Refresh the volatility reference + index reference based on how
+    /// much wall-clock time has elapsed since the previous swap.
+    /// Mirrors `LbPair::update_references` in
+    /// `MeteoraAg/dlmm-sdk/commons/src/extensions/lb_pair.rs`.
+    ///
+    /// Three regimes, gated by `(filter_period, decay_period)`:
+    ///   1. `elapsed < filter_period`: high-frequency window — leave
+    ///      everything alone so a burst of swaps compounds the
+    ///      accumulator.
+    ///   2. `filter_period <= elapsed < decay_period`: snapshot
+    ///      `active_id` into `index_reference` and decay
+    ///      `volatility_reference` by `reduction_factor / 10_000`.
+    ///   3. `elapsed >= decay_period`: snapshot `active_id`, reset
+    ///      `volatility_reference` to 0.
+    ///
+    /// On-chain this is called *once* at swap entry, before the per-bin
+    /// loop. Phase 3's [`compute_loss_dlmm`](crate::compute_loss_dlmm)
+    /// path follows the same shape.
+    ///
+    /// Returns `None` on arithmetic overflow (only possible with
+    /// pathologically large `volatility_accumulator * reduction_factor`,
+    /// not reachable from any legal pool config).
+    pub fn update_references(&mut self, current_timestamp: i64) -> Option<()> {
+        let elapsed = current_timestamp.checked_sub(self.last_update_timestamp)?;
+        if elapsed >= i64::from(self.filter_period) {
+            self.index_reference = self.active_id;
+            if elapsed < i64::from(self.decay_period) {
+                self.volatility_reference = self
+                    .volatility_accumulator
+                    .checked_mul(u32::from(self.reduction_factor))?
+                    .checked_div(DLMM_BASIS_POINT_MAX)?;
+            } else {
+                self.volatility_reference = 0;
+            }
+        }
+        Some(())
+    }
+
+    /// Recompute the volatility accumulator from the current `active_id`
+    /// against the snapshotted `index_reference`. Mirrors
+    /// `LbPair::update_volatility_accumulator` in commons.
+    ///
+    /// On-chain this is called **per bin** during the swap loop, *before*
+    /// the bin's swap math runs — so the variable-fee rate within a
+    /// bin reflects the accumulator value at that bin's start, not the
+    /// previous bin's. Phase 3's `cross_bin_swap` follows the same
+    /// shape so the per-bin fee replays exactly.
+    ///
+    /// Saturates at `max_volatility_accumulator` (the on-chain cap that
+    /// prevents the variable fee from growing without bound during
+    /// large multi-bin walks).
+    ///
+    /// Returns `None` on arithmetic overflow (only possible if
+    /// `delta_id * 10_000` overflows `u64` — requires a `delta_id`
+    /// north of `1.8e15`, far beyond DLMM's `[-443_636, 443_636]`
+    /// legal bin range).
+    pub fn update_volatility_accumulator(&mut self) -> Option<()> {
+        let delta_id = i64::from(self.index_reference)
+            .checked_sub(i64::from(self.active_id))?
+            .unsigned_abs();
+        let raw = u64::from(self.volatility_reference)
+            .checked_add(delta_id.checked_mul(u64::from(DLMM_BASIS_POINT_MAX))?)?;
+        let capped = raw.min(u64::from(self.max_volatility_accumulator));
+        self.volatility_accumulator = u32::try_from(capped).ok()?;
+        Some(())
     }
 }
 
@@ -1372,6 +1445,95 @@ mod tests {
         // rate = 2e6; gross = 1; num = 2e6; ceil(2e6 / 1e9) = 1.
         // (Floor would yield 0 — pin that we round up.)
         assert_eq!(pool.compute_fee_from_amount(1).unwrap(), 1);
+    }
+
+    /// Standard pool fixture used by the volatility-update tests. Bins
+    /// 25 bp, max accumulator 350_000 (matches an SOL/USDC mainnet
+    /// pool), reduction factor 5_000 ⇒ 50% decay per filter window.
+    fn pool_with_dyn_fee() -> DlmmPool {
+        DlmmPool {
+            active_id: 100,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+            filter_period: 30,
+            decay_period: 600,
+            reduction_factor: 5_000,
+            variable_fee_control: 40_000,
+            max_volatility_accumulator: 350_000,
+            volatility_accumulator: 20_000,
+            volatility_reference: 10_000,
+            index_reference: 95,
+            last_update_timestamp: 1_000_000,
+        }
+    }
+
+    /// Inside the filter window — references are *not* refreshed.
+    /// Pins regime 1: a burst of swaps compounds the accumulator.
+    #[test]
+    fn update_references_inside_filter_window_is_noop() {
+        let mut pool = pool_with_dyn_fee();
+        let before = pool;
+        // 10 < filter_period (30) ⇒ skip.
+        pool.update_references(1_000_000 + 10).unwrap();
+        assert_eq!(pool, before);
+    }
+
+    /// Filter window passed but inside decay window — index_reference
+    /// snapshots active_id, volatility_reference decays by 50%.
+    #[test]
+    fn update_references_decays_inside_decay_window() {
+        let mut pool = pool_with_dyn_fee();
+        // 100s elapsed: filter (30) <= 100 < decay (600).
+        pool.update_references(1_000_000 + 100).unwrap();
+        assert_eq!(pool.index_reference, 100, "index_ref ← active_id");
+        // volatility_accumulator (20_000) * reduction_factor (5_000) /
+        // BASIS_POINT_MAX (10_000) = 10_000.
+        assert_eq!(pool.volatility_reference, 10_000);
+    }
+
+    /// Decay window also passed — volatility_reference fully resets
+    /// to 0.
+    #[test]
+    fn update_references_resets_past_decay_window() {
+        let mut pool = pool_with_dyn_fee();
+        // 1000s > decay (600).
+        pool.update_references(1_000_000 + 1_000).unwrap();
+        assert_eq!(pool.index_reference, 100);
+        assert_eq!(pool.volatility_reference, 0);
+    }
+
+    /// `delta_id` is the *absolute* difference. Tests both signs so a
+    /// future regression that drops the `unsigned_abs()` is caught.
+    #[test]
+    fn update_volatility_accumulator_uses_abs_delta() {
+        let mut pool = pool_with_dyn_fee();
+        pool.volatility_reference = 5_000;
+        pool.index_reference = 100;
+        pool.active_id = 95; // delta = 5
+        pool.update_volatility_accumulator().unwrap();
+        // 5_000 + 5 * 10_000 = 55_000.
+        assert_eq!(pool.volatility_accumulator, 55_000);
+
+        // Flip sign of delta — same accumulator value (abs).
+        pool.active_id = 105;
+        pool.update_volatility_accumulator().unwrap();
+        assert_eq!(pool.volatility_accumulator, 55_000);
+    }
+
+    /// `update_volatility_accumulator` saturates at
+    /// `max_volatility_accumulator`. A 100-bin walk with default
+    /// max=350_000 would compute 1_000_000 raw, capped at 350_000.
+    #[test]
+    fn update_volatility_accumulator_caps_at_max() {
+        let mut pool = pool_with_dyn_fee();
+        pool.volatility_reference = 0;
+        pool.index_reference = 0;
+        pool.active_id = 100; // delta = 100, raw = 1_000_000.
+        pool.max_volatility_accumulator = 350_000;
+        pool.update_volatility_accumulator().unwrap();
+        assert_eq!(pool.volatility_accumulator, 350_000);
     }
 
     /// `total_fee_rate` caps at `DLMM_MAX_FEE_RATE` (10%). With Phase 1
