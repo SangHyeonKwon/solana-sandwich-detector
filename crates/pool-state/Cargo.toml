@@ -10,6 +10,7 @@ swap-events = { workspace = true }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
 solana-epoch-schedule = { workspace = true }
+solana-transaction-status = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
