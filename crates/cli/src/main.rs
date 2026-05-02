@@ -754,9 +754,12 @@ struct EnrichmentMetricsBucket {
 /// missing-key surprises in Vigil's BE) and `record()` can take a
 /// non-mutable `&self`.
 ///
-/// Adding a DEX variant: append it here too, or it'll silently miss
-/// metrics. The compile-time `assert!` below pins the count so a
-/// future variant addition forces this list to be updated.
+/// Adding a DEX variant: append it here too, or `record(new_variant, ...)`
+/// will hit the `expect` in production. The
+/// `all_dex_types_constant_covers_every_dextype_variant` test keeps
+/// this in sync — its exhaustive `match` on `DexType` is a compile
+/// error on a missing variant, and the runtime loop pins the array
+/// length so a typo in this literal is caught.
 const ALL_DEX_TYPES: [DexType; 8] = [
     DexType::RaydiumV4,
     DexType::RaydiumClmm,
@@ -835,8 +838,10 @@ struct EnrichmentMetricsSnapshot {
     by_dex: HashMap<DexType, EnrichmentMetricsBucketSnapshot>,
 }
 
-/// Per-DEX bucket as it appears on the wire. `Copy` so test fixtures
-/// can construct one with `..Default::default()`.
+/// Per-DEX bucket as it appears on the wire. `Copy` is a free win on
+/// a 48-byte POD of `u64` counters — keeps `EnrichmentMetricsSnapshot`
+/// cloneable as a bit-copy and lets callers pass a snapshot through
+/// without an explicit `.clone()`.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 struct EnrichmentMetricsBucketSnapshot {
     enriched: u64,
