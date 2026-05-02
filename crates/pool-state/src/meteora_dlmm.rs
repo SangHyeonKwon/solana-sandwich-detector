@@ -132,6 +132,13 @@ const DEFAULT_FEE_NUM: u64 = 3_000_000;
 /// kept as `u32` here so the volatility ops avoid widening churn.
 const DLMM_BASIS_POINT_MAX: u32 = 10_000;
 
+/// Hard-coded `compute_variable_fee` divisor (10^11). On-chain
+/// `LbPair::compute_variable_fee` ceil-divides `variable_fee_control *
+/// (volatility_accumulator * bin_step)^2` by this constant. Mirroring
+/// the literal (rather than re-deriving from FEE_PRECISION) guards
+/// against future on-chain refactors silently changing the scaling.
+const DLMM_VARIABLE_FEE_SCALE: u128 = 100_000_000_000;
+
 /// Meteora DLMM program id — `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
 /// Used by future BinArray PDA derivation. Decoded once per call from the
 /// hardcoded base58 (same pattern as `whirlpool_program_id`).
@@ -208,22 +215,56 @@ pub struct DlmmPool {
 }
 
 impl DlmmPool {
-    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]),
-    /// capped at [`DLMM_MAX_FEE_RATE`] to mirror on-chain `get_total_fee`.
-    ///
-    /// Phase 1 implements **base fee only**: `base_factor * bin_step *
-    /// 10 * 10^base_fee_power_factor`. Variable fee (volatility-driven)
-    /// would add to this rate but is intentionally skipped — pinning
-    /// the Phase 1 cap on accuracy. Phase 3 follow-up plumbs
-    /// `VolatilityAccumulator` and brings replay numbers into bit-for-
-    /// bit agreement with on-chain `quote_exact_in`.
-    pub fn total_fee_rate(&self) -> Option<u128> {
+    /// Static-fee numerator over [`DLMM_FEE_PRECISION`]:
+    /// `base_factor * bin_step * 10 * 10^base_fee_power_factor`. Mirrors
+    /// `LbPair::get_base_fee`. Uncapped — the cap is applied in
+    /// [`Self::total_fee_rate`] after the variable component is added.
+    pub fn base_fee_rate(&self) -> Option<u128> {
         let factor = (self.base_factor as u128)
             .checked_mul(self.bin_step as u128)?
             .checked_mul(10)?;
         let power_mul: u128 = 10u128.checked_pow(self.base_fee_power_factor as u32)?;
-        let raw = factor.checked_mul(power_mul)?;
-        Some(raw.min(DLMM_MAX_FEE_RATE))
+        factor.checked_mul(power_mul)
+    }
+
+    /// Variable-fee numerator at the supplied accumulator value.
+    /// Mirrors on-chain `LbPair::compute_variable_fee`:
+    /// `ceil(variable_fee_control * (vol_acc * bin_step)^2 / 10^11)`.
+    /// Returns 0 when `variable_fee_control == 0` (the static-fee-only
+    /// pool config — most pools today).
+    ///
+    /// Taking the accumulator as an argument (rather than reading
+    /// `self.volatility_accumulator`) mirrors the on-chain split
+    /// between `compute_variable_fee` and `get_variable_fee`. Replay
+    /// callers want to compute the variable fee *at the start of a
+    /// specific bin step*, after `update_volatility_accumulator` has
+    /// already mutated `self`.
+    pub fn compute_variable_fee(&self, volatility_accumulator: u32) -> Option<u128> {
+        if self.variable_fee_control == 0 {
+            return Some(0);
+        }
+        let vol = u128::from(volatility_accumulator);
+        let bin_step = u128::from(self.bin_step);
+        let vfc = u128::from(self.variable_fee_control);
+        let square = vol.checked_mul(bin_step)?.checked_pow(2)?;
+        let v_fee = vfc.checked_mul(square)?;
+        v_fee
+            .checked_add(DLMM_VARIABLE_FEE_SCALE.checked_sub(1)?)?
+            .checked_div(DLMM_VARIABLE_FEE_SCALE)
+    }
+
+    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]),
+    /// capped at [`DLMM_MAX_FEE_RATE`] to mirror on-chain `get_total_fee`.
+    ///
+    /// Reads `self.volatility_accumulator` for the variable component.
+    /// Per-bin replay must therefore call
+    /// [`Self::update_volatility_accumulator`] *before* this — the
+    /// accumulator value is the "at the start of this bin step" reading.
+    pub fn total_fee_rate(&self) -> Option<u128> {
+        let base = self.base_fee_rate()?;
+        let variable = self.compute_variable_fee(self.volatility_accumulator)?;
+        let total = base.checked_add(variable)?;
+        Some(total.min(DLMM_MAX_FEE_RATE))
     }
 
     /// Fee charged when the caller knows the *net* (post-fee) amount
@@ -1534,6 +1575,54 @@ mod tests {
         pool.max_volatility_accumulator = 350_000;
         pool.update_volatility_accumulator().unwrap();
         assert_eq!(pool.volatility_accumulator, 350_000);
+    }
+
+    /// `compute_variable_fee` short-circuits to 0 when the pool's
+    /// `variable_fee_control == 0` — the static-fee-only configuration
+    /// most pools ship with. Pin so a future regression doesn't read
+    /// `volatility_accumulator` and emit a non-zero variable fee for a
+    /// pool that explicitly disabled it.
+    #[test]
+    fn compute_variable_fee_zero_when_control_is_zero() {
+        let mut pool = pool_with_dyn_fee();
+        pool.variable_fee_control = 0;
+        // Even with a non-zero accumulator, output is 0.
+        assert_eq!(pool.compute_variable_fee(100_000), Some(0));
+    }
+
+    /// Numeric pin against the on-chain formula
+    /// `ceil(vfc * (vol_acc * bin_step)^2 / 10^11)`. Two cases drive
+    /// both the floor- and ceil-rounded paths:
+    ///   - `vol_acc=100, bin_step=10, vfc=40_000`:
+    ///     `square=(1_000)^2=1e6`, `v_fee=4e10`,
+    ///     `ceil(4e10 / 1e11) = 1`.
+    ///   - `vol_acc=10_000, bin_step=10, vfc=40_000`:
+    ///     `square=(100_000)^2=1e10`, `v_fee=4e14`,
+    ///     `ceil(4e14 / 1e11) = 4_000` (exact, no remainder).
+    #[test]
+    fn compute_variable_fee_matches_on_chain_formula() {
+        let mut pool = pool_with_dyn_fee();
+        pool.bin_step = 10;
+        pool.variable_fee_control = 40_000;
+        assert_eq!(pool.compute_variable_fee(100), Some(1));
+        assert_eq!(pool.compute_variable_fee(10_000), Some(4_000));
+    }
+
+    /// Pin that `total_fee_rate` sums base + variable instead of
+    /// reporting only base. Picks values where neither component
+    /// alone would surface a regression: base = 1e6, variable = 4_000,
+    /// total = 1_004_000.
+    #[test]
+    fn total_fee_rate_sums_base_and_variable() {
+        let mut pool = pool_with_dyn_fee();
+        pool.bin_step = 10;
+        pool.base_factor = 10_000;
+        pool.base_fee_power_factor = 0;
+        pool.variable_fee_control = 40_000;
+        pool.volatility_accumulator = 10_000;
+        // base = 10_000 * 10 * 10 = 1_000_000.
+        // variable (per the formula above) = 4_000.
+        assert_eq!(pool.total_fee_rate(), Some(1_004_000));
     }
 
     /// `total_fee_rate` caps at `DLMM_MAX_FEE_RATE` (10%). With Phase 1
