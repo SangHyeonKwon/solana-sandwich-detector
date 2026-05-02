@@ -181,6 +181,22 @@ pub trait PoolStateLookup: Send + Sync {
     async fn mint_accounts(&self, _mints: &[&str], _slot: u64) -> Vec<Option<MintInfo>> {
         Vec::new()
     }
+
+    /// Resolve the epoch number that contains `slot`, used to pick
+    /// between `older_transfer_fee` and `newer_transfer_fee` in a
+    /// Token-2022 `TransferFeeConfig`. Implementations typically
+    /// fetch + cache `EpochSchedule` from `getEpochSchedule` once,
+    /// then map every slot via `EpochSchedule::get_epoch`.
+    ///
+    /// Default returns `None` so implementations that don't speak
+    /// the epoch protocol stay opt-in. Callers should fall back to
+    /// `u64::MAX` (always-newer) — same behaviour the codebase had
+    /// before this method existed, which is correct for mainnet
+    /// outside the brief epoch window after a transfer-fee config
+    /// update.
+    async fn epoch_for_slot(&self, _slot: u64) -> Option<u64> {
+        None
+    }
 }
 
 /// No-op lookup: returns `None` for every pool. Used when pool-state

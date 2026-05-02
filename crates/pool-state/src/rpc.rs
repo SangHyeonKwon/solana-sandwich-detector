@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_epoch_schedule::EpochSchedule;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
@@ -113,6 +114,12 @@ pub struct RpcPoolLookup {
     /// [`Self::with_account_fetcher`] for archival backfill.
     fetcher: Arc<dyn AccountFetcher>,
     cache: Mutex<HashMap<String, Option<PoolConfig>>>,
+    /// `EpochSchedule` is invariant for the life of a Solana cluster
+    /// (governance change required), so one `getEpochSchedule` round
+    /// trip per `RpcPoolLookup` instance suffices. Lazy because
+    /// construction is sync. `Some(None)` means "fetched and the RPC
+    /// failed" — we don't keep retrying every call.
+    epoch_schedule: Mutex<Option<Option<EpochSchedule>>>,
 }
 
 impl RpcPoolLookup {
@@ -129,6 +136,7 @@ impl RpcPoolLookup {
             client,
             fetcher,
             cache: Mutex::new(HashMap::new()),
+            epoch_schedule: Mutex::new(None),
         }
     }
 
@@ -150,6 +158,7 @@ impl RpcPoolLookup {
             client,
             fetcher,
             cache: Mutex::new(HashMap::new()),
+            epoch_schedule: Mutex::new(None),
         }
     }
 
@@ -382,6 +391,31 @@ impl PoolStateLookup for RpcPoolLookup {
             .into_iter()
             .map(|opt| opt.and_then(|a| meteora_dlmm::bin_array::parse_bin_array(&a.data)))
             .collect()
+    }
+
+    /// Resolve `slot → epoch` via a cached `EpochSchedule`. The schedule
+    /// is fetched on first call and reused for the lifetime of this
+    /// `RpcPoolLookup`; mainnet `EpochSchedule` is governance-stable, so
+    /// stale-after-fetch isn't a concern. A failed fetch is also cached
+    /// (as `Some(None)`) so we don't retry on every enrichment call.
+    async fn epoch_for_slot(&self, slot: u64) -> Option<u64> {
+        {
+            let cache = self.epoch_schedule.lock().await;
+            if let Some(entry) = cache.as_ref() {
+                return entry.as_ref().map(|s| s.get_epoch(slot));
+            }
+        }
+        let fetched = match self.client.get_epoch_schedule().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(error = %e, "get_epoch_schedule failed");
+                None
+            }
+        };
+        let mut cache = self.epoch_schedule.lock().await;
+        // Race: another task may have populated while we fetched.
+        let stored = cache.get_or_insert(fetched);
+        stored.as_ref().map(|s| s.get_epoch(slot))
     }
 }
 

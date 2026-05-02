@@ -2777,6 +2777,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-client",
+ "solana-epoch-schedule",
  "solana-sdk",
  "swap-events",
  "thiserror 1.0.69",
