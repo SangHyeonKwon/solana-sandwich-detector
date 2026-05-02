@@ -1219,10 +1219,11 @@ pub use swap_math::{swap_within_bin, BinSwapStep};
 /// bounds total bin traversal even in pathological "thousands of
 /// empty bins between liquidity" pools.
 pub mod cross_bin {
+    use super::bitmap_extension::ParsedBitmapExtension;
     use super::price_math::bin_price;
     use super::swap_math::swap_within_bin;
     use super::{
-        bin_array::{bin_array_lower_upper_bin_id, ParsedBinArray},
+        bin_array::{bin_array_lower_upper_bin_id, bin_id_to_bin_array_index, ParsedBinArray},
         DlmmPool,
     };
     use std::collections::HashMap;
@@ -1253,6 +1254,19 @@ pub mod cross_bin {
         /// to short-circuit `get` for bins outside the window
         /// without searching the map.
         range: (i32, i32),
+        /// Loaded bin array indices, sorted ascending. Used by
+        /// [`fast_forward`](Self::fast_forward) to find the next
+        /// loaded array in the walk direction without re-scanning
+        /// the `bins` map.
+        loaded_array_indices: Vec<i32>,
+        /// Optional `BinArrayBitmapExtension`. When present and the
+        /// gap between consecutive loaded arrays falls inside the
+        /// extension's coverage envelope (`[-6656, -513] ∪ [512, 6655]`),
+        /// the walker can confirm the gap is empty and skip across.
+        /// `None` (or a gap touching the on-pool internal bitmap range)
+        /// ⇒ walker bails on the first miss, matching pre-extension
+        /// behaviour.
+        bitmap_extension: Option<ParsedBitmapExtension>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1266,18 +1280,41 @@ pub mod cross_bin {
         /// Build the map from a BinArray window. Skips bins outside
         /// the arrays' range. Recomputes price for any lazy-cached
         /// (on-chain `Bin.price = 0`) bin via [`bin_price`].
+        ///
+        /// No bitmap extension ⇒ walker bails on the first miss; use
+        /// [`from_arrays_with_bitmap_extension`](Self::from_arrays_with_bitmap_extension)
+        /// for sparse-window support.
         pub fn from_arrays(arrays: &[ParsedBinArray], bin_step: u16) -> Option<Self> {
+            Self::from_arrays_with_bitmap_extension(arrays, bin_step, None)
+        }
+
+        /// Build the map from a BinArray window plus an optional
+        /// `BinArrayBitmapExtension`. The walker uses the extension to
+        /// fast-forward across gaps between loaded arrays when the
+        /// bitmap confirms the intervening arrays carry no liquidity.
+        ///
+        /// `arrays` may be non-contiguous (caller-fetched windows often
+        /// drop unloadable PDAs); `loaded_array_indices` is captured in
+        /// ascending order so the fast-forward can find the next-loaded
+        /// array by direction without rescanning `bins`.
+        pub fn from_arrays_with_bitmap_extension(
+            arrays: &[ParsedBinArray],
+            bin_step: u16,
+            bitmap_extension: Option<ParsedBitmapExtension>,
+        ) -> Option<Self> {
             if arrays.is_empty() {
                 return None;
             }
             let mut bins = HashMap::new();
             let mut min_id = i32::MAX;
             let mut max_id = i32::MIN;
+            let mut loaded_array_indices: Vec<i32> = Vec::with_capacity(arrays.len());
             for arr in arrays {
                 let array_idx = arr.index as i32;
                 let (lower, upper) = bin_array_lower_upper_bin_id(array_idx);
                 min_id = min_id.min(lower);
                 max_id = max_id.max(upper);
+                loaded_array_indices.push(array_idx);
                 for (i, bin) in arr.bins.iter().enumerate() {
                     let bin_id = lower.checked_add(i as i32)?;
                     let price = if bin.price != 0 {
@@ -1295,10 +1332,14 @@ pub mod cross_bin {
                     );
                 }
             }
+            loaded_array_indices.sort_unstable();
+            loaded_array_indices.dedup();
             Some(Self {
                 bins,
                 bin_step,
                 range: (min_id, max_id),
+                loaded_array_indices,
+                bitmap_extension,
             })
         }
 
@@ -1342,6 +1383,65 @@ pub mod cross_bin {
         /// that need to derive prices for bins beyond the window.
         pub fn bin_step(&self) -> u16 {
             self.bin_step
+        }
+
+        /// Find the next-loaded bin array's near-edge bin id in the
+        /// walk direction, **iff** the gap between `active_id`'s array
+        /// and that next-loaded array is bitmap-confirmed empty. Used
+        /// by the walker to skip across sparse windows without paying
+        /// the per-empty-bin iteration cost.
+        ///
+        /// Returns `None` when:
+        ///   * no bitmap extension was supplied (caller can't verify
+        ///     the gap),
+        ///   * no further loaded array exists in the walk direction
+        ///     (the walker has truly exited the window),
+        ///   * any gap array is reported initialised (`Some(true)`)
+        ///     by the extension — its data isn't loaded so we can't
+        ///     legally swap against it,
+        ///   * any gap array falls outside the extension's coverage
+        ///     (returned `None` by `is_array_initialized`) — the
+        ///     on-pool internal bitmap might say it's initialised, and
+        ///     we don't yet plumb that.
+        ///
+        /// Returned bin id is the array's *upper* bin when walking
+        /// down (`swap_for_y = true`) or *lower* bin when walking up,
+        /// so the next iteration's `state.get` lands on the first
+        /// reachable bin of the new array.
+        pub(super) fn fast_forward(&self, active_id: i32, swap_for_y: bool) -> Option<i32> {
+            let bitmap = self.bitmap_extension.as_ref()?;
+            let current_array = bin_id_to_bin_array_index(active_id);
+            let next_loaded = if swap_for_y {
+                self.loaded_array_indices
+                    .iter()
+                    .filter(|&&i| i < current_array)
+                    .max()
+                    .copied()?
+            } else {
+                self.loaded_array_indices
+                    .iter()
+                    .filter(|&&i| i > current_array)
+                    .min()
+                    .copied()?
+            };
+            // Walking down: gap is `[next_loaded + 1 ..= current_array]`.
+            // Walking up: gap is `[current_array ..= next_loaded - 1]`.
+            // Includes `current_array` because that's the array whose
+            // miss triggered the fast-forward — we still need to
+            // confirm it's empty per the bitmap.
+            let (gap_lo, gap_hi) = if swap_for_y {
+                (next_loaded + 1, current_array)
+            } else {
+                (current_array, next_loaded - 1)
+            };
+            for idx in gap_lo..=gap_hi {
+                match bitmap.is_array_initialized(idx) {
+                    Some(false) => continue,
+                    Some(true) | None => return None,
+                }
+            }
+            let (lower, upper) = bin_array_lower_upper_bin_id(next_loaded);
+            Some(if swap_for_y { upper } else { lower })
         }
     }
 
@@ -1410,15 +1510,32 @@ pub mod cross_bin {
                     iterations: iter,
                 });
             }
-            // Look up the bin first; missing bin (window edge) fails
-            // the walk without mutating pool state. On-chain mirror:
-            // `quote_exact_in` only calls `update_volatility_accumulator`
-            // once it has confirmed the bin is in-range and about to
-            // be swapped — we do the same so a `None` here returns a
-            // clean failure path instead of leaving `pool.active_id`
-            // and `pool.volatility_accumulator` mutated for a bin we
+            // Look up the bin first; missing bin (window edge or a
+            // gap between loaded arrays) fails the walk without
+            // mutating pool state. On-chain mirror: `quote_exact_in`
+            // only calls `update_volatility_accumulator` once it has
+            // confirmed the bin is in-range and about to be swapped —
+            // we do the same so a `None` here returns a clean failure
+            // path instead of leaving `pool.active_id` and
+            // `pool.volatility_accumulator` mutated for a bin we
             // never traded against.
-            let snap = state.get(active_id)?;
+            //
+            // Bitmap-aware fast-forward: a sparse window with a
+            // confirmed-empty gap between loaded arrays (per the
+            // `BinArrayBitmapExtension`) lets the walker jump to the
+            // next loaded array's edge instead of bailing. Each jump
+            // still consumes one iteration so a pathological pool
+            // can't bypass `MAX_SWAP_ITERATIONS`.
+            let snap = match state.get(active_id) {
+                Some(s) => s,
+                None => match state.fast_forward(active_id, swap_for_y) {
+                    Some(next) => {
+                        active_id = next;
+                        continue;
+                    }
+                    None => return None,
+                },
+            };
 
             // Per-bin variable-fee refresh: sync active_id and update
             // the accumulator so `swap_within_bin`'s fee read sees the
@@ -2499,11 +2616,15 @@ mod cross_bin_tests {
         assert!(r.fee <= r.amount_in_with_fees / 100);
     }
 
-    /// Out-of-window: walker steps past the supplied arrays without
-    /// consuming all input ⇒ `None`. Catches the regression where
-    /// a too-small fetch window silently truncates the swap.
+    /// Out-of-window with no bitmap extension: walker steps past the
+    /// supplied arrays without consuming all input ⇒ `None`. With no
+    /// extension we can't tell whether the next array is initialised
+    /// or empty, so the walker must bail conservatively. The companion
+    /// test [`cross_bin_walk_skips_via_bitmap_extension`] pins the
+    /// other half: extension present + confirmed-empty gap ⇒ walker
+    /// fast-forwards instead of bailing.
     #[test]
-    fn out_of_window_bails() {
+    fn out_of_window_bails_when_no_bitmap_extension() {
         // Single array at index 0 covers bins [0, 69]. Each bin
         // holds 100 Y. Caller hands in enough X to need >70 bins'
         // worth — walker hits bin -1 (outside window) and bails.
@@ -2601,6 +2722,106 @@ mod cross_bin_tests {
             "vol_acc={} after {} iterations",
             pool.volatility_accumulator,
             r.iterations,
+        );
+    }
+
+    /// Bitmap-aware fast-forward: a sparse window with a confirmed-empty
+    /// gap between loaded arrays should let the walker cross the gap
+    /// instead of bailing. Arrays at extension-positive indices 512 and
+    /// 514 are loaded; array 513 is unloaded but bitmap-marked unset.
+    /// Walker starts at the upper edge of array 514 and swaps X→Y, so
+    /// `active_id` decreases through 514, hits the gap at 35979 (in
+    /// array 513), fast-forwards to 35909 (upper edge of array 512), and
+    /// continues draining until the input is exhausted.
+    #[test]
+    fn cross_bin_walk_skips_via_bitmap_extension() {
+        use super::bitmap_extension::ParsedBitmapExtension;
+
+        // Two loaded arrays at extension-positive indices 512 and 514.
+        // Array 513 (the gap) is NOT loaded.
+        let arrays = vec![uniform_array(512, 0, 100), uniform_array(514, 0, 100)];
+
+        // Bitmap: positive row 0 covers indices `[512, 1023]`. Bit 0 ↔
+        // index 512 (set), bit 1 ↔ index 513 (UNSET ⇒ confirmed empty),
+        // bit 2 ↔ index 514 (set).
+        let mut bitmap = ParsedBitmapExtension {
+            lb_pair: arrays[0].lb_pair,
+            positive_bitmap: [[0u64; 8]; 12],
+            negative_bitmap: [[0u64; 8]; 12],
+        };
+        bitmap.positive_bitmap[0][0] = (1u64 << 0) | (1u64 << 2);
+
+        // `bin_step = 1` keeps the price at bin ~36049 representable in
+        // Q64.64 (1.0001^36049 ≈ 36.78). With a larger step the price
+        // would overflow before the walk even starts.
+        let mut state =
+            DlmmBinState::from_arrays_with_bitmap_extension(&arrays, 1, Some(bitmap)).unwrap();
+        let mut pool = pool();
+        pool.bin_step = 1;
+
+        let initial_active_id = 514 * 70 + 69; // 36049 — top of array 514
+        pool.active_id = initial_active_id;
+
+        // Tuned to drain array 514 fully (~210 X) plus a chunk of array
+        // 512, so the walker MUST cross the gap and partial-fill on the
+        // far side. With 300 X input the remainder (~90 X) drains a few
+        // dozen bins of 512 before bottoming out.
+        let r = cross_bin_swap(300, initial_active_id, &mut state, true, &mut pool).unwrap();
+
+        // Walker crossed from array 514 into array 512. Final active_id
+        // must be inside array 512 (`[35840, 35909]`).
+        assert!(
+            (35840..=35909).contains(&r.final_active_id),
+            "expected fast-forward into array 512; got final_active_id={}",
+            r.final_active_id,
+        );
+        // Drained all 70 bins of 514 (7_000 Y) plus some of 512 ⇒ > 7_000 Y.
+        assert!(
+            r.amount_out > 7_000,
+            "expected amount_out > 7_000 (full 514 + partial 512); got {}",
+            r.amount_out,
+        );
+        // 70 (drain 514) + 1 (fast-forward across 513) + N (drain 512).
+        // The fast-forward step counts toward the iteration cap so a
+        // pathological pool can't bypass `MAX_SWAP_ITERATIONS`.
+        assert!(
+            r.iterations > 70,
+            "expected fast-forward iteration after full 514 drain; got {}",
+            r.iterations,
+        );
+    }
+
+    /// Bitmap-aware fast-forward bails when the gap is *not* confirmed
+    /// empty. Same window as the previous test, but bit 1 (index 513) is
+    /// now SET — the bitmap claims array 513 is initialised, but its
+    /// data isn't loaded. The walker must bail rather than silently
+    /// pretending array 513 is empty (which would understate victim loss
+    /// on a real sparse-liquidity pool).
+    #[test]
+    fn cross_bin_walk_bails_when_bitmap_says_gap_is_initialized() {
+        use super::bitmap_extension::ParsedBitmapExtension;
+
+        let arrays = vec![uniform_array(512, 0, 100), uniform_array(514, 0, 100)];
+
+        // bit 1 (= index 513) is SET ⇒ "initialised but not loaded".
+        let mut bitmap = ParsedBitmapExtension {
+            lb_pair: arrays[0].lb_pair,
+            positive_bitmap: [[0u64; 8]; 12],
+            negative_bitmap: [[0u64; 8]; 12],
+        };
+        bitmap.positive_bitmap[0][0] = (1u64 << 0) | (1u64 << 1) | (1u64 << 2);
+
+        let mut state =
+            DlmmBinState::from_arrays_with_bitmap_extension(&arrays, 1, Some(bitmap)).unwrap();
+        let mut pool = pool();
+        pool.bin_step = 1;
+
+        let initial_active_id = 514 * 70 + 69;
+        pool.active_id = initial_active_id;
+        let r = cross_bin_swap(300, initial_active_id, &mut state, true, &mut pool);
+        assert!(
+            r.is_none(),
+            "should bail when bitmap reports gap as initialised but unloaded",
         );
     }
 
