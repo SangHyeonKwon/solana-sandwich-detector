@@ -880,18 +880,25 @@ fn q64_to_f64(price_q64: u128) -> f64 {
 /// Exact `(price_post / price_pre - 1) * 10_000` for DLMM. Both inputs
 /// are Q64.64; staged through U256 so `|post - pre| * 10_000` can't
 /// overflow even for `bin_id` values near `MAX_BIN_ID` with large
-/// `bin_step`. Returns `None` only when `bin_price` itself fails (the
-/// caller falls back to the linearisation).
+/// `bin_step`. Returns `None` when `bin_price` itself fails or when
+/// `bin_price_pre_q64 == 0` (defensive — `compute_loss_dlmm_with_trace`
+/// already early-returns on zero pre-price, but the helper is
+/// library-shaped so it doesn't trust the caller to filter).
+///
+/// `bin_price_pre_q64` is expected to come from the same `bin_price`
+/// formula (either freshly computed or the on-chain-cached
+/// `Bin.price` written via the identical Q64.64 math); any drift
+/// between the two surfaces here as residual bps.
 fn exact_price_impact_bps_dlmm(
     bin_price_pre_q64: u128,
     active_id_post: i32,
     bin_step: u16,
 ) -> Option<u32> {
     use primitive_types::U256;
-    let price_post = crate::meteora_dlmm::bin_price(active_id_post, bin_step)?;
     if bin_price_pre_q64 == 0 {
         return None;
     }
+    let price_post = crate::meteora_dlmm::bin_price(active_id_post, bin_step)?;
     let pre = U256::from(bin_price_pre_q64);
     let post = U256::from(price_post);
     let abs_diff = if post > pre { post - pre } else { pre - post };
@@ -951,20 +958,18 @@ mod tests {
         );
     }
 
-    /// Negative-direction diff (active_id moved down): impact must be
-    /// the same as the equivalent positive move. Pins absolute-value
-    /// semantics so a Sell-side sandwich reports a positive bps.
+    /// Helper handles negative `active_id_post` (Sell-side sandwiches
+    /// move the active bin downward). The ratio in the two directions
+    /// is the multiplicative inverse — `|ratio - 1|` is *not* the
+    /// same on both sides — but both must be positive and finite, not
+    /// signed/wrapped. Pins that the unsigned-bps surface comes back
+    /// non-zero in either direction.
     #[test]
-    fn dlmm_exact_price_impact_negative_diff_is_absolute() {
+    fn dlmm_exact_price_impact_handles_negative_active_id() {
         let pre_at_neg = crate::meteora_dlmm::bin_price(-5, 100).unwrap();
         let pre_at_zero = crate::meteora_dlmm::bin_price(0, 100).unwrap();
         let down = exact_price_impact_bps_dlmm(pre_at_zero, -5, 100).unwrap();
         let up = exact_price_impact_bps_dlmm(pre_at_neg, 0, 100).unwrap();
-        // The price ratio in the two directions is the multiplicative
-        // inverse, so the |ratio - 1| values differ — but both fall in
-        // the same ballpark. Pin that *both* are non-zero and on the
-        // same side of zero (helper isn't returning a signed value
-        // somewhere, just the unsigned bps figure).
         assert!(down > 0);
         assert!(up > 0);
     }
@@ -1786,8 +1791,8 @@ mod tests {
             loss.actual_victim_out,
             loss.counterfactual_victim_out,
         );
-        // price_impact_bps = bins_moved * bin_step. With bin_step=25
-        // and a handful of bins moved, expect >0.
+        // price_impact_bps from the exact bin_price ratio. With
+        // bin_step=25 and a handful of bins moved, expect >0.
         assert!(loss.price_impact_bps > 0);
     }
 
