@@ -188,12 +188,16 @@ pub trait PoolStateLookup: Send + Sync {
     /// fetch + cache `EpochSchedule` from `getEpochSchedule` once,
     /// then map every slot via `EpochSchedule::get_epoch`.
     ///
+    /// On RPC failure, implementations are free to either return
+    /// `None` for one call window and retry next time, or cache the
+    /// failure permanently and never retry — callers MUST handle
+    /// `None` by falling back to `u64::MAX` (always-newer) so the
+    /// choice doesn't affect correctness outside the epoch window
+    /// after a transfer-fee config update.
+    ///
     /// Default returns `None` so implementations that don't speak
-    /// the epoch protocol stay opt-in. Callers should fall back to
-    /// `u64::MAX` (always-newer) — same behaviour the codebase had
-    /// before this method existed, which is correct for mainnet
-    /// outside the brief epoch window after a transfer-fee config
-    /// update.
+    /// the epoch protocol stay opt-in (NoPoolLookup, fixture-driven
+    /// test lookups, etc).
     async fn epoch_for_slot(&self, _slot: u64) -> Option<u64> {
         None
     }
@@ -270,5 +274,16 @@ mod tests {
             .tick_arrays("any-pool", DexType::OrcaWhirlpool, &[0, 5632], 0)
             .await;
         assert!(result.is_empty());
+    }
+
+    /// `epoch_for_slot` default returns `None` — pins the trait-default
+    /// contract so callers (DLMM enrichment) can rely on the
+    /// `unwrap_or(u64::MAX)` fallback path being the always-newer
+    /// behaviour for any lookup that doesn't override.
+    #[tokio::test]
+    async fn no_pool_lookup_epoch_for_slot_returns_none() {
+        let lookup = NoPoolLookup;
+        assert_eq!(lookup.epoch_for_slot(0).await, None);
+        assert_eq!(lookup.epoch_for_slot(123_456_789).await, None);
     }
 }

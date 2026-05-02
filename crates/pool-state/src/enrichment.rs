@@ -259,14 +259,12 @@ pub async fn enrich_attack(
             // None, .. }` ⇒ no fee adjustment, identical to the
             // pre-step-2 None pass-through.
             //
-            // Epoch resolution: ask the lookup for the epoch that
-            // contains `attack.slot` (RpcPoolLookup fetches
-            // EpochSchedule once and maps every slot via
-            // `EpochSchedule::get_epoch`). Falling back to `u64::MAX`
-            // keeps the previous always-newer behaviour for lookups
-            // that don't implement the trait method (mocks, NoPool)
-            // and for the brief window where the schedule fetch
-            // failed — matters in practice only inside the epoch
+            // Epoch resolution: only call `epoch_for_slot` when at
+            // least one mint actually has a TransferFeeConfig — that
+            // way pure-SPL pools never trigger a `getEpochSchedule`
+            // RPC. When the lookup returns `None` (no impl, fetch
+            // failed), fall back to `u64::MAX` ⇒ always-newer tier;
+            // the tier choice only matters inside the epoch
             // immediately following a transfer-fee config update.
             let mints = lookup
                 .mint_accounts(
@@ -283,7 +281,13 @@ pub async fn enrich_attack(
             } else {
                 (mint_quote_info, mint_base_info)
             };
-            let epoch = lookup.epoch_for_slot(attack.slot).await.unwrap_or(u64::MAX);
+            let any_transfer_fee = mint_x_info.is_some_and(|m| m.transfer_fee_config.is_some())
+                || mint_y_info.is_some_and(|m| m.transfer_fee_config.is_some());
+            let epoch = if any_transfer_fee {
+                lookup.epoch_for_slot(attack.slot).await.unwrap_or(u64::MAX)
+            } else {
+                u64::MAX
+            };
             let transfer_fee_x = mint_x_info.and_then(|m| m.transfer_fee_at(epoch));
             let transfer_fee_y = mint_y_info.and_then(|m| m.transfer_fee_at(epoch));
 
@@ -1892,6 +1896,22 @@ mod tests {
             trace.token_x_transfer_fee_bps,
             Some(200),
             "epoch == newer.epoch must pick newer transfer fee tier",
+        );
+
+        // epoch=None ⇒ enrichment falls back to `u64::MAX` ⇒ newer
+        // tier. Pins the trait-default contract: callers MUST
+        // tolerate `epoch_for_slot` returning `None` (NoPoolLookup,
+        // FixtureLookup, RPC failure) by behaving as always-newer.
+        let mut attack = make_dlmm_attack(5_000);
+        let tx = make_frontrun_tx();
+        let lookup = mk_lookup(None);
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        assert_eq!(
+            trace.token_x_transfer_fee_bps,
+            Some(200),
+            "epoch=None must fall back to u64::MAX (newer tier)",
         );
     }
 

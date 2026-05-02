@@ -18,7 +18,7 @@ use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use swap_events::types::DexType;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
 use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLookup};
@@ -116,10 +116,11 @@ pub struct RpcPoolLookup {
     cache: Mutex<HashMap<String, Option<PoolConfig>>>,
     /// `EpochSchedule` is invariant for the life of a Solana cluster
     /// (governance change required), so one `getEpochSchedule` round
-    /// trip per `RpcPoolLookup` instance suffices. Lazy because
-    /// construction is sync. `Some(None)` means "fetched and the RPC
-    /// failed" — we don't keep retrying every call.
-    epoch_schedule: Mutex<Option<Option<EpochSchedule>>>,
+    /// trip per `RpcPoolLookup` instance suffices. `OnceCell` runs the
+    /// init future exactly once even under concurrent calls; the
+    /// inner `Option<EpochSchedule>` is `None` when the RPC fetch
+    /// failed (cached so we don't retry on every enrichment call).
+    epoch_schedule: OnceCell<Option<EpochSchedule>>,
 }
 
 impl RpcPoolLookup {
@@ -136,7 +137,7 @@ impl RpcPoolLookup {
             client,
             fetcher,
             cache: Mutex::new(HashMap::new()),
-            epoch_schedule: Mutex::new(None),
+            epoch_schedule: OnceCell::new(),
         }
     }
 
@@ -158,7 +159,7 @@ impl RpcPoolLookup {
             client,
             fetcher,
             cache: Mutex::new(HashMap::new()),
-            epoch_schedule: Mutex::new(None),
+            epoch_schedule: OnceCell::new(),
         }
     }
 
@@ -397,25 +398,23 @@ impl PoolStateLookup for RpcPoolLookup {
     /// is fetched on first call and reused for the lifetime of this
     /// `RpcPoolLookup`; mainnet `EpochSchedule` is governance-stable, so
     /// stale-after-fetch isn't a concern. A failed fetch is also cached
-    /// (as `Some(None)`) so we don't retry on every enrichment call.
+    /// (as `None`) so we don't retry on every enrichment call.
     async fn epoch_for_slot(&self, slot: u64) -> Option<u64> {
-        {
-            let cache = self.epoch_schedule.lock().await;
-            if let Some(entry) = cache.as_ref() {
-                return entry.as_ref().map(|s| s.get_epoch(slot));
-            }
-        }
-        let fetched = match self.client.get_epoch_schedule().await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!(error = %e, "get_epoch_schedule failed");
-                None
-            }
-        };
-        let mut cache = self.epoch_schedule.lock().await;
-        // Race: another task may have populated while we fetched.
-        let stored = cache.get_or_insert(fetched);
-        stored.as_ref().map(|s| s.get_epoch(slot))
+        // `OnceCell::get_or_init` runs the init future exactly once
+        // even under concurrent callers — no manual race handling.
+        let schedule = self
+            .epoch_schedule
+            .get_or_init(|| async {
+                match self.client.get_epoch_schedule().await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!(error = %e, "get_epoch_schedule failed");
+                        None
+                    }
+                }
+            })
+            .await;
+        schedule.as_ref().map(|s| s.get_epoch(slot))
     }
 }
 
