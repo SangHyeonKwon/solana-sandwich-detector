@@ -24,6 +24,7 @@ detector-window = { path = "crates/detector-window" }
 pool-state = { path = "crates/pool-state" }
 solana-sdk = "2"
 solana-client = "2"
+solana-epoch-schedule = "2"
 solana-transaction-status = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

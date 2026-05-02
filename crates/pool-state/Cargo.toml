@@ -9,6 +9,7 @@ description = "AMM pool state reconstruction and counterfactual replay for Solan
 swap-events = { workspace = true }
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
+solana-epoch-schedule = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
