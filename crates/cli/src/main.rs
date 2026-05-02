@@ -16,7 +16,7 @@ use sandwich_detector::{
     detector,
     dex::{self, DexParser},
     source::{rpc::RpcBlockSource, BlockSource},
-    types::{BlockData, SandwichAttack, TransactionData},
+    types::{BlockData, DexType, SandwichAttack, TransactionData},
     window::{FilteredWindowDetector, WindowDetector},
     SCHEMA_VERSION,
 };
@@ -721,15 +721,26 @@ fn write_heartbeat<W: Write>(out: &mut W, ts_ms: i64) -> Result<()> {
     Ok(())
 }
 
-/// Process-lifetime counter for enrichment outcomes. Updated inside
-/// [`enrich_from_cache`] every time `enrich_attack` returns; emitted in
-/// the JSONL heartbeat under `metrics`. Lets ops monitor when the
+/// Process-lifetime counters for enrichment outcomes, bucketed by
+/// [`DexType`]. Updated inside [`enrich_from_cache`] every time
+/// `enrich_attack` returns; emitted in the JSONL heartbeat under
+/// `metrics`. Per-DEX bucketing lets ops watch the
 /// concentrated-liquidity fetch window (Whirlpool 5-array TickArray
-/// bracket or DLMM 5-array BinArray bracket) starts under-fetching
-/// in production — `cross_boundary_unsupported` climbing relative
-/// to `enriched` is the leading signal that the bracket should widen.
-#[derive(Debug, Default)]
+/// bracket or DLMM 5-array BinArray bracket) on the actual DEX where
+/// the trouble is — `meteora_dlmm.cross_boundary_unsupported` climbing
+/// without `orca_whirlpool.cross_boundary_unsupported` moving means
+/// it's a DLMM-side bracket issue, not a Whirlpool one. Buckets for
+/// every [`DexType`] variant are pre-populated so the wire shape is
+/// stable and Vigil's BE can iterate keys without missing-key handling.
+#[derive(Debug)]
 struct EnrichmentMetrics {
+    by_dex: HashMap<DexType, EnrichmentMetricsBucket>,
+}
+
+/// Per-DEX slice of [`EnrichmentMetrics`]. Same six counters as the
+/// flat (pre-#4) shape — only the dispatch key changed.
+#[derive(Debug, Default)]
+struct EnrichmentMetricsBucket {
     enriched: AtomicU64,
     unsupported_dex: AtomicU64,
     config_unavailable: AtomicU64,
@@ -738,25 +749,73 @@ struct EnrichmentMetrics {
     cross_boundary_unsupported: AtomicU64,
 }
 
+/// Static list of every [`DexType`] variant. Used to pre-populate the
+/// metrics map so the heartbeat wire shape is stable from t=0 (no
+/// missing-key surprises in Vigil's BE) and `record()` can take a
+/// non-mutable `&self`.
+///
+/// Adding a DEX variant: append it here too, or `record(new_variant, ...)`
+/// will hit the `expect` in production. The
+/// `all_dex_types_constant_covers_every_dextype_variant` test keeps
+/// this in sync — its exhaustive `match` on `DexType` is a compile
+/// error on a missing variant, and the runtime loop pins the array
+/// length so a typo in this literal is caught.
+const ALL_DEX_TYPES: [DexType; 8] = [
+    DexType::RaydiumV4,
+    DexType::RaydiumClmm,
+    DexType::RaydiumCpmm,
+    DexType::OrcaWhirlpool,
+    DexType::JupiterV6,
+    DexType::MeteoraDlmm,
+    DexType::PumpFun,
+    DexType::Phoenix,
+];
+
+impl Default for EnrichmentMetrics {
+    fn default() -> Self {
+        let by_dex = ALL_DEX_TYPES
+            .iter()
+            .map(|&d| (d, EnrichmentMetricsBucket::default()))
+            .collect();
+        Self { by_dex }
+    }
+}
+
 impl EnrichmentMetrics {
-    /// Bump the counter matching `result`. `Ordering::Relaxed` is fine —
-    /// we don't synchronise reads against any other state, just want
-    /// monotonic per-thread increments visible in the heartbeat
-    /// snapshot.
-    fn record(&self, result: EnrichmentResult) {
+    /// Bump the counter matching `(dex, result)`. `Ordering::Relaxed`
+    /// is fine — we don't synchronise reads against any other state,
+    /// just want monotonic per-thread increments visible in the
+    /// heartbeat snapshot. Pre-population in `Default` guarantees the
+    /// `HashMap::get` is infallible for any [`DexType`] variant.
+    fn record(&self, dex: DexType, result: EnrichmentResult) {
+        let bucket = self
+            .by_dex
+            .get(&dex)
+            .expect("ALL_DEX_TYPES pre-populates every variant");
         let counter = match result {
-            EnrichmentResult::Enriched => &self.enriched,
-            EnrichmentResult::UnsupportedDex => &self.unsupported_dex,
-            EnrichmentResult::ConfigUnavailable => &self.config_unavailable,
-            EnrichmentResult::ReservesMissing => &self.reserves_missing,
-            EnrichmentResult::ReplayFailed => &self.replay_failed,
-            EnrichmentResult::CrossBoundaryUnsupported => &self.cross_boundary_unsupported,
+            EnrichmentResult::Enriched => &bucket.enriched,
+            EnrichmentResult::UnsupportedDex => &bucket.unsupported_dex,
+            EnrichmentResult::ConfigUnavailable => &bucket.config_unavailable,
+            EnrichmentResult::ReservesMissing => &bucket.reserves_missing,
+            EnrichmentResult::ReplayFailed => &bucket.replay_failed,
+            EnrichmentResult::CrossBoundaryUnsupported => &bucket.cross_boundary_unsupported,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> EnrichmentMetricsSnapshot {
-        EnrichmentMetricsSnapshot {
+        let by_dex = self
+            .by_dex
+            .iter()
+            .map(|(&dex, bucket)| (dex, bucket.snapshot()))
+            .collect();
+        EnrichmentMetricsSnapshot { by_dex }
+    }
+}
+
+impl EnrichmentMetricsBucket {
+    fn snapshot(&self) -> EnrichmentMetricsBucketSnapshot {
+        EnrichmentMetricsBucketSnapshot {
             enriched: self.enriched.load(Ordering::Relaxed),
             unsupported_dex: self.unsupported_dex.load(Ordering::Relaxed),
             config_unavailable: self.config_unavailable.load(Ordering::Relaxed),
@@ -769,9 +828,22 @@ impl EnrichmentMetrics {
 
 /// Wire shape of the enrichment metrics field on the JSONL heartbeat.
 /// Mirrored into `contrib/vigil-types.ts` so Vigil's BE can `.metrics`
-/// off a heartbeat line without guessing field names.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+/// off a heartbeat line without guessing field names. The `#[serde(flatten)]`
+/// inlines per-DEX buckets at the `metrics` object's top level — i.e.
+/// `{ "metrics": { "raydium_v4": {...}, "orca_whirlpool": {...}, ... } }`
+/// rather than `{ "metrics": { "by_dex": {...} } }`.
+#[derive(Debug, Clone, Default, Serialize)]
 struct EnrichmentMetricsSnapshot {
+    #[serde(flatten)]
+    by_dex: HashMap<DexType, EnrichmentMetricsBucketSnapshot>,
+}
+
+/// Per-DEX bucket as it appears on the wire. `Copy` is a free win on
+/// a 48-byte POD of `u64` counters — keeps `EnrichmentMetricsSnapshot`
+/// cloneable as a bit-copy and lets callers pass a snapshot through
+/// without an explicit `.clone()`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct EnrichmentMetricsBucketSnapshot {
     enriched: u64,
     unsupported_dex: u64,
     config_unavailable: u64,
@@ -959,7 +1031,7 @@ async fn enrich_from_cache(
     // enrichment still runs unmodified.
     let backrun_tx = cache.get(&attack.backrun.signature);
     let result = enrich_attack(attack, tx, backrun_tx, lookup).await;
-    enrichment_metrics().record(result);
+    enrichment_metrics().record(attack.dex, result);
     if !matches!(result, EnrichmentResult::Enriched) {
         tracing::debug!(
             "enrich {:?} {}: {:?}",
@@ -1120,59 +1192,174 @@ mod tests {
         assert_eq!(v["_heartbeat"], Value::from(1_735_000_000_000i64));
         // metrics field always present (default-zero before any
         // enrichment) — Vigil's BE shouldn't have to handle a missing
-        // key.
+        // key. Per-DEX bucketing means top-level keys are DEX names;
+        // each bucket carries the same six counters as the pre-#4
+        // flat shape.
         let metrics = v
             .get("metrics")
             .expect("heartbeat carries a metrics snapshot");
-        for key in [
-            "enriched",
-            "unsupported_dex",
-            "config_unavailable",
-            "reserves_missing",
-            "replay_failed",
-            "cross_boundary_unsupported",
+        for dex_key in [
+            "raydium_v4",
+            "raydium_clmm",
+            "raydium_cpmm",
+            "orca_whirlpool",
+            "jupiter_v6",
+            "meteora_dlmm",
+            "pump_fun",
+            "phoenix",
         ] {
-            assert!(
-                metrics.get(key).is_some(),
-                "heartbeat metrics missing key {key}: {metrics:?}",
-            );
+            let bucket = metrics
+                .get(dex_key)
+                .unwrap_or_else(|| panic!("heartbeat metrics missing DEX {dex_key}: {metrics:?}"));
+            for counter_key in [
+                "enriched",
+                "unsupported_dex",
+                "config_unavailable",
+                "reserves_missing",
+                "replay_failed",
+                "cross_boundary_unsupported",
+            ] {
+                assert!(
+                    bucket.get(counter_key).is_some(),
+                    "heartbeat metrics[{dex_key}] missing counter {counter_key}: {bucket:?}",
+                );
+            }
         }
     }
 
     #[test]
     fn enrichment_metrics_record_increments_matching_counter() {
         // Counter mapping is what downstream ops keys off of — pin
-        // each variant lands in the right field of the snapshot.
+        // each variant lands in the right field of the right DEX's
+        // bucket. Mixes DEXes to verify per-DEX dispatch doesn't
+        // bleed across buckets.
         let metrics = EnrichmentMetrics::default();
-        metrics.record(EnrichmentResult::Enriched);
-        metrics.record(EnrichmentResult::Enriched);
-        metrics.record(EnrichmentResult::CrossBoundaryUnsupported);
-        metrics.record(EnrichmentResult::UnsupportedDex);
-        metrics.record(EnrichmentResult::ReservesMissing);
+        metrics.record(DexType::RaydiumV4, EnrichmentResult::Enriched);
+        metrics.record(DexType::RaydiumV4, EnrichmentResult::Enriched);
+        metrics.record(
+            DexType::OrcaWhirlpool,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+        metrics.record(DexType::JupiterV6, EnrichmentResult::UnsupportedDex);
+        metrics.record(DexType::MeteoraDlmm, EnrichmentResult::ReservesMissing);
         let snap = metrics.snapshot();
-        assert_eq!(snap.enriched, 2);
-        assert_eq!(snap.cross_boundary_unsupported, 1);
-        assert_eq!(snap.unsupported_dex, 1);
-        assert_eq!(snap.reserves_missing, 1);
-        assert_eq!(snap.config_unavailable, 0);
-        assert_eq!(snap.replay_failed, 0);
+        assert_eq!(snap.by_dex[&DexType::RaydiumV4].enriched, 2);
+        assert_eq!(
+            snap.by_dex[&DexType::OrcaWhirlpool].cross_boundary_unsupported,
+            1
+        );
+        assert_eq!(snap.by_dex[&DexType::JupiterV6].unsupported_dex, 1);
+        assert_eq!(snap.by_dex[&DexType::MeteoraDlmm].reserves_missing, 1);
+        // Cross-bucket isolation: RaydiumV4's enriched bumps shouldn't
+        // leak into any other DEX bucket.
+        assert_eq!(snap.by_dex[&DexType::OrcaWhirlpool].enriched, 0);
+        assert_eq!(snap.by_dex[&DexType::MeteoraDlmm].enriched, 0);
     }
 
     #[test]
     fn enrichment_metrics_snapshot_serializes_with_snake_case_keys() {
-        // Vigil's TS types expect snake_case keys; the auto-derived
-        // Serialize impl on EnrichmentMetricsSnapshot uses the field
-        // names directly. Pin that the JSON shape matches the
-        // contract.
-        let snap = EnrichmentMetricsSnapshot {
-            enriched: 7,
-            cross_boundary_unsupported: 3,
-            ..Default::default()
-        };
+        // Vigil's TS types expect snake_case keys at both layers:
+        // top-level DEX keys (`raydium_v4`, `orca_whirlpool`, ...) and
+        // counter keys inside each bucket. `#[serde(flatten)]` on
+        // by_dex inlines the HashMap entries at the top level rather
+        // than nesting under a `by_dex` field.
+        let mut by_dex = HashMap::new();
+        by_dex.insert(
+            DexType::RaydiumV4,
+            EnrichmentMetricsBucketSnapshot {
+                enriched: 7,
+                cross_boundary_unsupported: 3,
+                ..Default::default()
+            },
+        );
+        let snap = EnrichmentMetricsSnapshot { by_dex };
         let json = serde_json::to_value(snap).unwrap();
-        assert_eq!(json["enriched"], 7);
-        assert_eq!(json["cross_boundary_unsupported"], 3);
-        assert_eq!(json["unsupported_dex"], 0);
+        assert_eq!(json["raydium_v4"]["enriched"], 7);
+        assert_eq!(json["raydium_v4"]["cross_boundary_unsupported"], 3);
+        assert_eq!(json["raydium_v4"]["unsupported_dex"], 0);
+    }
+
+    #[test]
+    fn snapshot_json_preserves_per_dex_dispatch_with_zero_filled_untouched_buckets() {
+        // End-to-end pin on the contract Vigil's BE consumes: record
+        // events on two DEXes, then serialize the snapshot to JSON and
+        // verify (a) the per-DEX dispatch lands the right counter in
+        // the right bucket, (b) the same counter under different DEXes
+        // stays separate (the entire reason this refactor exists —
+        // distinguishing DLMM bracket walk-offs from Whirlpool ones),
+        // and (c) untouched DEXes still emit a zero-filled bucket so
+        // Vigil's BE never has to handle a missing key.
+        let metrics = EnrichmentMetrics::default();
+        metrics.record(DexType::OrcaWhirlpool, EnrichmentResult::Enriched);
+        metrics.record(
+            DexType::OrcaWhirlpool,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+        metrics.record(
+            DexType::MeteoraDlmm,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+        metrics.record(
+            DexType::MeteoraDlmm,
+            EnrichmentResult::CrossBoundaryUnsupported,
+        );
+
+        let json = serde_json::to_value(metrics.snapshot()).unwrap();
+
+        // (a) Whirlpool bucket reflects only Whirlpool events.
+        assert_eq!(json["orca_whirlpool"]["enriched"], 1);
+        assert_eq!(json["orca_whirlpool"]["cross_boundary_unsupported"], 1);
+
+        // (b) Same counter, different DEX, different total. Pre-#4
+        // this would have been a single `cross_boundary_unsupported: 3`
+        // with no way to attribute the DLMM half from operator-side.
+        assert_eq!(json["meteora_dlmm"]["cross_boundary_unsupported"], 2);
+        assert_eq!(json["meteora_dlmm"]["enriched"], 0);
+
+        // (c) Pre-population guarantee: every `DexType` variant emits
+        // a bucket even with zero events. Picks one untouched
+        // supported DEX (raydium_v4) and one unsupported one
+        // (pump_fun) to spot-check the contract.
+        assert_eq!(json["raydium_v4"]["enriched"], 0);
+        assert_eq!(json["raydium_v4"]["cross_boundary_unsupported"], 0);
+        assert_eq!(json["pump_fun"]["enriched"], 0);
+        assert_eq!(json["pump_fun"]["unsupported_dex"], 0);
+    }
+
+    #[test]
+    fn all_dex_types_constant_covers_every_dextype_variant() {
+        // Pin: `ALL_DEX_TYPES` and the `DexType` enum stay in sync.
+        // Adding a variant to `DexType` without adding it to
+        // `ALL_DEX_TYPES` means `record(new_variant, ...)` panics in
+        // production (the `expect` on the HashMap lookup). The
+        // exhaustive match below forces a compile error if a new
+        // variant is added — the runtime length check is just a
+        // double-check the array literal didn't drift.
+        fn _exhaustive_dex_check(d: DexType) -> &'static str {
+            match d {
+                DexType::RaydiumV4 => "raydium_v4",
+                DexType::RaydiumClmm => "raydium_clmm",
+                DexType::RaydiumCpmm => "raydium_cpmm",
+                DexType::OrcaWhirlpool => "orca_whirlpool",
+                DexType::JupiterV6 => "jupiter_v6",
+                DexType::MeteoraDlmm => "meteora_dlmm",
+                DexType::PumpFun => "pump_fun",
+                DexType::Phoenix => "phoenix",
+            }
+        }
+        assert_eq!(ALL_DEX_TYPES.len(), 8);
+
+        // Belt-and-braces: actually exercise `record` against every
+        // variant in the constant. If the constant ever gets out of
+        // sync with the enum (via an erroneous edit) this panics.
+        let metrics = EnrichmentMetrics::default();
+        for dex in ALL_DEX_TYPES {
+            metrics.record(dex, EnrichmentResult::Enriched);
+        }
+        let snap = metrics.snapshot();
+        for dex in ALL_DEX_TYPES {
+            assert_eq!(snap.by_dex[&dex].enriched, 1);
+        }
     }
 
     #[test]

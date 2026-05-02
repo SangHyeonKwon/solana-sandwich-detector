@@ -198,10 +198,18 @@ Enrichment 성공 시 각 `SandwichAttack`은 다음을 갖습니다:
 // Header — 시작 시 한 번 emit.
 { "_header": true, "schema_version": "vigil-v1", "tool_version": "0.x.y", "started_at_ms": 1730000000000 }
 
-// Heartbeat — 실행 중 30초마다. enrichment 메트릭 스냅샷 포함.
-{ "_heartbeat": true, "ts_ms": 1730000030000, "metrics": {
-    "enriched": 142, "unsupported_dex": 18, "config_unavailable": 3,
-    "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 4 } }
+// Heartbeat — 실행 중 30초마다. `DexType`별로 버킷팅된 enrichment 메트릭 스냅샷 포함.
+// 어느 DEX의 5-array fetch window가 under-fetch 중인지 ops가 바로 식별 가능.
+// 8개 DexType 키는 항상 모두 존재 (0으로 채워져 있을 수 있음).
+// `_heartbeat` 자체가 unix-ms 타임스탬프 (boolean 아님).
+{ "_heartbeat": 1730000030000, "metrics": {
+    "raydium_v4":     { "enriched": 90, "unsupported_dex": 0, "config_unavailable": 1,
+                        "reserves_missing": 0, "replay_failed": 0, "cross_boundary_unsupported": 0 },
+    "orca_whirlpool": { "enriched": 32, "unsupported_dex": 0, "config_unavailable": 1,
+                        "reserves_missing": 1, "replay_failed": 0, "cross_boundary_unsupported": 3 },
+    "meteora_dlmm":   { "enriched": 20, "unsupported_dex": 0, "config_unavailable": 1,
+                        "reserves_missing": 0, "replay_failed": 0, "cross_boundary_unsupported": 1 },
+    /* raydium_clmm, raydium_cpmm, jupiter_v6, pump_fun, phoenix 생략 */ } }
 
 // SandwichAttack — 탐지당 1개. 전체 스키마는 vigil-v1.json.
 { "slot": 285012345, "attacker": "...", "frontrun": {...}, "victim": {...}, ... }
