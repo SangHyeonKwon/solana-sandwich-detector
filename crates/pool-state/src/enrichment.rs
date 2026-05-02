@@ -239,9 +239,34 @@ pub async fn enrich_attack(
             // sooner if a leg walks into the gap.
             let arrays: Vec<ParsedBinArray> = arrays_raw.into_iter().flatten().collect();
 
-            let Some((loss, dlmm_trace)) =
-                compute_loss_dlmm_with_trace(attack, &dlmm_pool, &arrays, config.base_is_token_a)
-            else {
+            // Phase 3: feed the swap's wall-clock timestamp into the
+            // replay so `update_references` runs against a realistic
+            // `elapsed` window. `attack.timestamp_ms` is the block
+            // time in ms; convert to seconds. Fall back to the pool's
+            // own `last_update_timestamp` (⇒ `elapsed = 0`, no
+            // reference refresh) when the upstream block didn't carry
+            // a timestamp.
+            let swap_timestamp = attack
+                .timestamp_ms
+                .map(|ms| ms / 1_000)
+                .unwrap_or(dlmm_pool.last_update_timestamp);
+            // Token-2022 transfer-fee plumbing surface: when the
+            // pool's mints carry a TransferFeeConfig extension, the
+            // caller supplies it here. Step 6 wires the surface; an
+            // upcoming follow-up adds the actual mint fetch via
+            // PoolStateLookup, at which point these `None`s become
+            // `Some` for Token-2022 mints. Phase 1/2 corpus pools all
+            // use legacy SPL Token mints ⇒ `None` matches existing
+            // behaviour.
+            let Some((loss, dlmm_trace)) = compute_loss_dlmm_with_trace(
+                attack,
+                &dlmm_pool,
+                &arrays,
+                config.base_is_token_a,
+                swap_timestamp,
+                None,
+                None,
+            ) else {
                 // None ⇒ cross-bin walked off the window, iteration
                 // cap fired, or direction-mismatch invariant violation.
                 // Map to CrossTickUnsupported so Phase 3 follow-up
@@ -1318,6 +1343,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         })
     }
 
@@ -1495,6 +1521,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         });
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
@@ -1543,6 +1570,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         });
         let lookup = MockLookup {
             config: dlmm_config(),
@@ -1573,6 +1601,128 @@ mod tests {
             "expected walk to cross array boundary (≥ 70), got {}",
             trace.active_id_post_front,
         );
+    }
+
+    /// Phase 3 decay-window corpus: pool snapshot's
+    /// `last_update_timestamp` is far enough in the past (> decay_period)
+    /// that `update_references` resets `volatility_reference` to 0
+    /// and snapshots `index_reference = active_id`. The cross-bin
+    /// walker's first bin then reads `delta_id = 0` ⇒ vol_acc resets
+    /// to 0; subsequent bins grow it from there.
+    ///
+    /// Critical invariant: `vol_acc_post_front` must be **far smaller
+    /// than the snapshot's `volatility_accumulator`** even though the
+    /// snapshot value (250_000) carries through `vol_acc_pre`
+    /// untouched. If the decay reset path were broken, the walk
+    /// would *add* per-bin increments on top of the 250_000 snapshot
+    /// and the post-front value would land near or above the cap.
+    #[tokio::test]
+    async fn dlmm_corpus_decay_window_resets_volatility_reference() {
+        let mut attack = make_dlmm_attack(5_000);
+        // Drive update_references into the "past decay" branch.
+        attack.timestamp_ms = Some(2_000_000 * 1_000); // 2_000_000 s, in ms.
+        let dynamic_state = DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 0,
+            bin_step: 10,
+            base_factor: 10_000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+            filter_period: 30,
+            decay_period: 600,
+            reduction_factor: 5_000,
+            variable_fee_control: 40_000,
+            max_volatility_accumulator: 350_000,
+            // Snapshot has a meaningful vol_acc but
+            // last_update_timestamp is "long ago" — past decay window
+            // ⇒ update_references resets volatility_reference to 0.
+            volatility_accumulator: 250_000,
+            volatility_reference: 100_000,
+            index_reference: 50,
+            last_update_timestamp: 1_000_000,
+        });
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                None,
+            ],
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        // Snapshot vol_acc surfaces as-is in `vol_acc_pre` — the
+        // schema doc spells this out: update_references doesn't
+        // mutate the accumulator field itself.
+        assert_eq!(trace.volatility_accumulator_pre, 250_000);
+        // The decay-reset branch cleared `volatility_reference`, so
+        // the walk's per-bin update_volatility_accumulator computed
+        // from delta_id alone (no carryover). 5k input on 1k-per-bin
+        // pool drains a handful of bins ⇒ post_front lands well
+        // below the snapshot's 250_000.
+        assert!(
+            trace.volatility_accumulator_post_front < 250_000,
+            "decay reset must clear volatility carryover; got post={} (pre={})",
+            trace.volatility_accumulator_post_front,
+            trace.volatility_accumulator_pre,
+        );
+    }
+
+    /// Phase 3 dynamic-fee corpus: a pool with `variable_fee_control = 40_000`
+    /// (mainnet SOL/USDC ballpark) drives the trace to surface a
+    /// non-zero `volatility_accumulator_post_front` and
+    /// `variable_fee_rate_post_front` once the frontrun walks bins.
+    /// Pin that the surface flows through enrich → trace, not just
+    /// the unit-level path.
+    #[tokio::test]
+    async fn dlmm_corpus_variable_fee_surfaces_in_trace() {
+        let mut attack = make_dlmm_attack(5_000);
+        let dynamic_state = DynamicPoolState::Dlmm(DlmmPool {
+            active_id: 60,
+            bin_step: 10,
+            base_factor: 10_000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+            variable_fee_control: 40_000,
+            max_volatility_accumulator: 350_000,
+            ..Default::default()
+        });
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                None,
+            ],
+        };
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        assert!(
+            trace.volatility_accumulator_post_front > 0,
+            "frontrun walk must drive vol_acc up: post={}",
+            trace.volatility_accumulator_post_front,
+        );
+        assert!(
+            trace.variable_fee_rate_post_front > 0,
+            "post-front variable rate must be positive: rate={}",
+            trace.variable_fee_rate_post_front,
+        );
+        assert_eq!(trace.variable_fee_rate_pre, 0);
+        // Transfer fee surfaces stay null — enrichment passes None
+        // pending the mint-fetch follow-up.
+        assert_eq!(trace.token_x_transfer_fee_bps, None);
+        assert_eq!(trace.token_y_transfer_fee_bps, None);
     }
 
     /// Partial-peripheral window: the walker should bail when it

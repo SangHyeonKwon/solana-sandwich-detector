@@ -1068,10 +1068,48 @@ pub struct MeteoraDlmmReplayTrace {
     /// `bin_id` without re-deriving the pool config.
     pub bin_step: u16,
 
-    /// LP fee fraction. DLMM uses `fee_num / 1_000_000_000` units
-    /// (`base_factor * bin_step * 10 * 10^bf_power`), capped at 10%.
+    /// LP fee fraction. DLMM uses `fee_num / 1_000_000_000` units.
+    /// Phase 1/2: base fee only (`base_factor * bin_step * 10 *
+    /// 10^bf_power`). Phase 3: this carries the *static base* portion
+    /// of the rate; the variable component is surfaced separately
+    /// via `variable_fee_rate_*` so a reader can decompose the total.
+    /// Capped at 10% post-sum.
     pub fee_num: u64,
     pub fee_den: u64,
+
+    /// Volatility accumulator carried by the pool snapshot
+    /// (`v_parameters.volatility_accumulator`). On-chain
+    /// `update_references` does *not* mutate this field — it only
+    /// resets `volatility_reference` based on elapsed time — so this
+    /// surfaces the raw account-snapshot value. The first bin of the
+    /// cross-bin walk reads it indirectly through
+    /// `update_volatility_accumulator`'s `delta_id = |index_reference
+    /// - active_id|` formula; subsequent bins overwrite it.
+    pub volatility_accumulator_pre: u32,
+    /// Volatility accumulator after the frontrun walk. Equals
+    /// `pre + bins_crossed * 10_000` (capped at
+    /// `max_volatility_accumulator`). The biggest accumulator value
+    /// the victim's per-bin fee will ever see in the standard
+    /// frontrun→victim→backrun sequence.
+    pub volatility_accumulator_post_front: u32,
+
+    /// Variable-fee numerator at the pre-frontrun accumulator value
+    /// (over `fee_den`). `0` when the pool's `variable_fee_control`
+    /// is 0 or the accumulator is 0. Add to `fee_num` to get the
+    /// pre-frontrun total fee rate.
+    pub variable_fee_rate_pre: u64,
+    /// Variable-fee numerator at the post-frontrun accumulator. Lets
+    /// a reader see how much the frontrun's bin walk inflated the
+    /// fee the victim paid.
+    pub variable_fee_rate_post_front: u64,
+
+    /// Token-2022 transfer fee on token X, in basis points over
+    /// `10_000`. `None` for legacy SPL Token mints (the common case
+    /// for Phase 1/2 corpus pools). Surfaced symmetrically for X/Y
+    /// rather than in/out so the trace is direction-agnostic.
+    pub token_x_transfer_fee_bps: Option<u16>,
+    /// Token-2022 transfer fee on token Y, in basis points.
+    pub token_y_transfer_fee_bps: Option<u16>,
 }
 
 /// Serde adapter that serialises a `u128` as a base-10 decimal string

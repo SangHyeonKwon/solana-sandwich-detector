@@ -19,16 +19,30 @@
 //! `LbPair` is an Anchor account with `bytemuck repr(C)` body. The first
 //! 8 bytes are the discriminator (`sha256("account:LbPair")[..8]`).
 //! Field offsets (from the start of `account_data`, including the
-//! discriminator) for everything we read in Phase 1:
+//! discriminator) for everything we read:
 //!
 //! ```text
 //!   field                                offset  size
 //!   discriminator                            0     8
 //!   parameters (StaticParameters, 32B)       8    32
 //!     - base_factor: u16                     8     2
+//!     - filter_period: u16                  10     2
+//!     - decay_period: u16                   12     2
+//!     - reduction_factor: u16               14     2
+//!     - variable_fee_control: u32           16     4
+//!     - max_volatility_accumulator: u32     20     4
+//!     - min_bin_id: i32                     24     4   (unused in replay)
+//!     - max_bin_id: i32                     28     4   (unused in replay)
 //!     - protocol_share: u16                 32     2
 //!     - base_fee_power_factor: u8           34     1
+//!     - _padding: [u8; 5]                   35     5
 //!   v_parameters (VariableParameters, 32B)  40    32
+//!     - volatility_accumulator: u32         40     4
+//!     - volatility_reference: u32           44     4
+//!     - index_reference: i32                48     4
+//!     - _padding: [u8; 4]                   52     4
+//!     - last_update_timestamp: i64          56     8
+//!     - _padding_1: [u8; 8]                 64     8
 //!   bump_seed: [u8; 1]                      72     1
 //!   bin_step_seed: [u8; 2]                  73     2
 //!   pair_type: u8                           75     1
@@ -62,10 +76,22 @@ use crate::lookup::{AmmKind, PoolConfig};
 
 const DISCRIMINATOR_LEN: usize = 8;
 
-// StaticParameters fields (relative to discriminator end).
+// StaticParameters fields (relative to LbPair start, parameters at offset 8).
 const BASE_FACTOR_OFFSET: usize = DISCRIMINATOR_LEN; // 8
+const FILTER_PERIOD_OFFSET: usize = DISCRIMINATOR_LEN + 2; // 10
+const DECAY_PERIOD_OFFSET: usize = DISCRIMINATOR_LEN + 4; // 12
+const REDUCTION_FACTOR_OFFSET: usize = DISCRIMINATOR_LEN + 6; // 14
+const VARIABLE_FEE_CONTROL_OFFSET: usize = DISCRIMINATOR_LEN + 8; // 16
+const MAX_VOLATILITY_ACCUMULATOR_OFFSET: usize = DISCRIMINATOR_LEN + 12; // 20
 const PROTOCOL_SHARE_OFFSET: usize = DISCRIMINATOR_LEN + 24; // 32
 const BASE_FEE_POWER_FACTOR_OFFSET: usize = DISCRIMINATOR_LEN + 26; // 34
+
+// VariableParameters fields (v_parameters block at offset 40).
+const V_PARAMS_OFFSET: usize = DISCRIMINATOR_LEN + 32; // 40
+const VOLATILITY_ACCUMULATOR_OFFSET: usize = V_PARAMS_OFFSET; // 40
+const VOLATILITY_REFERENCE_OFFSET: usize = V_PARAMS_OFFSET + 4; // 44
+const INDEX_REFERENCE_OFFSET: usize = V_PARAMS_OFFSET + 8; // 48
+const LAST_UPDATE_TIMESTAMP_OFFSET: usize = V_PARAMS_OFFSET + 16; // 56
 
 // LbPair body offsets (after StaticParameters[32] + VariableParameters[32] = 64).
 const ACTIVE_ID_OFFSET: usize = DISCRIMINATOR_LEN + 32 + 32 + 1 + 2 + 1; // 76
@@ -100,6 +126,19 @@ pub const DLMM_MAX_FEE_RATE: u128 = 100_000_000;
 /// as the Raydium V4 / Whirlpool parsers' fallback.
 const DEFAULT_FEE_NUM: u64 = 3_000_000;
 
+/// Basis-point denominator used by DLMM volatility math. Mirrors
+/// `BASIS_POINT_MAX` in `MeteoraAg/dlmm-sdk/commons/src/constants.rs`.
+/// Distinct from the `price_math::BASIS_POINT_MAX` (u128, same value),
+/// kept as `u32` here so the volatility ops avoid widening churn.
+const DLMM_BASIS_POINT_MAX: u32 = 10_000;
+
+/// Hard-coded `compute_variable_fee` divisor (10^11). On-chain
+/// `LbPair::compute_variable_fee` ceil-divides `variable_fee_control *
+/// (volatility_accumulator * bin_step)^2` by this constant. Mirroring
+/// the literal (rather than re-deriving from FEE_PRECISION) guards
+/// against future on-chain refactors silently changing the scaling.
+const DLMM_VARIABLE_FEE_SCALE: u128 = 100_000_000_000;
+
 /// Meteora DLMM program id — `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
 /// Used by future BinArray PDA derivation. Decoded once per call from the
 /// hardcoded base58 (same pattern as `whirlpool_program_id`).
@@ -109,12 +148,16 @@ pub fn dlmm_program_id() -> Pubkey {
 }
 
 /// Snapshot of `LbPair` state combining the dynamic active bin id with
-/// the static fee parameters that govern within-bin swap fees. The
-/// fee-parameter triple (`base_factor`, `bin_step`, `base_fee_power_factor`)
-/// never mutates per swap, but lives in the same on-chain account, so we
-/// surface them together to avoid re-parsing the blob in step 4 when the
-/// swap-step math computes fees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the static + variable fee parameters that govern swap fees.
+///
+/// The static-fee triple (`base_factor`, `bin_step`, `base_fee_power_factor`)
+/// never mutates per swap; the variable-fee state (`volatility_accumulator`,
+/// `volatility_reference`, `index_reference`, `last_update_timestamp`) is
+/// updated each swap on-chain. We surface the snapshot at the moment the
+/// account was fetched — replay then advances the variable-fee state in-
+/// memory exactly as on-chain `update_references` /
+/// `update_volatility_accumulator` would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DlmmPool {
     /// Currently active bin id. The active bin holds reserves of both
     /// tokens; left bins (token_y only) and right bins (token_x only) are
@@ -133,25 +176,95 @@ pub struct DlmmPool {
     /// regardless of how it's split downstream), retained here for
     /// completeness.
     pub protocol_share: u16,
+    /// High-frequency-trading window in seconds. If two swaps land within
+    /// this window, the volatility reference is *not* refreshed — the
+    /// accumulator keeps growing across them so a burst of swaps
+    /// compounds the variable fee. Static per pool.
+    pub filter_period: u16,
+    /// Decay window in seconds. After `filter_period` but before
+    /// `decay_period` elapsed, the volatility reference decays by
+    /// `reduction_factor / 10_000`; past `decay_period`, it resets to 0.
+    /// Static per pool.
+    pub decay_period: u16,
+    /// Volatility decay multiplier in basis points. `5_000 = 50%`. Static
+    /// per pool.
+    pub reduction_factor: u16,
+    /// Coefficient that scales `(volatility_accumulator * bin_step)^2`
+    /// into the variable-fee numerator. `0` disables the variable-fee
+    /// component. Static per pool.
+    pub variable_fee_control: u32,
+    /// Cap on `volatility_accumulator` — pins the maximum variable-fee
+    /// rate. Static per pool.
+    pub max_volatility_accumulator: u32,
+    /// Volatility accumulator. On-chain it stores the count of bins
+    /// crossed since `index_reference`, expressed in basis-point units
+    /// (`bins_crossed * 10_000 + reference_residue`). Mutates every
+    /// `update_volatility_accumulator` call.
+    pub volatility_accumulator: u32,
+    /// Decayed volatility carried from the previous swap. Always
+    /// `<= volatility_accumulator`. Refreshed by `update_references`.
+    pub volatility_reference: u32,
+    /// `active_id` snapshotted at the previous swap (or, after an
+    /// `update_references` reset, the current `active_id`). Anchor for
+    /// the `delta_id = |index_reference - active_id|` accumulator term.
+    pub index_reference: i32,
+    /// Wall-clock timestamp of the last `update_references` call.
+    /// Compared against the current swap's timestamp to decide whether
+    /// the filter / decay window has elapsed.
+    pub last_update_timestamp: i64,
 }
 
 impl DlmmPool {
-    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]),
-    /// capped at [`DLMM_MAX_FEE_RATE`] to mirror on-chain `get_total_fee`.
-    ///
-    /// Phase 1 implements **base fee only**: `base_factor * bin_step *
-    /// 10 * 10^base_fee_power_factor`. Variable fee (volatility-driven)
-    /// would add to this rate but is intentionally skipped — pinning
-    /// the Phase 1 cap on accuracy. Phase 3 follow-up plumbs
-    /// `VolatilityAccumulator` and brings replay numbers into bit-for-
-    /// bit agreement with on-chain `quote_exact_in`.
-    pub fn total_fee_rate(&self) -> Option<u128> {
+    /// Static-fee numerator over [`DLMM_FEE_PRECISION`]:
+    /// `base_factor * bin_step * 10 * 10^base_fee_power_factor`. Mirrors
+    /// `LbPair::get_base_fee`. Uncapped — the cap is applied in
+    /// [`Self::total_fee_rate`] after the variable component is added.
+    pub fn base_fee_rate(&self) -> Option<u128> {
         let factor = (self.base_factor as u128)
             .checked_mul(self.bin_step as u128)?
             .checked_mul(10)?;
         let power_mul: u128 = 10u128.checked_pow(self.base_fee_power_factor as u32)?;
-        let raw = factor.checked_mul(power_mul)?;
-        Some(raw.min(DLMM_MAX_FEE_RATE))
+        factor.checked_mul(power_mul)
+    }
+
+    /// Variable-fee numerator at the supplied accumulator value.
+    /// Mirrors on-chain `LbPair::compute_variable_fee`:
+    /// `ceil(variable_fee_control * (vol_acc * bin_step)^2 / 10^11)`.
+    /// Returns 0 when `variable_fee_control == 0` (the static-fee-only
+    /// pool config — most pools today).
+    ///
+    /// Taking the accumulator as an argument (rather than reading
+    /// `self.volatility_accumulator`) mirrors the on-chain split
+    /// between `compute_variable_fee` and `get_variable_fee`. Replay
+    /// callers want to compute the variable fee *at the start of a
+    /// specific bin step*, after `update_volatility_accumulator` has
+    /// already mutated `self`.
+    pub fn compute_variable_fee(&self, volatility_accumulator: u32) -> Option<u128> {
+        if self.variable_fee_control == 0 {
+            return Some(0);
+        }
+        let vol = u128::from(volatility_accumulator);
+        let bin_step = u128::from(self.bin_step);
+        let vfc = u128::from(self.variable_fee_control);
+        let square = vol.checked_mul(bin_step)?.checked_pow(2)?;
+        let v_fee = vfc.checked_mul(square)?;
+        v_fee
+            .checked_add(DLMM_VARIABLE_FEE_SCALE.checked_sub(1)?)?
+            .checked_div(DLMM_VARIABLE_FEE_SCALE)
+    }
+
+    /// Aggregate swap-fee rate (numerator over [`DLMM_FEE_PRECISION`]),
+    /// capped at [`DLMM_MAX_FEE_RATE`] to mirror on-chain `get_total_fee`.
+    ///
+    /// Reads `self.volatility_accumulator` for the variable component.
+    /// Per-bin replay must therefore call
+    /// [`Self::update_volatility_accumulator`] *before* this — the
+    /// accumulator value is the "at the start of this bin step" reading.
+    pub fn total_fee_rate(&self) -> Option<u128> {
+        let base = self.base_fee_rate()?;
+        let variable = self.compute_variable_fee(self.volatility_accumulator)?;
+        let total = base.checked_add(variable)?;
+        Some(total.min(DLMM_MAX_FEE_RATE))
     }
 
     /// Fee charged when the caller knows the *net* (post-fee) amount
@@ -187,6 +300,73 @@ impl DlmmPool {
             .checked_add((DLMM_FEE_PRECISION - 1) as u128)?
             .checked_div(den)?;
         u64::try_from(fee).ok()
+    }
+
+    /// Refresh the volatility reference + index reference based on how
+    /// much wall-clock time has elapsed since the previous swap.
+    /// Mirrors `LbPair::update_references` in
+    /// `MeteoraAg/dlmm-sdk/commons/src/extensions/lb_pair.rs`.
+    ///
+    /// Three regimes, gated by `(filter_period, decay_period)`:
+    ///   1. `elapsed < filter_period`: high-frequency window — leave
+    ///      everything alone so a burst of swaps compounds the
+    ///      accumulator.
+    ///   2. `filter_period <= elapsed < decay_period`: snapshot
+    ///      `active_id` into `index_reference` and decay
+    ///      `volatility_reference` by `reduction_factor / 10_000`.
+    ///   3. `elapsed >= decay_period`: snapshot `active_id`, reset
+    ///      `volatility_reference` to 0.
+    ///
+    /// On-chain this is called *once* at swap entry, before the per-bin
+    /// loop. Phase 3's [`compute_loss_dlmm`](crate::compute_loss_dlmm)
+    /// path follows the same shape.
+    ///
+    /// Returns `None` on arithmetic overflow (only possible with
+    /// pathologically large `volatility_accumulator * reduction_factor`,
+    /// not reachable from any legal pool config).
+    pub fn update_references(&mut self, current_timestamp: i64) -> Option<()> {
+        let elapsed = current_timestamp.checked_sub(self.last_update_timestamp)?;
+        if elapsed >= i64::from(self.filter_period) {
+            self.index_reference = self.active_id;
+            if elapsed < i64::from(self.decay_period) {
+                self.volatility_reference = self
+                    .volatility_accumulator
+                    .checked_mul(u32::from(self.reduction_factor))?
+                    .checked_div(DLMM_BASIS_POINT_MAX)?;
+            } else {
+                self.volatility_reference = 0;
+            }
+        }
+        Some(())
+    }
+
+    /// Recompute the volatility accumulator from the current `active_id`
+    /// against the snapshotted `index_reference`. Mirrors
+    /// `LbPair::update_volatility_accumulator` in commons.
+    ///
+    /// On-chain this is called **per bin** during the swap loop, *before*
+    /// the bin's swap math runs — so the variable-fee rate within a
+    /// bin reflects the accumulator value at that bin's start, not the
+    /// previous bin's. Phase 3's `cross_bin_swap` follows the same
+    /// shape so the per-bin fee replays exactly.
+    ///
+    /// Saturates at `max_volatility_accumulator` (the on-chain cap that
+    /// prevents the variable fee from growing without bound during
+    /// large multi-bin walks).
+    ///
+    /// Returns `None` on arithmetic overflow (only possible if
+    /// `delta_id * 10_000` overflows `u64` — requires a `delta_id`
+    /// north of `1.8e15`, far beyond DLMM's `[-443_636, 443_636]`
+    /// legal bin range).
+    pub fn update_volatility_accumulator(&mut self) -> Option<()> {
+        let delta_id = i64::from(self.index_reference)
+            .checked_sub(i64::from(self.active_id))?
+            .unsigned_abs();
+        let raw = u64::from(self.volatility_reference)
+            .checked_add(delta_id.checked_mul(u64::from(DLMM_BASIS_POINT_MAX))?)?;
+        let capped = raw.min(u64::from(self.max_volatility_accumulator));
+        self.volatility_accumulator = u32::try_from(capped).ok()?;
+        Some(())
     }
 }
 
@@ -263,8 +443,9 @@ pub fn parse_config(pool_address: &str, account_data: &[u8]) -> Option<PoolConfi
     })
 }
 
-/// Parse the dynamic swap-relevant state (active_id) plus the fee
-/// parameter triple. Returns `None` for short blobs.
+/// Parse the dynamic swap-relevant state (active bin + variable-fee
+/// state) plus the static fee parameters. Returns `None` for short
+/// blobs.
 pub fn parse_pool_state(account_data: &[u8]) -> Option<DlmmPool> {
     if account_data.len() < MIN_LAYOUT_LEN {
         return None;
@@ -275,6 +456,15 @@ pub fn parse_pool_state(account_data: &[u8]) -> Option<DlmmPool> {
         base_factor: read_u16(account_data, BASE_FACTOR_OFFSET)?,
         base_fee_power_factor: read_u8(account_data, BASE_FEE_POWER_FACTOR_OFFSET)?,
         protocol_share: read_u16(account_data, PROTOCOL_SHARE_OFFSET)?,
+        filter_period: read_u16(account_data, FILTER_PERIOD_OFFSET)?,
+        decay_period: read_u16(account_data, DECAY_PERIOD_OFFSET)?,
+        reduction_factor: read_u16(account_data, REDUCTION_FACTOR_OFFSET)?,
+        variable_fee_control: read_u32(account_data, VARIABLE_FEE_CONTROL_OFFSET)?,
+        max_volatility_accumulator: read_u32(account_data, MAX_VOLATILITY_ACCUMULATOR_OFFSET)?,
+        volatility_accumulator: read_u32(account_data, VOLATILITY_ACCUMULATOR_OFFSET)?,
+        volatility_reference: read_u32(account_data, VOLATILITY_REFERENCE_OFFSET)?,
+        index_reference: read_i32(account_data, INDEX_REFERENCE_OFFSET)?,
+        last_update_timestamp: read_i64(account_data, LAST_UPDATE_TIMESTAMP_OFFSET)?,
     })
 }
 
@@ -295,6 +485,11 @@ fn read_u8(data: &[u8], offset: usize) -> Option<u8> {
 fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
     let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
     Some(i32::from_le_bytes(bytes))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
@@ -996,13 +1191,19 @@ pub mod cross_bin {
     ///     the `None` here means a real arithmetic edge case).
     ///
     /// Side effect: `state` is mutated to reflect post-swap bin
-    /// reserves. Caller passes a clone for counterfactual replays.
+    /// reserves; `pool` is mutated to reflect post-walk variable-fee
+    /// state (`active_id`, `volatility_accumulator`). Caller passes
+    /// clones for counterfactual replays. The caller is also
+    /// responsible for invoking [`DlmmPool::update_references`] *before*
+    /// this — the on-chain swap calls `update_references` once at
+    /// entry, then `update_volatility_accumulator` per bin (mirrored
+    /// here inside the loop).
     pub fn cross_bin_swap(
         amount_in: u64,
         initial_active_id: i32,
         state: &mut DlmmBinState,
         swap_for_y: bool,
-        pool: &DlmmPool,
+        pool: &mut DlmmPool,
     ) -> Option<CrossBinSwapResult> {
         let mut amount_left = amount_in;
         let mut total_in_with_fees: u64 = 0;
@@ -1012,6 +1213,7 @@ pub mod cross_bin {
 
         for iter in 0..MAX_SWAP_ITERATIONS {
             if amount_left == 0 {
+                pool.active_id = active_id;
                 return Some(CrossBinSwapResult {
                     amount_in_with_fees: total_in_with_fees,
                     amount_out: total_out,
@@ -1020,7 +1222,24 @@ pub mod cross_bin {
                     iterations: iter,
                 });
             }
+            // Look up the bin first; missing bin (window edge) fails
+            // the walk without mutating pool state. On-chain mirror:
+            // `quote_exact_in` only calls `update_volatility_accumulator`
+            // once it has confirmed the bin is in-range and about to
+            // be swapped — we do the same so a `None` here returns a
+            // clean failure path instead of leaving `pool.active_id`
+            // and `pool.volatility_accumulator` mutated for a bin we
+            // never traded against.
             let snap = state.get(active_id)?;
+
+            // Per-bin variable-fee refresh: sync active_id and update
+            // the accumulator so `swap_within_bin`'s fee read sees the
+            // accumulator value at *this bin's start*. Mirrors on-chain
+            // `quote_exact_in`'s `update_volatility_accumulator()` call
+            // immediately before each `active_bin.swap(...)`.
+            pool.active_id = active_id;
+            pool.update_volatility_accumulator()?;
+
             let step = swap_within_bin(
                 amount_left,
                 snap.amount_x,
@@ -1058,6 +1277,7 @@ pub mod cross_bin {
 
             if !step.bin_drained {
                 // Partial fill ⇒ caller's swap is complete.
+                pool.active_id = active_id;
                 return Some(CrossBinSwapResult {
                     amount_in_with_fees: total_in_with_fees,
                     amount_out: total_out,
@@ -1165,6 +1385,45 @@ mod tests {
         assert!(parse_pool_state(&short).is_none());
     }
 
+    /// Pin the StaticParameters dynamic-fee fields + VariableParameters
+    /// offsets parsed in Phase 3. The `synth_blob` zeroes everything,
+    /// so we set distinguishable values at each offset and verify the
+    /// parse picks them up. Catches a future regression that swaps two
+    /// adjacent offsets (e.g. `filter_period` <-> `decay_period`).
+    #[test]
+    fn parses_dynamic_fee_state() {
+        let mut data = synth_blob();
+        let mint_y = Pubkey::from_str(WSOL_MINT).unwrap();
+        data[TOKEN_Y_MINT_OFFSET..TOKEN_Y_MINT_OFFSET + 32].copy_from_slice(mint_y.as_ref());
+        data[FILTER_PERIOD_OFFSET..FILTER_PERIOD_OFFSET + 2].copy_from_slice(&30u16.to_le_bytes());
+        data[DECAY_PERIOD_OFFSET..DECAY_PERIOD_OFFSET + 2].copy_from_slice(&600u16.to_le_bytes());
+        data[REDUCTION_FACTOR_OFFSET..REDUCTION_FACTOR_OFFSET + 2]
+            .copy_from_slice(&5_000u16.to_le_bytes());
+        data[VARIABLE_FEE_CONTROL_OFFSET..VARIABLE_FEE_CONTROL_OFFSET + 4]
+            .copy_from_slice(&40_000u32.to_le_bytes());
+        data[MAX_VOLATILITY_ACCUMULATOR_OFFSET..MAX_VOLATILITY_ACCUMULATOR_OFFSET + 4]
+            .copy_from_slice(&350_000u32.to_le_bytes());
+        data[VOLATILITY_ACCUMULATOR_OFFSET..VOLATILITY_ACCUMULATOR_OFFSET + 4]
+            .copy_from_slice(&12_345u32.to_le_bytes());
+        data[VOLATILITY_REFERENCE_OFFSET..VOLATILITY_REFERENCE_OFFSET + 4]
+            .copy_from_slice(&6_000u32.to_le_bytes());
+        data[INDEX_REFERENCE_OFFSET..INDEX_REFERENCE_OFFSET + 4]
+            .copy_from_slice(&(-42i32).to_le_bytes());
+        data[LAST_UPDATE_TIMESTAMP_OFFSET..LAST_UPDATE_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&1_700_000_000i64.to_le_bytes());
+
+        let state = parse_pool_state(&data).unwrap();
+        assert_eq!(state.filter_period, 30);
+        assert_eq!(state.decay_period, 600);
+        assert_eq!(state.reduction_factor, 5_000);
+        assert_eq!(state.variable_fee_control, 40_000);
+        assert_eq!(state.max_volatility_accumulator, 350_000);
+        assert_eq!(state.volatility_accumulator, 12_345);
+        assert_eq!(state.volatility_reference, 6_000);
+        assert_eq!(state.index_reference, -42);
+        assert_eq!(state.last_update_timestamp, 1_700_000_000);
+    }
+
     #[test]
     fn falls_back_to_default_fee_on_zero_factor() {
         let mut data = synth_blob();
@@ -1209,6 +1468,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 1, // x10
             protocol_share: 0,
+            ..Default::default()
         };
         // base_fee_rate = 8000 * 25 * 10 * 10 = 20_000_000 → 2% in 1e9.
         // fee on 1_000_000 = 1_000_000 * 20_000_000 / 1e9 = 20_000 (exact).
@@ -1227,6 +1487,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         };
         // rate = 2e6, den = 998e6; 1e6 * 2e6 / 998e6 = 2004.0080...
         // floor = 2004, remainder ≠ 0 ⇒ ceil = 2005.
@@ -1245,10 +1506,163 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         };
         // rate = 2e6; gross = 1; num = 2e6; ceil(2e6 / 1e9) = 1.
         // (Floor would yield 0 — pin that we round up.)
         assert_eq!(pool.compute_fee_from_amount(1).unwrap(), 1);
+    }
+
+    /// Standard pool fixture used by the volatility-update tests. Bins
+    /// 25 bp, max accumulator 350_000 (matches an SOL/USDC mainnet
+    /// pool), reduction factor 5_000 ⇒ 50% decay per filter window.
+    fn pool_with_dyn_fee() -> DlmmPool {
+        DlmmPool {
+            active_id: 100,
+            bin_step: 25,
+            base_factor: 8000,
+            base_fee_power_factor: 0,
+            protocol_share: 0,
+            filter_period: 30,
+            decay_period: 600,
+            reduction_factor: 5_000,
+            variable_fee_control: 40_000,
+            max_volatility_accumulator: 350_000,
+            volatility_accumulator: 20_000,
+            volatility_reference: 10_000,
+            index_reference: 95,
+            last_update_timestamp: 1_000_000,
+        }
+    }
+
+    /// Inside the filter window — references are *not* refreshed.
+    /// Pins regime 1: a burst of swaps compounds the accumulator.
+    #[test]
+    fn update_references_inside_filter_window_is_noop() {
+        let mut pool = pool_with_dyn_fee();
+        let before = pool;
+        // 10 < filter_period (30) ⇒ skip.
+        pool.update_references(1_000_000 + 10).unwrap();
+        assert_eq!(pool, before);
+    }
+
+    /// Filter window passed but inside decay window — index_reference
+    /// snapshots active_id, volatility_reference decays by 50%.
+    #[test]
+    fn update_references_decays_inside_decay_window() {
+        let mut pool = pool_with_dyn_fee();
+        // 100s elapsed: filter (30) <= 100 < decay (600).
+        pool.update_references(1_000_000 + 100).unwrap();
+        assert_eq!(pool.index_reference, 100, "index_ref ← active_id");
+        // volatility_accumulator (20_000) * reduction_factor (5_000) /
+        // BASIS_POINT_MAX (10_000) = 10_000.
+        assert_eq!(pool.volatility_reference, 10_000);
+    }
+
+    /// Boundary: `reduction_factor = 10_000` ⇒ the decay multiplier
+    /// is exactly `1.0`, so the volatility_reference equals the
+    /// previous accumulator with no decay. Pins that the integer
+    /// `*reduction_factor / BASIS_POINT_MAX` math doesn't pick up an
+    /// off-by-one (e.g. `(vol * 10_001 / 10_000)` from a stray `+1`).
+    #[test]
+    fn update_references_full_decay_factor_preserves_accumulator() {
+        let mut pool = pool_with_dyn_fee();
+        pool.reduction_factor = 10_000;
+        pool.volatility_accumulator = 33_333;
+        // Inside decay window.
+        pool.update_references(1_000_000 + 100).unwrap();
+        assert_eq!(pool.volatility_reference, 33_333);
+    }
+
+    /// Decay window also passed — volatility_reference fully resets
+    /// to 0.
+    #[test]
+    fn update_references_resets_past_decay_window() {
+        let mut pool = pool_with_dyn_fee();
+        // 1000s > decay (600).
+        pool.update_references(1_000_000 + 1_000).unwrap();
+        assert_eq!(pool.index_reference, 100);
+        assert_eq!(pool.volatility_reference, 0);
+    }
+
+    /// `delta_id` is the *absolute* difference. Tests both signs so a
+    /// future regression that drops the `unsigned_abs()` is caught.
+    #[test]
+    fn update_volatility_accumulator_uses_abs_delta() {
+        let mut pool = pool_with_dyn_fee();
+        pool.volatility_reference = 5_000;
+        pool.index_reference = 100;
+        pool.active_id = 95; // delta = 5
+        pool.update_volatility_accumulator().unwrap();
+        // 5_000 + 5 * 10_000 = 55_000.
+        assert_eq!(pool.volatility_accumulator, 55_000);
+
+        // Flip sign of delta — same accumulator value (abs).
+        pool.active_id = 105;
+        pool.update_volatility_accumulator().unwrap();
+        assert_eq!(pool.volatility_accumulator, 55_000);
+    }
+
+    /// `update_volatility_accumulator` saturates at
+    /// `max_volatility_accumulator`. A 100-bin walk with default
+    /// max=350_000 would compute 1_000_000 raw, capped at 350_000.
+    #[test]
+    fn update_volatility_accumulator_caps_at_max() {
+        let mut pool = pool_with_dyn_fee();
+        pool.volatility_reference = 0;
+        pool.index_reference = 0;
+        pool.active_id = 100; // delta = 100, raw = 1_000_000.
+        pool.max_volatility_accumulator = 350_000;
+        pool.update_volatility_accumulator().unwrap();
+        assert_eq!(pool.volatility_accumulator, 350_000);
+    }
+
+    /// `compute_variable_fee` short-circuits to 0 when the pool's
+    /// `variable_fee_control == 0` — the static-fee-only configuration
+    /// most pools ship with. Pin so a future regression doesn't read
+    /// `volatility_accumulator` and emit a non-zero variable fee for a
+    /// pool that explicitly disabled it.
+    #[test]
+    fn compute_variable_fee_zero_when_control_is_zero() {
+        let mut pool = pool_with_dyn_fee();
+        pool.variable_fee_control = 0;
+        // Even with a non-zero accumulator, output is 0.
+        assert_eq!(pool.compute_variable_fee(100_000), Some(0));
+    }
+
+    /// Numeric pin against the on-chain formula
+    /// `ceil(vfc * (vol_acc * bin_step)^2 / 10^11)`. Two cases drive
+    /// both the floor- and ceil-rounded paths:
+    ///   - `vol_acc=100, bin_step=10, vfc=40_000`:
+    ///     `square=(1_000)^2=1e6`, `v_fee=4e10`,
+    ///     `ceil(4e10 / 1e11) = 1`.
+    ///   - `vol_acc=10_000, bin_step=10, vfc=40_000`:
+    ///     `square=(100_000)^2=1e10`, `v_fee=4e14`,
+    ///     `ceil(4e14 / 1e11) = 4_000` (exact, no remainder).
+    #[test]
+    fn compute_variable_fee_matches_on_chain_formula() {
+        let mut pool = pool_with_dyn_fee();
+        pool.bin_step = 10;
+        pool.variable_fee_control = 40_000;
+        assert_eq!(pool.compute_variable_fee(100), Some(1));
+        assert_eq!(pool.compute_variable_fee(10_000), Some(4_000));
+    }
+
+    /// Pin that `total_fee_rate` sums base + variable instead of
+    /// reporting only base. Picks values where neither component
+    /// alone would surface a regression: base = 1e6, variable = 4_000,
+    /// total = 1_004_000.
+    #[test]
+    fn total_fee_rate_sums_base_and_variable() {
+        let mut pool = pool_with_dyn_fee();
+        pool.bin_step = 10;
+        pool.base_factor = 10_000;
+        pool.base_fee_power_factor = 0;
+        pool.variable_fee_control = 40_000;
+        pool.volatility_accumulator = 10_000;
+        // base = 10_000 * 10 * 10 = 1_000_000.
+        // variable (per the formula above) = 4_000.
+        assert_eq!(pool.total_fee_rate(), Some(1_004_000));
     }
 
     /// `total_fee_rate` caps at `DLMM_MAX_FEE_RATE` (10%). With Phase 1
@@ -1267,6 +1681,7 @@ mod tests {
             base_factor: 10_000,
             base_fee_power_factor: 1,
             protocol_share: 0,
+            ..Default::default()
         };
         assert_eq!(pool.total_fee_rate(), Some(DLMM_MAX_FEE_RATE));
     }
@@ -1516,6 +1931,7 @@ mod swap_math_tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         }
     }
 
@@ -1662,6 +2078,7 @@ mod cross_bin_tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         }
     }
 
@@ -1696,8 +2113,8 @@ mod cross_bin_tests {
     fn single_bin_walk_one_iteration() {
         let arrays = vec![uniform_array(0, 1_000_000_000, 1_000_000_000)];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
-        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &pool).unwrap();
+        let mut pool = pool();
+        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &mut pool).unwrap();
         assert_eq!(r.iterations, 1);
         assert_eq!(r.final_active_id, 0);
         assert_eq!(r.amount_in_with_fees, 1_000_000);
@@ -1723,11 +2140,11 @@ mod cross_bin_tests {
             uniform_array(2, 0, 1_000),
         ];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
+        let mut pool = pool();
 
         // Start at active_id = 0; swap X→Y. Each bin holds 1_000 Y.
         // Caller hands in enough X to drain ~5 bins.
-        let r = cross_bin_swap(20_000, 0, &mut state, true, &pool).unwrap();
+        let r = cross_bin_swap(20_000, 0, &mut state, true, &mut pool).unwrap();
         // Walker should have advanced backward (X→Y consumes y, bin
         // ids decrease).
         assert!(r.final_active_id < 0, "got {}", r.final_active_id);
@@ -1747,9 +2164,9 @@ mod cross_bin_tests {
         // worth — walker hits bin -1 (outside window) and bails.
         let arrays = vec![uniform_array(0, 0, 100)];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
+        let mut pool = pool();
         // 70 bins * 100 Y = 7_000 Y; need much more X to drain that.
-        let r = cross_bin_swap(1_000_000_000, 0, &mut state, true, &pool);
+        let r = cross_bin_swap(1_000_000_000, 0, &mut state, true, &mut pool);
         assert!(r.is_none(), "should bail when walker leaves window");
     }
 
@@ -1792,13 +2209,54 @@ mod cross_bin_tests {
         };
         let arrays = vec![array_0, array_minus1];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
-        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &pool).unwrap();
+        let mut pool = pool();
+        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &mut pool).unwrap();
         // Walker advanced from 0 (empty) → -1 (liquid). At least 2
         // iterations: one to skip bin 0, one to swap in bin -1.
         assert!(r.iterations >= 2);
         assert_eq!(r.final_active_id, -1);
         assert!(r.amount_out > 0);
+    }
+
+    /// Phase 3 plumbing: a multi-bin walk against a pool with
+    /// `variable_fee_control > 0` mutates `pool.volatility_accumulator`
+    /// (so the per-bin fee read sees rising volatility) and ends with
+    /// the walker's `final_active_id` mirrored on `pool.active_id`.
+    /// Pin so a future regression that drops the per-bin
+    /// `update_volatility_accumulator` call (or the active_id sync at
+    /// the loop's exit paths) is caught.
+    #[test]
+    fn cross_bin_walk_advances_volatility_accumulator() {
+        let arrays = vec![
+            uniform_array(-2, 0, 1_000),
+            uniform_array(-1, 0, 1_000),
+            uniform_array(0, 0, 1_000),
+            uniform_array(1, 0, 1_000),
+            uniform_array(2, 0, 1_000),
+        ];
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let mut pool = pool();
+        // Enable variable fee + give the accumulator headroom. Match
+        // mainnet SOL/USDC ballpark so the cap doesn't fire.
+        pool.variable_fee_control = 40_000;
+        pool.max_volatility_accumulator = 350_000;
+        // index_reference == active_id at entry, so the first bin's
+        // delta_id = 0 (no volatility yet); the next bin's delta_id = 1.
+        pool.index_reference = 0;
+        pool.active_id = 0;
+        // Drive a multi-bin walk (input bigger than one bin's reserves).
+        let r = cross_bin_swap(20_000, 0, &mut state, true, &mut pool).unwrap();
+        assert!(r.iterations >= 2, "expected multi-bin walk");
+        assert_eq!(pool.active_id, r.final_active_id);
+        // After at least one bin transition, the accumulator must be
+        // non-zero — exact value depends on iteration count, but the
+        // loop entered the "delta_id > 0" regime.
+        assert!(
+            pool.volatility_accumulator > 0,
+            "vol_acc={} after {} iterations",
+            pool.volatility_accumulator,
+            r.iterations,
+        );
     }
 
     /// Iteration cap pin: declarative — `MAX_SWAP_ITERATIONS = 256`.
