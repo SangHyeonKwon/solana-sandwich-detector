@@ -259,15 +259,15 @@ pub async fn enrich_attack(
             // None, .. }` ⇒ no fee adjustment, identical to the
             // pre-step-2 None pass-through.
             //
-            // Epoch resolution: we use `u64::MAX` so
-            // `TransferFeeConfig::epoch_fee` always picks
-            // `newer_transfer_fee`, the side that's been live since
-            // the most recent config update. A future refinement
-            // could plumb the actual current epoch via getEpochInfo,
-            // but for mainnet operation today the newer slot is
-            // active — older only matters during the brief epoch
-            // window after a transfer-fee config change, which is
-            // rare on production pools.
+            // Epoch resolution: ask the lookup for the epoch that
+            // contains `attack.slot` (RpcPoolLookup fetches
+            // EpochSchedule once and maps every slot via
+            // `EpochSchedule::get_epoch`). Falling back to `u64::MAX`
+            // keeps the previous always-newer behaviour for lookups
+            // that don't implement the trait method (mocks, NoPool)
+            // and for the brief window where the schedule fetch
+            // failed — matters in practice only inside the epoch
+            // immediately following a transfer-fee config update.
             let mints = lookup
                 .mint_accounts(
                     &[config.base_mint.as_str(), config.quote_mint.as_str()],
@@ -283,8 +283,9 @@ pub async fn enrich_attack(
             } else {
                 (mint_quote_info, mint_base_info)
             };
-            let transfer_fee_x = mint_x_info.and_then(|m| m.transfer_fee_at(u64::MAX));
-            let transfer_fee_y = mint_y_info.and_then(|m| m.transfer_fee_at(u64::MAX));
+            let epoch = lookup.epoch_for_slot(attack.slot).await.unwrap_or(u64::MAX);
+            let transfer_fee_x = mint_x_info.and_then(|m| m.transfer_fee_at(epoch));
+            let transfer_fee_y = mint_y_info.and_then(|m| m.transfer_fee_at(epoch));
 
             let Some((loss, dlmm_trace)) = compute_loss_dlmm_with_trace(
                 attack,
@@ -445,6 +446,10 @@ mod tests {
         /// enrichment receives `None` for both ⇒ legacy SPL Token
         /// behaviour.
         mint_accounts: Vec<Option<crate::spl_mint::MintInfo>>,
+        /// Tests that need to pin a specific epoch for older-vs-newer
+        /// transfer-fee resolution set this; default `None` keeps the
+        /// legacy `unwrap_or(u64::MAX)` always-newer behaviour.
+        epoch: Option<u64>,
     }
 
     #[async_trait]
@@ -488,6 +493,10 @@ mod tests {
             _slot: u64,
         ) -> Vec<Option<crate::spl_mint::MintInfo>> {
             self.mint_accounts.clone()
+        }
+
+        async fn epoch_for_slot(&self, _slot: u64) -> Option<u64> {
+            self.epoch
         }
     }
 
@@ -613,6 +622,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -644,6 +654,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -666,6 +677,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -686,6 +698,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -730,6 +743,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -799,6 +813,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -837,6 +852,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -862,6 +878,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -893,6 +910,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -982,6 +1000,7 @@ mod tests {
             tick_arrays,
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -1021,6 +1040,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -1039,6 +1059,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -1108,6 +1129,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1144,6 +1166,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1180,6 +1203,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         enrich_attack(&mut attack, &frontrun_tx, None, &lookup).await;
@@ -1217,6 +1241,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1239,6 +1264,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1268,6 +1294,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
         enrich_attack(&mut attack, &tx, None, &lookup).await;
 
@@ -1305,6 +1332,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         enrich_attack(&mut attack, &frontrun_tx, Some(&backrun_tx), &lookup).await;
@@ -1432,6 +1460,7 @@ mod tests {
                 None,
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
@@ -1456,6 +1485,7 @@ mod tests {
             // immediately, then runs out of window.
             bin_arrays: vec![None, None, Some(dlmm_active_array(100, 100)), None, None],
             mint_accounts: vec![],
+            epoch: None,
         };
         assert_eq!(
             enrich_attack(&mut attack, &tx, None, &lookup).await,
@@ -1477,6 +1507,7 @@ mod tests {
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
+            epoch: None,
         };
         assert_eq!(
             enrich_attack(&mut attack, &tx, None, &lookup).await,
@@ -1530,6 +1561,7 @@ mod tests {
                 None,
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -1602,6 +1634,7 @@ mod tests {
                 None,
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -1654,6 +1687,7 @@ mod tests {
                 None,
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(
@@ -1721,6 +1755,7 @@ mod tests {
                 None,
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -1756,9 +1791,9 @@ mod tests {
         let dynamic_state = Some(dlmm_state());
         let tx = make_frontrun_tx();
         // Base mint carries a 200 bp transfer fee on its newer slot;
-        // older slot is zero so a future epoch-resolution refinement
-        // doesn't accidentally pick it up. The fetch wiring uses
-        // `epoch_fee(u64::MAX)` ⇒ always newer.
+        // older slot is zero so a stale epoch-resolution path doesn't
+        // accidentally pick it up. With `epoch: None` on the mock,
+        // enrichment falls back to `u64::MAX` ⇒ always newer.
         let base_mint_info = MintInfo {
             decimals: 6,
             transfer_fee_config: Some(TransferFeeConfig {
@@ -1784,12 +1819,80 @@ mod tests {
             // Slot 0 = base mint (X axis since base_is_token_a),
             // slot 1 = quote mint (Y axis, no extension).
             mint_accounts: vec![Some(base_mint_info), None],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
         let trace = attack.dlmm_replay.expect("dlmm_replay populated");
         assert_eq!(trace.token_x_transfer_fee_bps, Some(200));
         assert_eq!(trace.token_y_transfer_fee_bps, None);
+    }
+
+    /// Pins the epoch-aware transfer-fee resolution: when the lookup
+    /// reports an epoch *before* `newer_transfer_fee.epoch`, replay
+    /// uses the older tier; on or after, replay uses the newer tier.
+    /// Same fixture as `dlmm_corpus_mint_fetch_surfaces_transfer_fee_bps`
+    /// — only the lookup's epoch toggles. Older=50 bp, newer=200 bp,
+    /// newer.epoch=100.
+    #[tokio::test]
+    async fn dlmm_epoch_for_slot_picks_older_vs_newer_fee() {
+        use crate::spl_mint::{MintInfo, TransferFee, TransferFeeConfig};
+        let base_mint_info = MintInfo {
+            decimals: 6,
+            transfer_fee_config: Some(TransferFeeConfig {
+                older_transfer_fee: TransferFee {
+                    epoch: 0,
+                    maximum_fee: u64::MAX,
+                    transfer_fee_basis_points: 50,
+                },
+                newer_transfer_fee: TransferFee {
+                    epoch: 100,
+                    maximum_fee: u64::MAX,
+                    transfer_fee_basis_points: 200,
+                },
+            }),
+        };
+        let mk_lookup = |epoch: Option<u64>| MockLookup {
+            config: dlmm_config(),
+            dynamic_state: Some(dlmm_state()),
+            tick_arrays: vec![],
+            bin_arrays: vec![
+                None,
+                None,
+                Some(dlmm_uniform_array(0, 1_000, 1_000)),
+                None,
+                None,
+            ],
+            mint_accounts: vec![Some(base_mint_info), None],
+            epoch,
+        };
+
+        // epoch 50 < newer.epoch ⇒ older tier (50 bp)
+        let mut attack = make_dlmm_attack(5_000);
+        let tx = make_frontrun_tx();
+        let lookup = mk_lookup(Some(50));
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        assert_eq!(
+            trace.token_x_transfer_fee_bps,
+            Some(50),
+            "epoch < newer.epoch must pick older transfer fee tier",
+        );
+
+        // epoch 100 == newer.epoch ⇒ newer tier (200 bp); boundary
+        // pin since `epoch_fee` uses `>=`.
+        let mut attack = make_dlmm_attack(5_000);
+        let tx = make_frontrun_tx();
+        let lookup = mk_lookup(Some(100));
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        let trace = attack.dlmm_replay.expect("dlmm_replay populated");
+        assert_eq!(
+            trace.token_x_transfer_fee_bps,
+            Some(200),
+            "epoch == newer.epoch must pick newer transfer fee tier",
+        );
     }
 
     /// Phase 3 dynamic-fee corpus: a pool with `variable_fee_control = 40_000`
@@ -1824,6 +1927,7 @@ mod tests {
                 None,
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::Enriched);
@@ -1871,6 +1975,7 @@ mod tests {
                 Some(dlmm_uniform_array(2, 1_000, 1_000)),
             ],
             mint_accounts: vec![],
+            epoch: None,
         };
         // 1M input ≫ array 0's ~70k worth of reserves ⇒ walker must
         // step into array 1, which is `None` ⇒ bail.
