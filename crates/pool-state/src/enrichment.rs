@@ -239,9 +239,24 @@ pub async fn enrich_attack(
             // sooner if a leg walks into the gap.
             let arrays: Vec<ParsedBinArray> = arrays_raw.into_iter().flatten().collect();
 
-            let Some((loss, dlmm_trace)) =
-                compute_loss_dlmm_with_trace(attack, &dlmm_pool, &arrays, config.base_is_token_a)
-            else {
+            // Phase 3: feed the swap's wall-clock timestamp into the
+            // replay so `update_references` runs against a realistic
+            // `elapsed` window. `attack.timestamp_ms` is the block
+            // time in ms; convert to seconds. Fall back to the pool's
+            // own `last_update_timestamp` (⇒ `elapsed = 0`, no
+            // reference refresh) when the upstream block didn't carry
+            // a timestamp.
+            let swap_timestamp = attack
+                .timestamp_ms
+                .map(|ms| ms / 1_000)
+                .unwrap_or(dlmm_pool.last_update_timestamp);
+            let Some((loss, dlmm_trace)) = compute_loss_dlmm_with_trace(
+                attack,
+                &dlmm_pool,
+                &arrays,
+                config.base_is_token_a,
+                swap_timestamp,
+            ) else {
                 // None ⇒ cross-bin walked off the window, iteration
                 // cap fired, or direction-mismatch invariant violation.
                 // Map to CrossTickUnsupported so Phase 3 follow-up

@@ -556,8 +556,10 @@ pub fn compute_loss_dlmm(
     pool: &DlmmPool,
     arrays: &[ParsedBinArray],
     base_is_token_a: bool,
+    swap_timestamp: i64,
 ) -> Option<LossEstimate> {
-    compute_loss_dlmm_with_trace(attack, pool, arrays, base_is_token_a).map(|(loss, _trace)| loss)
+    compute_loss_dlmm_with_trace(attack, pool, arrays, base_is_token_a, swap_timestamp)
+        .map(|(loss, _trace)| loss)
 }
 
 /// Like [`compute_loss_dlmm`] but also returns a
@@ -574,6 +576,7 @@ pub fn compute_loss_dlmm_with_trace(
     pool: &DlmmPool,
     arrays: &[ParsedBinArray],
     base_is_token_a: bool,
+    swap_timestamp: i64,
 ) -> Option<(LossEstimate, MeteoraDlmmReplayTrace)> {
     if attack.victim.direction != attack.frontrun.direction {
         return None;
@@ -590,6 +593,21 @@ pub fn compute_loss_dlmm_with_trace(
         return None;
     }
 
+    // Phase 3: variable-fee plumbing. On-chain `quote_exact_in` calls
+    // `update_references` once at swap entry, then per-bin
+    // `update_volatility_accumulator` inside the walk loop. Mirror that
+    // shape: snapshot the pool, run the entry-time `update_references`
+    // here, and let `cross_bin_swap` handle per-bin updates.
+    //
+    // All five legs share the same `swap_timestamp` (Solana block
+    // timestamps are second-resolution; the three real swaps + two
+    // counterfactuals all sit inside one block). `update_references`
+    // therefore fires at most once per leg — subsequent calls within
+    // the block see `elapsed = 0 < filter_period` and no-op, matching
+    // on-chain semantics.
+    let mut pool_initial = *pool;
+    pool_initial.update_references(swap_timestamp)?;
+
     // SwapDirection (Buy/Sell, quote terms) ⇒ DLMM `swap_for_y`. The
     // DLMM x/y axis is V3's a/b axis, so the mapping mirrors
     // Whirlpool's frontrun_a_to_b derivation:
@@ -602,55 +620,67 @@ pub fn compute_loss_dlmm_with_trace(
     let victim_swap_for_y = frontrun_swap_for_y;
     let backrun_swap_for_y = !frontrun_swap_for_y;
 
-    // 1. Frontrun on initial state → state_1.
+    // 1. Frontrun on initial state → state_1. Pool snapshot reflects
+    //    "first swap of the block": vol_acc starts from the on-chain
+    //    snapshot and grows with each bin crossed.
     let mut state_1 = initial_state.clone();
+    let mut pool_front = pool_initial;
     let fr = cross_bin_swap(
         attack.frontrun.amount_in,
         initial_active_id,
         &mut state_1,
         frontrun_swap_for_y,
-        pool,
+        &mut pool_front,
     )?;
     let active_after_front = fr.final_active_id;
 
-    // 2. Victim on state_1 → state_2.
+    // 2. Victim on state_1 → state_2. Pool inherits the post-frontrun
+    //    `volatility_accumulator` so the victim's per-bin fee reflects
+    //    the elevated volatility — same as on-chain.
     let mut state_2 = state_1.clone();
+    let mut pool_victim = pool_front;
     let v = cross_bin_swap(
         attack.victim.amount_in,
         active_after_front,
         &mut state_2,
         victim_swap_for_y,
-        pool,
+        &mut pool_victim,
     )?;
 
-    // 3. Counterfactual victim on initial state.
+    // 3. Counterfactual victim on initial state — frontrun never
+    //    happened. Pool restarts from `pool_initial` so vol_acc = the
+    //    pre-block snapshot value, not post-frontrun.
     let mut state_counter = initial_state.clone();
+    let mut pool_victim_counter = pool_initial;
     let v_counter = cross_bin_swap(
         attack.victim.amount_in,
         initial_active_id,
         &mut state_counter,
         victim_swap_for_y,
-        pool,
+        &mut pool_victim_counter,
     )?;
 
-    // 4. Backrun on state_2.
+    // 4. Backrun on state_2. Pool inherits post-victim accumulator.
     let mut state_3 = state_2.clone();
+    let mut pool_back = pool_victim;
     let b = cross_bin_swap(
         attack.backrun.amount_in,
         v.final_active_id,
         &mut state_3,
         backrun_swap_for_y,
-        pool,
+        &mut pool_back,
     )?;
 
-    // 5. Counterfactual: backrun on state_1 (no victim).
+    // 5. Counterfactual: backrun on state_1 (no victim). Pool inherits
+    //    post-frontrun (no victim) accumulator.
     let mut state_no_v = state_1.clone();
+    let mut pool_back_no_v = pool_front;
     let b_no_v = cross_bin_swap(
         attack.backrun.amount_in,
         active_after_front,
         &mut state_no_v,
         backrun_swap_for_y,
-        pool,
+        &mut pool_back_no_v,
     )?;
 
     // Quote-axis conversion. Initial bin price is the spot at the
@@ -1502,7 +1532,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true, 0).unwrap();
         assert_eq!(
             loss.victim_loss, 0,
             "within-bin replay must yield zero loss"
@@ -1526,7 +1556,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 1_000_000_000, 0),
         );
-        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true).is_none());
+        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true, 0).is_none());
     }
 
     /// Direction mismatch bails before any cross-bin work.
@@ -1539,7 +1569,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Sell, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true).is_none());
+        assert!(compute_loss_dlmm(&attack, &pool, &arrays, true, 0).is_none());
     }
 
     /// `base_is_token_a = false` (base on y-axis): exercise the
@@ -1554,7 +1584,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 50_000, 0),
             swap("b", "atk", SwapDirection::Sell, 100_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, &arrays, false).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, false, 0).unwrap();
         assert_eq!(loss.victim_loss, 0);
         assert_eq!(loss.actual_victim_out, loss.counterfactual_victim_out);
     }
@@ -1576,7 +1606,7 @@ mod tests {
             swap("v", "vic", SwapDirection::Buy, 5_000, 0),
             swap("b", "atk", SwapDirection::Sell, 5_000, 0),
         );
-        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true).unwrap();
+        let loss = compute_loss_dlmm(&attack, &pool, &arrays, true, 0).unwrap();
         // Cross-bin walk: active_id moved, victim ate worse prices.
         // The exact loss depends on the price progression, but it
         // must be non-zero.

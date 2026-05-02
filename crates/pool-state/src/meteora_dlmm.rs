@@ -1191,13 +1191,19 @@ pub mod cross_bin {
     ///     the `None` here means a real arithmetic edge case).
     ///
     /// Side effect: `state` is mutated to reflect post-swap bin
-    /// reserves. Caller passes a clone for counterfactual replays.
+    /// reserves; `pool` is mutated to reflect post-walk variable-fee
+    /// state (`active_id`, `volatility_accumulator`). Caller passes
+    /// clones for counterfactual replays. The caller is also
+    /// responsible for invoking [`DlmmPool::update_references`] *before*
+    /// this — the on-chain swap calls `update_references` once at
+    /// entry, then `update_volatility_accumulator` per bin (mirrored
+    /// here inside the loop).
     pub fn cross_bin_swap(
         amount_in: u64,
         initial_active_id: i32,
         state: &mut DlmmBinState,
         swap_for_y: bool,
-        pool: &DlmmPool,
+        pool: &mut DlmmPool,
     ) -> Option<CrossBinSwapResult> {
         let mut amount_left = amount_in;
         let mut total_in_with_fees: u64 = 0;
@@ -1207,6 +1213,7 @@ pub mod cross_bin {
 
         for iter in 0..MAX_SWAP_ITERATIONS {
             if amount_left == 0 {
+                pool.active_id = active_id;
                 return Some(CrossBinSwapResult {
                     amount_in_with_fees: total_in_with_fees,
                     amount_out: total_out,
@@ -1215,6 +1222,14 @@ pub mod cross_bin {
                     iterations: iter,
                 });
             }
+            // Per-bin variable-fee refresh: sync active_id and update
+            // the accumulator so `swap_within_bin`'s fee read sees the
+            // accumulator value at *this bin's start*. Mirrors on-chain
+            // `quote_exact_in`'s `update_volatility_accumulator()` call
+            // immediately before each `active_bin.swap(...)`.
+            pool.active_id = active_id;
+            pool.update_volatility_accumulator()?;
+
             let snap = state.get(active_id)?;
             let step = swap_within_bin(
                 amount_left,
@@ -1253,6 +1268,7 @@ pub mod cross_bin {
 
             if !step.bin_drained {
                 // Partial fill ⇒ caller's swap is complete.
+                pool.active_id = active_id;
                 return Some(CrossBinSwapResult {
                     amount_in_with_fees: total_in_with_fees,
                     amount_out: total_out,
@@ -2073,8 +2089,8 @@ mod cross_bin_tests {
     fn single_bin_walk_one_iteration() {
         let arrays = vec![uniform_array(0, 1_000_000_000, 1_000_000_000)];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
-        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &pool).unwrap();
+        let mut pool = pool();
+        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &mut pool).unwrap();
         assert_eq!(r.iterations, 1);
         assert_eq!(r.final_active_id, 0);
         assert_eq!(r.amount_in_with_fees, 1_000_000);
@@ -2100,11 +2116,11 @@ mod cross_bin_tests {
             uniform_array(2, 0, 1_000),
         ];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
+        let mut pool = pool();
 
         // Start at active_id = 0; swap X→Y. Each bin holds 1_000 Y.
         // Caller hands in enough X to drain ~5 bins.
-        let r = cross_bin_swap(20_000, 0, &mut state, true, &pool).unwrap();
+        let r = cross_bin_swap(20_000, 0, &mut state, true, &mut pool).unwrap();
         // Walker should have advanced backward (X→Y consumes y, bin
         // ids decrease).
         assert!(r.final_active_id < 0, "got {}", r.final_active_id);
@@ -2124,9 +2140,9 @@ mod cross_bin_tests {
         // worth — walker hits bin -1 (outside window) and bails.
         let arrays = vec![uniform_array(0, 0, 100)];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
+        let mut pool = pool();
         // 70 bins * 100 Y = 7_000 Y; need much more X to drain that.
-        let r = cross_bin_swap(1_000_000_000, 0, &mut state, true, &pool);
+        let r = cross_bin_swap(1_000_000_000, 0, &mut state, true, &mut pool);
         assert!(r.is_none(), "should bail when walker leaves window");
     }
 
@@ -2169,13 +2185,54 @@ mod cross_bin_tests {
         };
         let arrays = vec![array_0, array_minus1];
         let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
-        let pool = pool();
-        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &pool).unwrap();
+        let mut pool = pool();
+        let r = cross_bin_swap(1_000_000, 0, &mut state, true, &mut pool).unwrap();
         // Walker advanced from 0 (empty) → -1 (liquid). At least 2
         // iterations: one to skip bin 0, one to swap in bin -1.
         assert!(r.iterations >= 2);
         assert_eq!(r.final_active_id, -1);
         assert!(r.amount_out > 0);
+    }
+
+    /// Phase 3 plumbing: a multi-bin walk against a pool with
+    /// `variable_fee_control > 0` mutates `pool.volatility_accumulator`
+    /// (so the per-bin fee read sees rising volatility) and ends with
+    /// the walker's `final_active_id` mirrored on `pool.active_id`.
+    /// Pin so a future regression that drops the per-bin
+    /// `update_volatility_accumulator` call (or the active_id sync at
+    /// the loop's exit paths) is caught.
+    #[test]
+    fn cross_bin_walk_advances_volatility_accumulator() {
+        let arrays = vec![
+            uniform_array(-2, 0, 1_000),
+            uniform_array(-1, 0, 1_000),
+            uniform_array(0, 0, 1_000),
+            uniform_array(1, 0, 1_000),
+            uniform_array(2, 0, 1_000),
+        ];
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let mut pool = pool();
+        // Enable variable fee + give the accumulator headroom. Match
+        // mainnet SOL/USDC ballpark so the cap doesn't fire.
+        pool.variable_fee_control = 40_000;
+        pool.max_volatility_accumulator = 350_000;
+        // index_reference == active_id at entry, so the first bin's
+        // delta_id = 0 (no volatility yet); the next bin's delta_id = 1.
+        pool.index_reference = 0;
+        pool.active_id = 0;
+        // Drive a multi-bin walk (input bigger than one bin's reserves).
+        let r = cross_bin_swap(20_000, 0, &mut state, true, &mut pool).unwrap();
+        assert!(r.iterations >= 2, "expected multi-bin walk");
+        assert_eq!(pool.active_id, r.final_active_id);
+        // After at least one bin transition, the accumulator must be
+        // non-zero — exact value depends on iteration count, but the
+        // loop entered the "delta_id > 0" regime.
+        assert!(
+            pool.volatility_accumulator > 0,
+            "vol_acc={} after {} iterations",
+            pool.volatility_accumulator,
+            r.iterations,
+        );
     }
 
     /// Iteration cap pin: declarative — `MAX_SWAP_ITERATIONS = 256`.
