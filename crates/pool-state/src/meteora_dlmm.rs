@@ -1298,6 +1298,11 @@ pub mod cross_bin {
         }
         // Iteration cap hit without finishing — pathological pool
         // (sparse liquidity beyond the cap, or a misbehaving caller).
+        // Mirror `active_id` for consistency with the three success-
+        // exit paths above; the caller discards the pool on `None`
+        // (counterfactual.rs propagates with `?`), so this is a
+        // defensive write to keep all four exit paths uniform.
+        pool.active_id = active_id;
         None
     }
 }
@@ -2265,5 +2270,35 @@ mod cross_bin_tests {
     #[test]
     fn iteration_cap_constant_pin() {
         assert_eq!(MAX_SWAP_ITERATIONS, 256);
+    }
+
+    /// Iteration-cap exit path mirrors the advanced `active_id` onto
+    /// the pool, matching the three success-exit paths. Caller
+    /// discards the pool on `None`, so this is cosmetic — but it
+    /// catches a regression where the cap branch silently leaves
+    /// `pool.active_id` at the *last drained* bin instead of the
+    /// *next* (post-advance) one, breaking the "all exit paths
+    /// uniformly mirror the post-walk active_id" invariant.
+    #[test]
+    fn iteration_cap_mirrors_advanced_active_id() {
+        // 7 arrays cover bin ids -210..=279 — ample room to drain
+        // 256 consecutive bins without leaving the fetched window.
+        let arrays = (-3..=3).map(|i| uniform_array(i, 0, 1)).collect::<Vec<_>>();
+        let mut state = DlmmBinState::from_arrays(&arrays, 25).unwrap();
+        let mut pool = pool();
+        pool.active_id = 128;
+
+        // Each bin holds 1 Y. Input is enormous → walker drains one
+        // bin per iteration: iter=0 drains bin 128 then advances to
+        // 127, iter=255 drains bin -127 then advances to -128, then
+        // the for-loop exits on the cap (iter=256 never runs).
+        let r = cross_bin_swap(1_000_000_000, 128, &mut state, true, &mut pool);
+        assert!(r.is_none(), "expected iteration-cap bail");
+
+        // Without the mirror: pool.active_id == -127 (last drained).
+        // With the mirror: pool.active_id == -128 (next post-advance
+        // id, same value the next iteration would have written via
+        // line ~1240's `pool.active_id = active_id`).
+        assert_eq!(pool.active_id, -128);
     }
 }
