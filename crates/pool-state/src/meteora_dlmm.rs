@@ -691,6 +691,194 @@ pub mod bin_array {
     }
 }
 
+/// `BinArrayBitmapExtension` PDA — sparse-pool support for bin arrays
+/// outside the on-pool bitmap range.
+///
+/// The on-chain `LbPair` carries an inline `bin_array_bitmap: [u64; 16]`
+/// covering bin array indices `[-512, 511]` (1024 bits, 1 per array).
+/// Pools whose liquidity reaches further out — common on long-tail
+/// Token-2022 pairs — keep an additional `BinArrayBitmapExtension`
+/// account that extends coverage to `[-6656, -513] ∪ [512, 6655]`. Both
+/// bitmaps tag a bin array as *initialized* (= has at least one liquidity
+/// position open) versus *empty*; the on-chain swap walker uses them to
+/// fast-forward across empty stretches without paying the per-bin
+/// iteration cost.
+///
+/// We surface only the extension here. The internal bitmap lives on the
+/// `LbPair` account body (offset `~0x110+`); plumbing it is a separate
+/// follow-up. Until then, the walker's bitmap-aware fast-forward only
+/// kicks in when the gap to skip is fully outside `[-512, 511]`. Gaps
+/// touching the internal range fall back to the conservative
+/// "bail on miss" behaviour [`out_of_window_bails`] pins.
+///
+/// PDA seeds: `[b"bitmap", lb_pair]`. Mirrors `derive_bin_array_bitmap_extension`
+/// in `MeteoraAg/dlmm-sdk/commons/src/pda.rs`.
+///
+/// # Account layout
+///
+/// ```text
+///   field                                     offset  size
+///   discriminator                                 0     8
+///   lb_pair: Pubkey                               8    32
+///   positive_bin_array_bitmap: [[u64; 8]; 12]    40   768
+///   negative_bin_array_bitmap: [[u64; 8]; 12]   808   768
+/// ```
+///
+/// Total: 1576 bytes. `bytemuck repr(C)`, no padding.
+///
+/// # Bitmap math
+///
+/// Each row is 8 little-endian `u64` limbs forming a 512-bit integer
+/// (`U512` in the SDK; we just bit-test the limbs directly to avoid the
+/// dep). Positive row `r ∈ [0, 11]` covers array indices
+/// `[(r+1)*512, (r+2)*512 - 1]`; negative row `r` covers
+/// `[-(r+2)*512, -(r+1)*512 - 1]`. Within a row, bit `b` corresponds to
+/// the `b`-th array index counting outward from the inner edge.
+pub mod bitmap_extension {
+    use super::{dlmm_program_id, read_pubkey, read_u64};
+    use solana_sdk::pubkey::Pubkey;
+
+    /// Bits per row (= bin array indices covered per row). Mirrors
+    /// `BIN_ARRAY_BITMAP_SIZE` in `commons/src/constants.rs`. Same value
+    /// as the on-pool internal bitmap's coverage radius — the extension
+    /// is structured as 12 contiguous "internal-sized" bitmaps stacked
+    /// outward in each direction.
+    pub const BITS_PER_ROW: i32 = 512;
+
+    /// Number of rows in each of the positive/negative bitmaps. Mirrors
+    /// `EXTENSION_BINARRAY_BITMAP_SIZE` in `commons/src/constants.rs`.
+    pub const ROWS: usize = 12;
+
+    /// `u64` limbs per row (`8 * 64 = 512 = BITS_PER_ROW`).
+    pub const LIMBS_PER_ROW: usize = 8;
+
+    /// PDA seed prefix. Mirrors `BIN_ARRAY_BITMAP_SEED` in
+    /// `commons/src/seeds.rs`.
+    pub const BITMAP_SEED: &[u8] = b"bitmap";
+
+    // Account body offsets (from start of account_data, including the
+    // 8-byte discriminator). Pubbed so tests + downstream parsers can
+    // pin the layout — a regression to a different offset would be
+    // caught by the synthetic-blob test.
+    const DISCRIMINATOR_LEN: usize = 8;
+    /// Offset of the `lb_pair` field.
+    pub const LB_PAIR_OFFSET: usize = DISCRIMINATOR_LEN; // 8
+    /// Offset of `positive_bin_array_bitmap`.
+    pub const POSITIVE_OFFSET: usize = LB_PAIR_OFFSET + 32; // 40
+    /// Bytes per row (`8 limbs * 8 bytes`).
+    pub const ROW_BYTES: usize = LIMBS_PER_ROW * 8; // 64
+    /// Offset of `negative_bin_array_bitmap`.
+    pub const NEGATIVE_OFFSET: usize = POSITIVE_OFFSET + ROWS * ROW_BYTES; // 808
+
+    /// Account size including the discriminator. We over-tolerate
+    /// trailing bytes (only `>=` checked), matching the rest of
+    /// pool-state's parser convention.
+    pub const BITMAP_EXTENSION_DATA_LEN: usize = NEGATIVE_OFFSET + ROWS * ROW_BYTES; // 1576
+
+    /// Parsed `BinArrayBitmapExtension` account. Each `u64` row is
+    /// stored as the on-chain little-endian limb array — bit indexing
+    /// is LSB-first within `limbs[0]`, then carries through to `limbs[7]`'s
+    /// high bit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ParsedBitmapExtension {
+        /// `LbPair` this extension belongs to. Stored for cross-checks
+        /// against an expected pool — a mismatched `lb_pair` is a
+        /// strong signal of a wrong-PDA fetch.
+        pub lb_pair: Pubkey,
+        /// Bitmap rows for positive bin array indices. Row `r` covers
+        /// indices `[(r+1)*512, (r+2)*512 - 1]`.
+        pub positive_bitmap: [[u64; LIMBS_PER_ROW]; ROWS],
+        /// Bitmap rows for negative bin array indices. Row `r` covers
+        /// indices `[-(r+2)*512, -(r+1)*512 - 1]`.
+        pub negative_bitmap: [[u64; LIMBS_PER_ROW]; ROWS],
+    }
+
+    impl ParsedBitmapExtension {
+        /// Inclusive bin array index range the extension covers — the
+        /// *outer* envelope, including the `[-512, 511]` hole that the
+        /// internal bitmap handles. Use [`covers_index`] to check
+        /// extension-only coverage.
+        pub fn coverage_envelope() -> (i32, i32) {
+            (
+                -BITS_PER_ROW * (ROWS as i32 + 1),
+                BITS_PER_ROW * (ROWS as i32 + 1) - 1,
+            )
+        }
+
+        /// `true` iff `bin_array_index` is in the extension's coverage
+        /// (outside the internal `[-512, 511]` band but within the
+        /// `[-6656, 6655]` envelope).
+        pub fn covers_index(bin_array_index: i32) -> bool {
+            let (lo, hi) = Self::coverage_envelope();
+            (lo..=hi).contains(&bin_array_index)
+                && !(-BITS_PER_ROW..BITS_PER_ROW).contains(&bin_array_index)
+        }
+
+        /// Whether the bin array at `bin_array_index` is initialised
+        /// (= has open positions). Returns:
+        ///   * `Some(true)`  — bit set, array is initialised,
+        ///   * `Some(false)` — bit unset, array is confirmed empty,
+        ///   * `None`        — `bin_array_index` is outside the
+        ///     extension's coverage (caller must consult the internal
+        ///     bitmap, or treat as "unknown" if the internal bitmap
+        ///     isn't available).
+        pub fn is_array_initialized(&self, bin_array_index: i32) -> Option<bool> {
+            if !Self::covers_index(bin_array_index) {
+                return None;
+            }
+            // Mirrors `get_bitmap_offset` + `bin_array_offset_in_bitmap`
+            // in `commons/src/extensions/bin_array_bitmap.rs`.
+            let (row, bit) = if bin_array_index > 0 {
+                (
+                    (bin_array_index / BITS_PER_ROW - 1) as usize,
+                    (bin_array_index % BITS_PER_ROW) as usize,
+                )
+            } else {
+                let m = -(bin_array_index + 1);
+                ((m / BITS_PER_ROW - 1) as usize, (m % BITS_PER_ROW) as usize)
+            };
+            let limbs = if bin_array_index > 0 {
+                &self.positive_bitmap[row]
+            } else {
+                &self.negative_bitmap[row]
+            };
+            let limb_idx = bit / 64;
+            let bit_in_limb = bit % 64;
+            Some((limbs[limb_idx] >> bit_in_limb) & 1 == 1)
+        }
+    }
+
+    /// Parse a `BinArrayBitmapExtension` account blob. Returns `None`
+    /// for short data; over-tolerates trailing bytes.
+    pub fn parse_bitmap_extension(account_data: &[u8]) -> Option<ParsedBitmapExtension> {
+        if account_data.len() < BITMAP_EXTENSION_DATA_LEN {
+            return None;
+        }
+        let lb_pair = read_pubkey(account_data, LB_PAIR_OFFSET)?;
+        let mut positive_bitmap = [[0u64; LIMBS_PER_ROW]; ROWS];
+        let mut negative_bitmap = [[0u64; LIMBS_PER_ROW]; ROWS];
+        for r in 0..ROWS {
+            for l in 0..LIMBS_PER_ROW {
+                positive_bitmap[r][l] =
+                    read_u64(account_data, POSITIVE_OFFSET + (r * LIMBS_PER_ROW + l) * 8)?;
+                negative_bitmap[r][l] =
+                    read_u64(account_data, NEGATIVE_OFFSET + (r * LIMBS_PER_ROW + l) * 8)?;
+            }
+        }
+        Some(ParsedBitmapExtension {
+            lb_pair,
+            positive_bitmap,
+            negative_bitmap,
+        })
+    }
+
+    /// Derive the `BinArrayBitmapExtension` PDA for `lb_pair`. Mirrors
+    /// `derive_bin_array_bitmap_extension` in `commons/src/pda.rs`.
+    pub fn bitmap_extension_pda(lb_pair: &Pubkey) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[BITMAP_SEED, lb_pair.as_ref()], &dlmm_program_id())
+    }
+}
+
 /// Q64.64 fixed-point bin price math.
 ///
 /// DLMM bin prices follow `price(bin_id, bin_step) = (1 + bin_step / 10_000)^bin_id`,
@@ -1801,6 +1989,163 @@ mod bin_array_tests {
         // length is what we expect.
         let bytes = (-1i64).to_le_bytes();
         assert_eq!(bytes.len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod bitmap_extension_tests {
+    use super::bitmap_extension::{
+        bitmap_extension_pda, parse_bitmap_extension, ParsedBitmapExtension,
+        BITMAP_EXTENSION_DATA_LEN, BITS_PER_ROW, LIMBS_PER_ROW, NEGATIVE_OFFSET, POSITIVE_OFFSET,
+        ROWS,
+    };
+    use solana_sdk::pubkey::Pubkey;
+
+    /// PDA derivation: deterministic for the same `lb_pair`, distinct
+    /// across `lb_pair`s. Pins the seed byte string (`"bitmap"`) — a
+    /// regression to a different seed would yield a non-matching PDA.
+    #[test]
+    fn bitmap_extension_pda_is_deterministic() {
+        let lb_pair = Pubkey::new_unique();
+        let (a, _) = bitmap_extension_pda(&lb_pair);
+        let (b, _) = bitmap_extension_pda(&lb_pair);
+        assert_eq!(a, b);
+
+        let other = Pubkey::new_unique();
+        let (c, _) = bitmap_extension_pda(&other);
+        assert_ne!(a, c);
+    }
+
+    /// Coverage envelope is `[-512*13, 512*13 - 1]` = `[-6656, 6655]`.
+    /// `covers_index` excludes the inner `[-512, 511]` band that the
+    /// on-pool internal bitmap owns — pin both ends so a regression to
+    /// `>= -BITS_PER_ROW` (off-by-one inclusive vs exclusive) fails.
+    #[test]
+    fn coverage_envelope_pins_inner_and_outer_edges() {
+        let (lo, hi) = ParsedBitmapExtension::coverage_envelope();
+        assert_eq!((lo, hi), (-6656, 6655));
+
+        // Inner band is the internal bitmap's territory.
+        for inner in [-512, -1, 0, 1, 511] {
+            assert!(!ParsedBitmapExtension::covers_index(inner), "inner {inner}");
+        }
+        // Just outside the inner band is in extension territory.
+        assert!(ParsedBitmapExtension::covers_index(-513));
+        assert!(ParsedBitmapExtension::covers_index(512));
+        // Outer envelope edges.
+        assert!(ParsedBitmapExtension::covers_index(-6656));
+        assert!(ParsedBitmapExtension::covers_index(6655));
+        // One past the envelope ⇒ uncovered.
+        assert!(!ParsedBitmapExtension::covers_index(-6657));
+        assert!(!ParsedBitmapExtension::covers_index(6656));
+    }
+
+    /// `is_array_initialized` mapping pins:
+    ///   * positive index 512 → row 0, bit 0 (LSB of `positive_bitmap[0][0]`),
+    ///   * positive index 513 → row 0, bit 1,
+    ///   * positive index 1023 → row 0, bit 511 (MSB of `positive_bitmap[0][7]`),
+    ///   * positive index 1024 → row 1, bit 0,
+    ///   * negative index -513 → row 0, bit 0 of `negative_bitmap`,
+    ///   * negative index -1024 → row 0, bit 511,
+    ///   * negative index -1025 → row 1, bit 0.
+    ///
+    /// Out-of-coverage indices return `None`.
+    #[test]
+    fn is_array_initialized_maps_to_correct_bit() {
+        let mut bm = ParsedBitmapExtension {
+            lb_pair: Pubkey::new_unique(),
+            positive_bitmap: [[0u64; LIMBS_PER_ROW]; ROWS],
+            negative_bitmap: [[0u64; LIMBS_PER_ROW]; ROWS],
+        };
+
+        // Set each pinned bit and verify it round-trips.
+        bm.positive_bitmap[0][0] |= 1u64 << 0; // index 512
+        bm.positive_bitmap[0][0] |= 1u64 << 1; // index 513
+        bm.positive_bitmap[0][7] |= 1u64 << 63; // index 1023
+        bm.positive_bitmap[1][0] |= 1u64 << 0; // index 1024
+        bm.negative_bitmap[0][0] |= 1u64 << 0; // index -513
+        bm.negative_bitmap[0][7] |= 1u64 << 63; // index -1024
+        bm.negative_bitmap[1][0] |= 1u64 << 0; // index -1025
+
+        assert_eq!(bm.is_array_initialized(512), Some(true));
+        assert_eq!(bm.is_array_initialized(513), Some(true));
+        assert_eq!(bm.is_array_initialized(1023), Some(true));
+        assert_eq!(bm.is_array_initialized(1024), Some(true));
+        assert_eq!(bm.is_array_initialized(-513), Some(true));
+        assert_eq!(bm.is_array_initialized(-1024), Some(true));
+        assert_eq!(bm.is_array_initialized(-1025), Some(true));
+
+        // Unset bit ⇒ Some(false).
+        assert_eq!(bm.is_array_initialized(514), Some(false));
+        assert_eq!(bm.is_array_initialized(-514), Some(false));
+
+        // Inner band ⇒ None (caller falls back to internal bitmap).
+        assert_eq!(bm.is_array_initialized(0), None);
+        assert_eq!(bm.is_array_initialized(-1), None);
+        assert_eq!(bm.is_array_initialized(511), None);
+        assert_eq!(bm.is_array_initialized(-512), None);
+
+        // Past the envelope ⇒ None (no data).
+        assert_eq!(bm.is_array_initialized(6656), None);
+        assert_eq!(bm.is_array_initialized(-6657), None);
+    }
+
+    /// Parse a synthetic blob with distinguishing bits in:
+    ///   * positive row 0 limb 0  — covers index 512,
+    ///   * positive row 11 limb 7 — covers indices near +6655,
+    ///   * negative row 0 limb 0  — covers index -513,
+    ///   * negative row 11 limb 7 — covers indices near -6656,
+    ///
+    /// plus the `lb_pair` field. Pins the layout offsets.
+    #[test]
+    fn parse_synthetic_bitmap_extension() {
+        let mut data = vec![0u8; BITMAP_EXTENSION_DATA_LEN];
+        let lb_pair = Pubkey::new_unique();
+        data[8..40].copy_from_slice(lb_pair.as_ref());
+
+        // positive_bitmap[0][0] = 0b11 ⇒ bits for indices 512, 513 set.
+        let val = 0b11u64;
+        data[POSITIVE_OFFSET..POSITIVE_OFFSET + 8].copy_from_slice(&val.to_le_bytes());
+
+        // positive_bitmap[11][7]: high bit ⇒ index 6655.
+        let pos_11_7 = POSITIVE_OFFSET + (11 * LIMBS_PER_ROW + 7) * 8;
+        data[pos_11_7..pos_11_7 + 8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+
+        // negative_bitmap[0][0] low bit ⇒ index -513.
+        data[NEGATIVE_OFFSET..NEGATIVE_OFFSET + 8].copy_from_slice(&1u64.to_le_bytes());
+
+        // negative_bitmap[11][7] high bit ⇒ index -6656.
+        let neg_11_7 = NEGATIVE_OFFSET + (11 * LIMBS_PER_ROW + 7) * 8;
+        data[neg_11_7..neg_11_7 + 8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+
+        let parsed = parse_bitmap_extension(&data).unwrap();
+        assert_eq!(parsed.lb_pair, lb_pair);
+        assert_eq!(parsed.is_array_initialized(512), Some(true));
+        assert_eq!(parsed.is_array_initialized(513), Some(true));
+        assert_eq!(parsed.is_array_initialized(514), Some(false));
+        assert_eq!(parsed.is_array_initialized(6655), Some(true));
+        assert_eq!(parsed.is_array_initialized(-513), Some(true));
+        assert_eq!(parsed.is_array_initialized(-514), Some(false));
+        assert_eq!(parsed.is_array_initialized(-6656), Some(true));
+    }
+
+    #[test]
+    fn parse_rejects_short_blob() {
+        let short = vec![0u8; BITMAP_EXTENSION_DATA_LEN - 1];
+        assert!(parse_bitmap_extension(&short).is_none());
+    }
+
+    /// Layout pin: total byte count + the constants that drive bitmap
+    /// math. A future refactor that bumps `ROWS` would silently break
+    /// PDA fetches if we don't pin both the constant and the byte size
+    /// it implies.
+    #[test]
+    fn layout_constants_pinned() {
+        assert_eq!(BITS_PER_ROW, 512);
+        assert_eq!(ROWS, 12);
+        assert_eq!(LIMBS_PER_ROW, 8);
+        // 8 disc + 32 lb_pair + 12 * 8 * 8 (positive) + 12 * 8 * 8 (negative)
+        assert_eq!(BITMAP_EXTENSION_DATA_LEN, 8 + 32 + 768 + 768);
     }
 }
 
