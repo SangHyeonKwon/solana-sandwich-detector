@@ -156,6 +156,153 @@ fn u128_divergence_bps(predicted: u128, observed: u128) -> u32 {
     bps.min(u32::MAX as u128) as u32
 }
 
+// ----- Balance cross-check (parser-vs-RPC sanity) -----
+
+/// Divergence between a sandwich attack's recorded victim `amount_out`
+/// (extracted by the swap-events parser at detection time) and the
+/// on-chain ground truth observed by re-walking the victim transaction's
+/// `pre_token_balances` / `post_token_balances` via a fresh
+/// `getTransaction` RPC.
+///
+/// Unlike [`WhirlpoolDiffReport`] which validates *replay math* against
+/// archival pool state, this report validates the *parser* end-to-end:
+/// it doesn't re-run any AMM math, just confirms the parser's victim
+/// `amount_out` matches what the chain says the victim wallet actually
+/// received. A non-zero diff points to a parser-stable failure mode
+/// (account-key drift between block snapshot and tx fetch, lookup-table
+/// updates, RPC-side serialisation differences) rather than a replay
+/// bug. Standard `getTransaction` is fully archival on every major
+/// Solana RPC provider, so this surface works on historical sandwich
+/// corpora without an account-state archival service.
+///
+/// **Known blind spot — Token-2022 transfer-fee mints.** Both sides
+/// of the diff read the *net-of-fee* received amount (the parser
+/// computes it from `post_token_balance - pre_token_balance`; the
+/// observation re-runs the same heuristic), so on transfer-fee mints
+/// the diff is structurally zero and does *not* validate whether the
+/// parser correctly accounted for the gross/net distinction. Use the
+/// enrichment-side Token-2022 paths for that audit instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BalanceDiffReport {
+    /// `amount_out` recorded by the swap-events parser — the same value
+    /// carried in `attack.victim.amount_out`.
+    pub recorded_amount_out: u64,
+    /// `amount_out` observed by re-walking the victim tx's token-balance
+    /// deltas at validation time. Authoritative chain truth.
+    pub observed_amount_out: u64,
+    /// Relative gap between recorded and observed, in bps of
+    /// `observed_amount_out`. Same convention as
+    /// [`reserves_divergence_bps`]: an exact match is `0`; `observed == 0`
+    /// with non-zero `recorded` saturates to `u32::MAX`.
+    pub diff_bps: u32,
+}
+
+impl BalanceDiffReport {
+    /// Construct a report from an observed (chain truth) and recorded
+    /// (parser output) `amount_out` pair. The bps math reuses
+    /// [`side_divergence_bps`] so the scale matches the reserves-side
+    /// reconciliation surface.
+    pub fn new(observed_amount_out: u64, recorded_amount_out: u64) -> Self {
+        Self {
+            observed_amount_out,
+            recorded_amount_out,
+            diff_bps: side_divergence_bps(recorded_amount_out, observed_amount_out),
+        }
+    }
+}
+
+/// Why the balance cross-check bailed. Three orthogonal failure modes
+/// the operator wants to distinguish at a glance: a malformed signature
+/// in the input record (data-shape bug), an RPC fetch error (transient
+/// or provider archival-horizon issue — retryable on a different
+/// endpoint), or a successful fetch whose tx the observation heuristic
+/// can't classify (multi-leg route, signer mismatch, non-Json encoding —
+/// real diagnostic, not retryable).
+///
+/// `RpcFetch` carries the upstream error string so the operator can
+/// triage rate limits / 404s / network errors without re-running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossCheckError {
+    /// `attack.victim.signature` didn't parse as a
+    /// [`solana_sdk::signature::Signature`]. Indicates a malformed
+    /// JSONL input or upstream parser bug, not an on-chain condition.
+    BadSignature,
+    /// The `getTransaction` RPC call returned an error. The string is
+    /// the upstream `solana_client` error, suitable for diagnostic
+    /// logging. Common causes: rate limit, missing tx beyond the
+    /// provider's archival horizon, transient network failure.
+    RpcFetch(String),
+    /// The fetch succeeded but the observation heuristic
+    /// ([`swap_events::observe::observe_swap_from_tx`]) couldn't
+    /// classify the swap — e.g. multi-leg Jupiter route, victim
+    /// signer mismatch, non-Json encoding, or no signer-side balance
+    /// change. Real diagnostic, not retryable.
+    Unobservable,
+}
+
+/// Compare a sandwich attack's recorded `victim.amount_out` against an
+/// already-fetched victim transaction. Pure function — caller is
+/// responsible for sourcing the transaction (typically via
+/// [`cross_check_victim_balance`] which pulls it from an
+/// [`solana_client::nonblocking::rpc_client::RpcClient`]).
+///
+/// Returns [`CrossCheckError::Unobservable`] when
+/// [`swap_events::observe::observe_swap_from_tx`] can't classify the
+/// deltas — for example when the transaction is not JSON-encoded, the
+/// tx's first signer doesn't match `attack.victim.signer`, or the
+/// balance deltas don't match the detector's swap heuristic (multi-leg
+/// route, no signer-side change, etc.). Sig-parse and RPC-fetch
+/// failures don't apply at this layer — they're surfaced by the async
+/// wrapper.
+pub fn diff_against_observed_tx(
+    attack: &swap_events::types::SandwichAttack,
+    tx: &solana_transaction_status::EncodedTransactionWithStatusMeta,
+) -> Result<BalanceDiffReport, CrossCheckError> {
+    let observed = swap_events::observe::observe_swap_from_tx(tx, &attack.victim.signer)
+        .ok_or(CrossCheckError::Unobservable)?;
+    Ok(BalanceDiffReport::new(
+        observed.amount_out,
+        attack.victim.amount_out,
+    ))
+}
+
+/// Run the parser-vs-RPC balance cross-check for a single sandwich
+/// attack. Fetches the victim transaction via standard `getTransaction`
+/// (fully archival on every major Solana RPC provider — no slot-aware
+/// fetcher needed) and feeds it into [`diff_against_observed_tx`].
+///
+/// Defaults: `Json` encoding, `Finalized` commitment, v0 transaction
+/// version support. `Finalized` (not `Confirmed`) so the cross-check
+/// can't accidentally read a forked tx — at archival ages the
+/// distinction is moot for non-forked txs but rules out noise on the
+/// rare edge case.
+///
+/// Returns:
+///   * [`CrossCheckError::BadSignature`] when `attack.victim.signature`
+///     doesn't parse as a [`solana_sdk::signature::Signature`],
+///   * [`CrossCheckError::RpcFetch`] (with upstream error string) when
+///     the `getTransaction` call fails,
+///   * [`CrossCheckError::Unobservable`] when the observation heuristic
+///     can't classify the resulting tx (see [`diff_against_observed_tx`]).
+pub async fn cross_check_victim_balance(
+    attack: &swap_events::types::SandwichAttack,
+    client: &solana_client::nonblocking::rpc_client::RpcClient,
+) -> Result<BalanceDiffReport, CrossCheckError> {
+    use std::str::FromStr;
+    let sig = solana_sdk::signature::Signature::from_str(&attack.victim.signature)
+        .map_err(|_| CrossCheckError::BadSignature)?;
+    let config = solana_client::rpc_config::RpcTransactionConfig {
+        encoding: Some(solana_transaction_status::UiTransactionEncoding::Json),
+        commitment: Some(solana_sdk::commitment_config::CommitmentConfig::finalized()),
+        max_supported_transaction_version: Some(0),
+    };
+    let result = client
+        .get_transaction_with_config(&sig, config)
+        .await
+        .map_err(|e| CrossCheckError::RpcFetch(e.to_string()))?;
+    diff_against_observed_tx(attack, &result.transaction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +602,188 @@ mod tests {
         // for the public function, this is the helper's contract).
         assert_eq!(u128_divergence_bps(1, 0), u32::MAX);
         assert_eq!(u128_divergence_bps(0, 0), 0);
+    }
+
+    // ----- Balance cross-check -----
+
+    #[test]
+    fn balance_diff_zero_on_exact_match() {
+        let report = BalanceDiffReport::new(1_000_000, 1_000_000);
+        assert_eq!(report.observed_amount_out, 1_000_000);
+        assert_eq!(report.recorded_amount_out, 1_000_000);
+        assert_eq!(report.diff_bps, 0);
+    }
+
+    #[test]
+    fn balance_diff_five_percent_off_returns_500_bps() {
+        // Parser recorded 5% high vs chain truth.
+        let high = BalanceDiffReport::new(1_000_000, 1_050_000);
+        assert_eq!(high.diff_bps, 500);
+        // Parser recorded 5% low — same magnitude (abs_diff is symmetric).
+        let low = BalanceDiffReport::new(1_000_000, 950_000);
+        assert_eq!(low.diff_bps, 500);
+    }
+
+    #[test]
+    fn balance_diff_saturates_when_observed_zero_and_recorded_nonzero() {
+        // Chain says victim received nothing but parser recorded a swap —
+        // the relative gap is ill-defined, surface it as the maximum so a
+        // consumer can't accidentally read the absence as a small diff.
+        assert_eq!(BalanceDiffReport::new(0, 1).diff_bps, u32::MAX);
+    }
+
+    #[test]
+    fn balance_diff_zero_when_both_zero() {
+        // Degenerate but legal — neither parser nor chain saw output.
+        assert_eq!(BalanceDiffReport::new(0, 0).diff_bps, 0);
+    }
+
+    #[test]
+    fn balance_diff_no_overflow_on_max_amounts() {
+        // Single-unit gap on a u64::MAX position rounds to 0 bps without
+        // panicking. amount_out is a token-smallest-unit u64 so this is
+        // pathological but the math should still be safe.
+        let huge = u64::MAX;
+        assert_eq!(BalanceDiffReport::new(huge, huge - 1).diff_bps, 0);
+    }
+
+    // ----- diff_against_observed_tx (pure-function half of the cross-check) -----
+
+    /// Build a SandwichAttack with the supplied victim signer + amount_out.
+    /// All the structural fields the function doesn't touch are filled
+    /// with placeholders that satisfy the type but say nothing.
+    fn attack_with_victim(
+        victim_signer: &str,
+        victim_amount_out: u64,
+    ) -> swap_events::types::SandwichAttack {
+        use swap_events::types::{DexType, SandwichAttack, SwapDirection, SwapEvent};
+        fn ev(signer: &str, amount_out: u64) -> SwapEvent {
+            SwapEvent {
+                signature: "v".into(),
+                signer: signer.into(),
+                dex: DexType::OrcaWhirlpool,
+                pool: "p".into(),
+                direction: SwapDirection::Buy,
+                token_mint: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".into(),
+                amount_in: 1_000,
+                amount_out,
+                tx_index: 0,
+                slot: Some(0),
+                fee: None,
+            }
+        }
+        SandwichAttack {
+            slot: 0,
+            attacker: "atk".into(),
+            pool: "p".into(),
+            dex: DexType::OrcaWhirlpool,
+            frontrun: ev("atk", 0),
+            victim: ev(victim_signer, victim_amount_out),
+            backrun: ev("atk", 0),
+            estimated_attacker_profit: None,
+            victim_loss_lamports: None,
+            victim_loss_lamports_lower: None,
+            victim_loss_lamports_upper: None,
+            frontrun_slot: None,
+            backrun_slot: None,
+            detection_method: None,
+            bundle_provenance: None,
+            confidence: None,
+            net_profit: None,
+            attacker_profit: None,
+            price_impact_bps: None,
+            evidence: None,
+            amm_replay: None,
+            whirlpool_replay: None,
+            dlmm_replay: None,
+            attack_signature: None,
+            timestamp_ms: None,
+            attack_type: None,
+            severity: None,
+            confidence_level: None,
+            slot_leader: None,
+            is_wide_sandwich: false,
+            receipts: vec![],
+            victim_signer: None,
+            victim_amount_in: None,
+            victim_amount_out: None,
+            victim_amount_out_expected: None,
+        }
+    }
+
+    /// Build a `getTransaction`-shaped payload with the user as fee
+    /// payer, swapping `usdc_out` USDC out for `token_in` of a non-quote
+    /// mint (i.e. a Buy of TOKEN). The first signature + accountKeys[0]
+    /// are "user" so the cross-check's signer match succeeds.
+    fn buy_tx_payload(
+        usdc_in: u64,
+        token_out: u64,
+    ) -> solana_transaction_status::EncodedTransactionWithStatusMeta {
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let token = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        serde_json::from_value(serde_json::json!({
+            "transaction": {
+                "signatures": ["v"],
+                "message": {
+                    "header": { "numRequiredSignatures": 1, "numReadonlySignedAccounts": 0, "numReadonlyUnsignedAccounts": 0 },
+                    "accountKeys": ["user", "user_usdc_acc", "user_token_acc"],
+                    "recentBlockhash": "11111111111111111111111111111111",
+                    "instructions": [],
+                },
+            },
+            "meta": {
+                "err": null,
+                "status": { "Ok": null },
+                "fee": 5_000,
+                "preBalances": [10_000_000u64, 0u64, 0u64],
+                "postBalances": [10_000_000u64, 0u64, 0u64],
+                "preTokenBalances": [
+                    { "accountIndex": 1, "mint": usdc,  "owner": "user", "uiTokenAmount": { "amount": usdc_in.to_string(),  "decimals": 6, "uiAmount": null, "uiAmountString": usdc_in.to_string() } },
+                    { "accountIndex": 2, "mint": token, "owner": "user", "uiTokenAmount": { "amount": "0",                  "decimals": 6, "uiAmount": null, "uiAmountString": "0" } },
+                ],
+                "postTokenBalances": [
+                    { "accountIndex": 1, "mint": usdc,  "owner": "user", "uiTokenAmount": { "amount": "0",                   "decimals": 6, "uiAmount": null, "uiAmountString": "0" } },
+                    { "accountIndex": 2, "mint": token, "owner": "user", "uiTokenAmount": { "amount": token_out.to_string(), "decimals": 6, "uiAmount": null, "uiAmountString": token_out.to_string() } },
+                ],
+            },
+            "version": null,
+        }))
+        .expect("payload deserialises")
+    }
+
+    #[test]
+    fn diff_against_observed_tx_zero_when_amounts_match() {
+        let attack = attack_with_victim("user", 500);
+        let tx = buy_tx_payload(1_000, 500);
+        let report = diff_against_observed_tx(&attack, &tx).expect("observation succeeds");
+        assert_eq!(report.observed_amount_out, 500);
+        assert_eq!(report.recorded_amount_out, 500);
+        assert_eq!(report.diff_bps, 0);
+    }
+
+    #[test]
+    fn diff_against_observed_tx_surfaces_mismatch_in_bps() {
+        // Parser recorded 525, chain says 500 → 5% high.
+        let attack = attack_with_victim("user", 525);
+        let tx = buy_tx_payload(1_000, 500);
+        let report = diff_against_observed_tx(&attack, &tx).expect("observation succeeds");
+        assert_eq!(report.observed_amount_out, 500);
+        assert_eq!(report.recorded_amount_out, 525);
+        assert_eq!(report.diff_bps, 500);
+    }
+
+    #[test]
+    fn diff_against_observed_tx_returns_unobservable_on_signer_mismatch() {
+        // Tx is signed by "user" but we're checking against an attack
+        // attributing the victim to "alien" — observation should bail
+        // and the cross-check is reported as `Unobservable` rather than
+        // silently producing a misleading diff. `BadSignature` /
+        // `RpcFetch` only fire in the async wrapper.
+        let attack = attack_with_victim("alien", 500);
+        let tx = buy_tx_payload(1_000, 500);
+        assert_eq!(
+            diff_against_observed_tx(&attack, &tx),
+            Err(CrossCheckError::Unobservable),
+        );
     }
 }

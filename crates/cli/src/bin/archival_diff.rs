@@ -6,14 +6,23 @@
 //! the pool account at `attack.slot + slot_offset` via the configured
 //! [`AccountFetcher`], and emits a per-attack diff record on stdout.
 //!
-//! ## Stream-mode caveat
+//! ## Status: placeholder fetcher
 //!
-//! With the default [`LatestAccountFetcher`] the slot is *not* honoured —
-//! `solana-client`'s public `getAccountInfo` always serves latest-confirmed.
-//! For real archival validation, build with a provider-specific
-//! [`AccountFetcher`] impl (Helius `getAccountInfoAtSlot`, Triton archival
-//! endpoint, etc.) and route this binary through it. See
-//! `pool_state::AccountFetcher` for the integration surface.
+//! No major Solana RPC provider exposes a `getAccountInfo`-at-historical-
+//! slot method (Helius/Triton/QuickNode all serve latest-confirmed for
+//! account state — `minContextSlot` is a freshness floor, not a pin;
+//! `getAccountInfoAtSlot` does not exist). Real account-state archival
+//! requires either ledger replay (Old Faithful + Anza Jetstreamer) or a
+//! Geyser plugin capturing state in real time. Until one of those is
+//! wired up, this binary's [`LatestAccountFetcher`] is a placeholder and
+//! the slot argument has no effect.
+//!
+//! For end-to-end victim accounting validation that *does* work on
+//! historical sandwich corpora today, see the sister binary
+//! `balance-diff`. It validates `victim.amount_out` against on-chain
+//! truth via standard `getTransaction` (fully archival on every major
+//! provider) — the parser side rather than the replay side, but the
+//! more practical of the two for mainnet parity work right now.
 //!
 //! ## Output shape
 //!
