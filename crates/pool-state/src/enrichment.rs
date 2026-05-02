@@ -1318,6 +1318,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         })
     }
 
@@ -1495,6 +1496,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         });
         let tx = make_frontrun_tx();
         let lookup = MockLookup {
@@ -1543,6 +1545,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         });
         let lookup = MockLookup {
             config: dlmm_config(),

@@ -19,16 +19,30 @@
 //! `LbPair` is an Anchor account with `bytemuck repr(C)` body. The first
 //! 8 bytes are the discriminator (`sha256("account:LbPair")[..8]`).
 //! Field offsets (from the start of `account_data`, including the
-//! discriminator) for everything we read in Phase 1:
+//! discriminator) for everything we read:
 //!
 //! ```text
 //!   field                                offset  size
 //!   discriminator                            0     8
 //!   parameters (StaticParameters, 32B)       8    32
 //!     - base_factor: u16                     8     2
+//!     - filter_period: u16                  10     2
+//!     - decay_period: u16                   12     2
+//!     - reduction_factor: u16               14     2
+//!     - variable_fee_control: u32           16     4
+//!     - max_volatility_accumulator: u32     20     4
+//!     - min_bin_id: i32                     24     4   (unused in replay)
+//!     - max_bin_id: i32                     28     4   (unused in replay)
 //!     - protocol_share: u16                 32     2
 //!     - base_fee_power_factor: u8           34     1
+//!     - _padding: [u8; 5]                   35     5
 //!   v_parameters (VariableParameters, 32B)  40    32
+//!     - volatility_accumulator: u32         40     4
+//!     - volatility_reference: u32           44     4
+//!     - index_reference: i32                48     4
+//!     - _padding: [u8; 4]                   52     4
+//!     - last_update_timestamp: i64          56     8
+//!     - _padding_1: [u8; 8]                 64     8
 //!   bump_seed: [u8; 1]                      72     1
 //!   bin_step_seed: [u8; 2]                  73     2
 //!   pair_type: u8                           75     1
@@ -62,10 +76,22 @@ use crate::lookup::{AmmKind, PoolConfig};
 
 const DISCRIMINATOR_LEN: usize = 8;
 
-// StaticParameters fields (relative to discriminator end).
+// StaticParameters fields (relative to LbPair start, parameters at offset 8).
 const BASE_FACTOR_OFFSET: usize = DISCRIMINATOR_LEN; // 8
+const FILTER_PERIOD_OFFSET: usize = DISCRIMINATOR_LEN + 2; // 10
+const DECAY_PERIOD_OFFSET: usize = DISCRIMINATOR_LEN + 4; // 12
+const REDUCTION_FACTOR_OFFSET: usize = DISCRIMINATOR_LEN + 6; // 14
+const VARIABLE_FEE_CONTROL_OFFSET: usize = DISCRIMINATOR_LEN + 8; // 16
+const MAX_VOLATILITY_ACCUMULATOR_OFFSET: usize = DISCRIMINATOR_LEN + 12; // 20
 const PROTOCOL_SHARE_OFFSET: usize = DISCRIMINATOR_LEN + 24; // 32
 const BASE_FEE_POWER_FACTOR_OFFSET: usize = DISCRIMINATOR_LEN + 26; // 34
+
+// VariableParameters fields (v_parameters block at offset 40).
+const V_PARAMS_OFFSET: usize = DISCRIMINATOR_LEN + 32; // 40
+const VOLATILITY_ACCUMULATOR_OFFSET: usize = V_PARAMS_OFFSET; // 40
+const VOLATILITY_REFERENCE_OFFSET: usize = V_PARAMS_OFFSET + 4; // 44
+const INDEX_REFERENCE_OFFSET: usize = V_PARAMS_OFFSET + 8; // 48
+const LAST_UPDATE_TIMESTAMP_OFFSET: usize = V_PARAMS_OFFSET + 16; // 56
 
 // LbPair body offsets (after StaticParameters[32] + VariableParameters[32] = 64).
 const ACTIVE_ID_OFFSET: usize = DISCRIMINATOR_LEN + 32 + 32 + 1 + 2 + 1; // 76
@@ -109,12 +135,16 @@ pub fn dlmm_program_id() -> Pubkey {
 }
 
 /// Snapshot of `LbPair` state combining the dynamic active bin id with
-/// the static fee parameters that govern within-bin swap fees. The
-/// fee-parameter triple (`base_factor`, `bin_step`, `base_fee_power_factor`)
-/// never mutates per swap, but lives in the same on-chain account, so we
-/// surface them together to avoid re-parsing the blob in step 4 when the
-/// swap-step math computes fees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the static + variable fee parameters that govern swap fees.
+///
+/// The static-fee triple (`base_factor`, `bin_step`, `base_fee_power_factor`)
+/// never mutates per swap; the variable-fee state (`volatility_accumulator`,
+/// `volatility_reference`, `index_reference`, `last_update_timestamp`) is
+/// updated each swap on-chain. We surface the snapshot at the moment the
+/// account was fetched — replay then advances the variable-fee state in-
+/// memory exactly as on-chain `update_references` /
+/// `update_volatility_accumulator` would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DlmmPool {
     /// Currently active bin id. The active bin holds reserves of both
     /// tokens; left bins (token_y only) and right bins (token_x only) are
@@ -133,6 +163,42 @@ pub struct DlmmPool {
     /// regardless of how it's split downstream), retained here for
     /// completeness.
     pub protocol_share: u16,
+    /// High-frequency-trading window in seconds. If two swaps land within
+    /// this window, the volatility reference is *not* refreshed — the
+    /// accumulator keeps growing across them so a burst of swaps
+    /// compounds the variable fee. Static per pool.
+    pub filter_period: u16,
+    /// Decay window in seconds. After `filter_period` but before
+    /// `decay_period` elapsed, the volatility reference decays by
+    /// `reduction_factor / 10_000`; past `decay_period`, it resets to 0.
+    /// Static per pool.
+    pub decay_period: u16,
+    /// Volatility decay multiplier in basis points. `5_000 = 50%`. Static
+    /// per pool.
+    pub reduction_factor: u16,
+    /// Coefficient that scales `(volatility_accumulator * bin_step)^2`
+    /// into the variable-fee numerator. `0` disables the variable-fee
+    /// component. Static per pool.
+    pub variable_fee_control: u32,
+    /// Cap on `volatility_accumulator` — pins the maximum variable-fee
+    /// rate. Static per pool.
+    pub max_volatility_accumulator: u32,
+    /// Volatility accumulator. On-chain it stores the count of bins
+    /// crossed since `index_reference`, expressed in basis-point units
+    /// (`bins_crossed * 10_000 + reference_residue`). Mutates every
+    /// `update_volatility_accumulator` call.
+    pub volatility_accumulator: u32,
+    /// Decayed volatility carried from the previous swap. Always
+    /// `<= volatility_accumulator`. Refreshed by `update_references`.
+    pub volatility_reference: u32,
+    /// `active_id` snapshotted at the previous swap (or, after an
+    /// `update_references` reset, the current `active_id`). Anchor for
+    /// the `delta_id = |index_reference - active_id|` accumulator term.
+    pub index_reference: i32,
+    /// Wall-clock timestamp of the last `update_references` call.
+    /// Compared against the current swap's timestamp to decide whether
+    /// the filter / decay window has elapsed.
+    pub last_update_timestamp: i64,
 }
 
 impl DlmmPool {
@@ -263,8 +329,9 @@ pub fn parse_config(pool_address: &str, account_data: &[u8]) -> Option<PoolConfi
     })
 }
 
-/// Parse the dynamic swap-relevant state (active_id) plus the fee
-/// parameter triple. Returns `None` for short blobs.
+/// Parse the dynamic swap-relevant state (active bin + variable-fee
+/// state) plus the static fee parameters. Returns `None` for short
+/// blobs.
 pub fn parse_pool_state(account_data: &[u8]) -> Option<DlmmPool> {
     if account_data.len() < MIN_LAYOUT_LEN {
         return None;
@@ -275,6 +342,15 @@ pub fn parse_pool_state(account_data: &[u8]) -> Option<DlmmPool> {
         base_factor: read_u16(account_data, BASE_FACTOR_OFFSET)?,
         base_fee_power_factor: read_u8(account_data, BASE_FEE_POWER_FACTOR_OFFSET)?,
         protocol_share: read_u16(account_data, PROTOCOL_SHARE_OFFSET)?,
+        filter_period: read_u16(account_data, FILTER_PERIOD_OFFSET)?,
+        decay_period: read_u16(account_data, DECAY_PERIOD_OFFSET)?,
+        reduction_factor: read_u16(account_data, REDUCTION_FACTOR_OFFSET)?,
+        variable_fee_control: read_u32(account_data, VARIABLE_FEE_CONTROL_OFFSET)?,
+        max_volatility_accumulator: read_u32(account_data, MAX_VOLATILITY_ACCUMULATOR_OFFSET)?,
+        volatility_accumulator: read_u32(account_data, VOLATILITY_ACCUMULATOR_OFFSET)?,
+        volatility_reference: read_u32(account_data, VOLATILITY_REFERENCE_OFFSET)?,
+        index_reference: read_i32(account_data, INDEX_REFERENCE_OFFSET)?,
+        last_update_timestamp: read_i64(account_data, LAST_UPDATE_TIMESTAMP_OFFSET)?,
     })
 }
 
@@ -295,6 +371,11 @@ fn read_u8(data: &[u8], offset: usize) -> Option<u8> {
 fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
     let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
     Some(i32::from_le_bytes(bytes))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
 }
 
 fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
@@ -1165,6 +1246,45 @@ mod tests {
         assert!(parse_pool_state(&short).is_none());
     }
 
+    /// Pin the StaticParameters dynamic-fee fields + VariableParameters
+    /// offsets parsed in Phase 3. The `synth_blob` zeroes everything,
+    /// so we set distinguishable values at each offset and verify the
+    /// parse picks them up. Catches a future regression that swaps two
+    /// adjacent offsets (e.g. `filter_period` <-> `decay_period`).
+    #[test]
+    fn parses_dynamic_fee_state() {
+        let mut data = synth_blob();
+        let mint_y = Pubkey::from_str(WSOL_MINT).unwrap();
+        data[TOKEN_Y_MINT_OFFSET..TOKEN_Y_MINT_OFFSET + 32].copy_from_slice(mint_y.as_ref());
+        data[FILTER_PERIOD_OFFSET..FILTER_PERIOD_OFFSET + 2].copy_from_slice(&30u16.to_le_bytes());
+        data[DECAY_PERIOD_OFFSET..DECAY_PERIOD_OFFSET + 2].copy_from_slice(&600u16.to_le_bytes());
+        data[REDUCTION_FACTOR_OFFSET..REDUCTION_FACTOR_OFFSET + 2]
+            .copy_from_slice(&5_000u16.to_le_bytes());
+        data[VARIABLE_FEE_CONTROL_OFFSET..VARIABLE_FEE_CONTROL_OFFSET + 4]
+            .copy_from_slice(&40_000u32.to_le_bytes());
+        data[MAX_VOLATILITY_ACCUMULATOR_OFFSET..MAX_VOLATILITY_ACCUMULATOR_OFFSET + 4]
+            .copy_from_slice(&350_000u32.to_le_bytes());
+        data[VOLATILITY_ACCUMULATOR_OFFSET..VOLATILITY_ACCUMULATOR_OFFSET + 4]
+            .copy_from_slice(&12_345u32.to_le_bytes());
+        data[VOLATILITY_REFERENCE_OFFSET..VOLATILITY_REFERENCE_OFFSET + 4]
+            .copy_from_slice(&6_000u32.to_le_bytes());
+        data[INDEX_REFERENCE_OFFSET..INDEX_REFERENCE_OFFSET + 4]
+            .copy_from_slice(&(-42i32).to_le_bytes());
+        data[LAST_UPDATE_TIMESTAMP_OFFSET..LAST_UPDATE_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&1_700_000_000i64.to_le_bytes());
+
+        let state = parse_pool_state(&data).unwrap();
+        assert_eq!(state.filter_period, 30);
+        assert_eq!(state.decay_period, 600);
+        assert_eq!(state.reduction_factor, 5_000);
+        assert_eq!(state.variable_fee_control, 40_000);
+        assert_eq!(state.max_volatility_accumulator, 350_000);
+        assert_eq!(state.volatility_accumulator, 12_345);
+        assert_eq!(state.volatility_reference, 6_000);
+        assert_eq!(state.index_reference, -42);
+        assert_eq!(state.last_update_timestamp, 1_700_000_000);
+    }
+
     #[test]
     fn falls_back_to_default_fee_on_zero_factor() {
         let mut data = synth_blob();
@@ -1209,6 +1329,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 1, // x10
             protocol_share: 0,
+            ..Default::default()
         };
         // base_fee_rate = 8000 * 25 * 10 * 10 = 20_000_000 → 2% in 1e9.
         // fee on 1_000_000 = 1_000_000 * 20_000_000 / 1e9 = 20_000 (exact).
@@ -1227,6 +1348,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         };
         // rate = 2e6, den = 998e6; 1e6 * 2e6 / 998e6 = 2004.0080...
         // floor = 2004, remainder ≠ 0 ⇒ ceil = 2005.
@@ -1245,6 +1367,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         };
         // rate = 2e6; gross = 1; num = 2e6; ceil(2e6 / 1e9) = 1.
         // (Floor would yield 0 — pin that we round up.)
@@ -1267,6 +1390,7 @@ mod tests {
             base_factor: 10_000,
             base_fee_power_factor: 1,
             protocol_share: 0,
+            ..Default::default()
         };
         assert_eq!(pool.total_fee_rate(), Some(DLMM_MAX_FEE_RATE));
     }
@@ -1516,6 +1640,7 @@ mod swap_math_tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         }
     }
 
@@ -1662,6 +1787,7 @@ mod cross_bin_tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         }
     }
 

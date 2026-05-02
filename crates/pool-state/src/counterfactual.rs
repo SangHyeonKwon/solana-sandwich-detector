@@ -1465,6 +1465,7 @@ mod tests {
             base_factor: 8000,
             base_fee_power_factor: 0,
             protocol_share: 0,
+            ..Default::default()
         }
     }
 
