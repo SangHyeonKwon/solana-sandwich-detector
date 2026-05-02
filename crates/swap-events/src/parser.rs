@@ -158,7 +158,7 @@ fn parse_inner_instructions(
         .collect()
 }
 
-fn parse_sol_balance_changes(
+pub(crate) fn parse_sol_balance_changes(
     meta: &UiTransactionStatusMeta,
     account_keys: &[String],
 ) -> Vec<SolBalanceChange> {
@@ -180,7 +180,7 @@ fn parse_sol_balance_changes(
         .collect()
 }
 
-fn parse_token_balance_changes(
+pub(crate) fn parse_token_balance_changes(
     meta: &UiTransactionStatusMeta,
     account_keys: &[String],
 ) -> Vec<TokenBalanceChange> {

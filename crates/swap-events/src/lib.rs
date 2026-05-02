@@ -1,5 +1,6 @@
 pub mod dex;
 pub mod error;
+pub mod observe;
 pub mod parser;
 pub mod source;
 pub mod types;
