@@ -43,12 +43,12 @@ Los ataques sandwich son la forma más común de extracción de MEV en Solana. U
 |-----|-----------------|--------------------------|
 | Raydium V4 | Directo + CPI | ✅ Producto constante |
 | Raydium CPMM | Directo + CPI | ✅ Producto constante |
-| Raydium CLMM | Directo + CPI | — |
+| Raydium CLMM | Directo + CPI | ✅ Concentrada, dentro-tick + cross-tick |
 | Orca Whirlpool | Directo + CPI | ✅ Concentrada, dentro-tick + cross-tick |
 | Meteora DLMM | Directo + CPI | ✅ Suma constante, dentro-bin + cross-bin |
-| Jupiter V6 | Route-through (resuelve pool subyacente) | (vía pool subyacente) |
-| Pump.fun | Directo + CPI | — |
-| Phoenix | Directo + CPI | — |
+| Jupiter V6 | Route-through (resuelve pool subyacente) | ✅ Single-hop dispatch al DEX subyacente (multi-hop diferido) |
+| Pump.fun | Directo + CPI | ✅ Bonding curve, virtual reserves recuperadas desde `TradeEvent` log |
+| Phoenix | Directo + CPI | — (CLOB; aún no soportado) |
 
 > Añadir un nuevo DEX toma ~50 líneas para parsear swaps; el replay añade un módulo aparte. Ver [Contribuir](#contribuir).
 
@@ -171,7 +171,7 @@ state_2c = state_0 después de la víctima, sin frontrun  (replay, "contrafactua
 victim_loss = victim_out(state_2c) - victim_out(state_2)
 ```
 
-Las reservas de cada paso vienen de los `pre_token_balances` / `post_token_balances` de la propia transacción — no se requiere RPC histórico para pools de producto constante. Los AMMs de liquidez concentrada (Whirlpool, DLMM) requieren el snapshot dinámico (`sqrt_price` / `liquidity` / `active_id`), obtenido vía `getAccountInfo` sobre la cuenta del pool; el trait `AccountFetcher` permite enchufar proveedores archival para backfill.
+Las reservas de cada paso vienen de los `pre_token_balances` / `post_token_balances` de la propia transacción — no se requiere RPC histórico para pools de producto constante. Los AMMs de liquidez concentrada (Whirlpool, Raydium CLMM, DLMM) requieren el snapshot dinámico (`sqrt_price` / `liquidity` / `active_id`), obtenido vía `getAccountInfo` sobre la cuenta del pool; el trait `AccountFetcher` permite enchufar proveedores archival para backfill. Pump.fun es un caso especial — sus `virtual_*_reserves` de bonding curve se recuperan del log Anchor `TradeEvent` que Pump.fun emite por swap, por lo que no requiere RPC extra y el replay archival funciona directamente.
 
 Cuando el enriquecimiento tiene éxito, cada `SandwichAttack` recibe:
 
@@ -182,7 +182,7 @@ Cuando el enriquecimiento tiene éxito, cada `SandwichAttack` recibe:
 - `severity` — categoría según la razón loss/TVL del pool
 - Trace por DEX: `amm_replay` (producto constante), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` — permite a un consumidor downstream recalcular la pérdida desde la aritmética cruda
 
-Los ataques en DEXes no soportados pasan con estos campos en `None`.
+Los ataques en DEXes no soportados (Phoenix actualmente; rutas de Jupiter a través de pools subyacentes no soportados también cuentan) pasan con estos campos en `None`. Las rutas multi-hop de Jupiter aparecen como `cross_boundary_unsupported` en la métrica heartbeat — single-hop pivota a través del replay path existente del DEX subyacente.
 
 ---
 

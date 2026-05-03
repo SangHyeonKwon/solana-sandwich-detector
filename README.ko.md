@@ -43,12 +43,12 @@
 |-----|------------------|------------------------|
 | Raydium V4 | Direct + CPI | ✅ Constant product |
 | Raydium CPMM | Direct + CPI | ✅ Constant product |
-| Raydium CLMM | Direct + CPI | — |
+| Raydium CLMM | Direct + CPI | ✅ Concentrated, within-tick + cross-tick |
 | Orca Whirlpool | Direct + CPI | ✅ Concentrated, within-tick + cross-tick |
 | Meteora DLMM | Direct + CPI | ✅ Constant-sum, within-bin + cross-bin |
-| Jupiter V6 | Route-through (underlying pool 해석) | (underlying pool 경유) |
-| Pump.fun | Direct + CPI | — |
-| Phoenix | Direct + CPI | — |
+| Jupiter V6 | Route-through (underlying pool 해석) | ✅ Single-hop은 underlying DEX로 dispatch (multi-hop 미지원) |
+| Pump.fun | Direct + CPI | ✅ Bonding curve, virtual reserves를 `TradeEvent` log에서 복원 |
+| Phoenix | Direct + CPI | — (CLOB; 미지원) |
 
 > 새 DEX 추가는 swap 파싱이 ~50줄, replay 지원은 별도 모듈. [기여](#기여) 참조.
 
@@ -171,7 +171,7 @@ state_2c = frontrun 없이 victim     (재연, "반사실")
 victim_loss = victim_out(state_2c) - victim_out(state_2)
 ```
 
-각 단계의 잔액은 트랜잭션 자체의 `pre_token_balances` / `post_token_balances`에서 옴 — constant-product pool은 historical RPC 불필요. Concentrated-liquidity AMM(Whirlpool, DLMM)은 동적 `sqrt_price` / `liquidity` / `active_id` 스냅샷이 필요하며 pool 계정에 `getAccountInfo`로 가져옴; `AccountFetcher` trait를 통해 백필용 archival provider를 끼워 넣을 수 있습니다.
+각 단계의 잔액은 트랜잭션 자체의 `pre_token_balances` / `post_token_balances`에서 옴 — constant-product pool은 historical RPC 불필요. Concentrated-liquidity AMM (Whirlpool, Raydium CLMM, DLMM)은 동적 `sqrt_price` / `liquidity` / `active_id` 스냅샷이 필요하며 pool 계정에 `getAccountInfo`로 가져옴; `AccountFetcher` trait를 통해 백필용 archival provider를 끼워 넣을 수 있습니다. Pump.fun은 별개 — bonding-curve `virtual_*_reserves`를 Pump.fun이 swap마다 emit하는 `TradeEvent` Anchor log에서 복원하므로 추가 RPC 없이 동작 + archival replay도 그대로 가능.
 
 Enrichment 성공 시 각 `SandwichAttack`은 다음을 갖습니다:
 
@@ -182,7 +182,7 @@ Enrichment 성공 시 각 `SandwichAttack`은 다음을 갖습니다:
 - `severity` — loss 대비 pool TVL 비율의 버킷
 - DEX별 trace: `amm_replay`(constant product), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` — 다운스트림 소비자가 raw 산술로 loss를 재계산 가능
 
-미지원 DEX의 공격은 이 필드들이 `None`인 채로 통과됩니다.
+미지원 DEX (현재 Phoenix; Jupiter route가 미지원 underlying pool 거치는 경우 포함)의 공격은 이 필드들이 `None`인 채로 통과됩니다. Multi-hop Jupiter route는 heartbeat 메트릭의 `cross_boundary_unsupported`로 분류 — single-hop은 underlying DEX의 기존 replay path로 pivot됨.
 
 ---
 
