@@ -90,17 +90,37 @@ pub struct TradeEvent {
     pub virtual_token_reserves: u64,
 }
 
-/// Total size of the Anchor-encoded `TradeEvent` payload (8-byte
-/// discriminator + 105 bytes of fields).
+/// Minimum size of the Anchor-encoded `TradeEvent` payload covering
+/// every field we read (8-byte discriminator + 105 bytes of fields).
+/// Pump.fun has shipped at least one program upgrade that *appends*
+/// fields — `real_sol_reserves`, `real_token_reserves`, and a
+/// `fee_recipient` pubkey were added, growing the payload to 298
+/// bytes on mainnet as of 2026-05. The on-the-wire prefix bytes 0..113
+/// retained their original meaning across that upgrade, so the parser
+/// is permissive on length (≥) and only enforces equality on the
+/// fields it actually decodes.
 const TRADE_EVENT_LEN: usize = 113;
 
 /// Parse a single base64-decoded `Program data` payload as a
 /// `TradeEvent`. Returns `None` if the discriminator doesn't match
-/// or the payload length isn't exactly [`TRADE_EVENT_LEN`] — both
-/// signal "this log line wasn't a Pump.fun TradeEvent emission",
-/// which the caller filters out without raising.
+/// or the payload is shorter than [`TRADE_EVENT_LEN`] — both signal
+/// "this log line wasn't a Pump.fun TradeEvent emission" (or was a
+/// truncated / corrupted one), which the caller filters out without
+/// raising.
+///
+/// Length policy: `data.len() >= TRADE_EVENT_LEN`. Pump.fun has had
+/// at least one program upgrade that appended fields after the
+/// prefix we decode (see [`TRADE_EVENT_LEN`]); rejecting any extra
+/// bytes would fail closed on every mainnet event after that
+/// upgrade. The bool-byte sanity check on `is_buy` (0 or 1) and the
+/// implicit constraints from `virtual_*_reserves` being non-zero u64s
+/// catch the realistic mis-parse mode where an unrelated `Program
+/// data:` line happens to start with our 8-byte discriminator (that
+/// being a 1-in-2^64 collision against a different Anchor event with
+/// matching `sha256("event:TradeEvent")[..8]` — not a thing in
+/// practice but the guard is cheap).
 pub fn parse_trade_event_data(data: &[u8]) -> Option<TradeEvent> {
-    if data.len() != TRADE_EVENT_LEN {
+    if data.len() < TRADE_EVENT_LEN {
         return None;
     }
     if data[0..8] != TRADE_EVENT_DISCRIMINATOR {
@@ -246,14 +266,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_payload() {
-        // Defensive: a future Pump.fun upgrade that adds a field
-        // would extend the payload. We refuse to mis-parse it
-        // rather than silently truncate.
+    fn parses_extended_payload_using_prefix_only() {
+        // Pump.fun has shipped at least one program upgrade that
+        // appended fields after the original 113-byte payload. The
+        // prefix bytes (mint / amounts / is_buy / user / timestamp /
+        // virtual reserves) retain their meaning across that upgrade,
+        // so the parser must accept longer payloads and decode the
+        // prefix unchanged. Rejecting them — as the original strict-
+        // equality check did — fails closed on every mainnet event
+        // after the upgrade, which is exactly what bit production
+        // until this hotfix.
         let event = fixture_event();
         let mut bytes = build_trade_event_payload(&event);
-        bytes.push(0); // pretend a future field appeared
-        assert!(parse_trade_event_data(&bytes).is_none());
+        // Tail with arbitrary new-field bytes — concrete test against
+        // a real mainnet capture lives in
+        // `parses_real_mainnet_pump_fun_trade_event` below.
+        bytes.extend_from_slice(&[0xAB; 185]);
+        let parsed = parse_trade_event_data(&bytes).expect("extended event parses");
+        assert_eq!(parsed, event);
+    }
+
+    /// Real mainnet capture from the validation run that surfaced the
+    /// strict-equality bug. Tx
+    /// `62vRYY8YitkmngZyYXP5EFXxiHJrnRy347k3U5e6W9q4oE8r96sBg2XWXAyAqVsCyPUazARCHmnMacvLF6jbLbWP`
+    /// (slot 417_236_032, 2026-05-03, mint
+    /// `5mcL4agtemfkfJVEG8Pqvkp6aZUdHZNrEb2ECCbspump`). Pinning this
+    /// fixture means a future Pump.fun layout change that breaks the
+    /// prefix shape — not just appends — surfaces here as a test
+    /// regression instead of silently mis-parsing. Copy-pasting the
+    /// base64 keeps the fixture self-contained and human-auditable.
+    #[test]
+    fn parses_real_mainnet_pump_fun_trade_event() {
+        let b64 = "vdt/007mYe5G3D/hrkMVLzkQCdKwOexceEQLX/jOJBecchtKefIubwCUNXcAAAAAYMBdoDw5AAABHFWzPvxZhokehQwVtgzLJxqQSO1mSMF4PpcBnW5C4jgWyPZpAAAAAAAK9K4HAAAA0iWttSt3AwAAXtCyAAAAANKNmmmaeAIASsL40N1cvJfjKJwZfLUGKlTz2Va5zm5RFfllZ6pcs+ZfAAAAAAAAAMDqIQEAAAAAQ9XgDjNtTO0TXanGdyzEn5z1qe/crhBLi61NZmAuNLEAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAGJ1eQAeAAAAAAAAAICNWwAAAAAAiBMAAAAAAABg9ZAAAAAAAA==";
+        let payload = STANDARD.decode(b64).expect("base64 decodes");
+        // Sanity: this is the upgraded format we expected to see.
+        assert!(
+            payload.len() > TRADE_EVENT_LEN,
+            "fixture should be the upgraded ≥113-byte event, got {}",
+            payload.len()
+        );
+        let event = parse_trade_event_data(&payload).expect("mainnet event parses");
+        assert!(event.is_buy);
+        assert_eq!(event.sol_amount, 2_000_000_000); // 2 SOL gross
+        assert_eq!(event.virtual_sol_reserves, 33_000_000_000); // 33 SOL pool depth
+        assert_eq!(event.virtual_token_reserves, 975_454_545_454_546);
     }
 
     #[test]
