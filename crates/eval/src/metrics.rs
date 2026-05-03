@@ -212,7 +212,7 @@ mod tests {
             price_impact_bps: None,
             evidence: None,
             amm_replay: None,
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,

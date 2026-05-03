@@ -35,7 +35,7 @@ pub use counterfactual::{
     compute_loss_whirlpool_with_trace, compute_loss_with_trace, LossEstimate,
 };
 pub use diff_test::{
-    compare_whirlpool_replay_to_archival, cross_check_victim_balance, diff_against_observed_tx,
+    compare_clmm_replay_to_archival, cross_check_victim_balance, diff_against_observed_tx,
     diff_attack_against_archival, reserves_divergence_bps, BalanceDiffReport, CrossCheckError,
     WhirlpoolDiffReport, PASS_THRESHOLD_BPS,
 };

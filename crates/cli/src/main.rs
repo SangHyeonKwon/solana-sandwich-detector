@@ -1149,7 +1149,7 @@ mod tests {
                 fee_num: 25,
                 fee_den: 10_000,
             }),
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: Some(1_700_000_000_000),

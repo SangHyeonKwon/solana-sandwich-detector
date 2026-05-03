@@ -18,7 +18,7 @@
 //! chain truth, we have to fetch the pool account *at the slot after the
 //! sandwich*. That fetch is provider-specific (archival RPC), so the
 //! comparison is split into a pure function
-//! ([`compare_whirlpool_replay_to_archival`]) and an async wrapper
+//! ([`compare_clmm_replay_to_archival`]) and an async wrapper
 //! ([`diff_attack_against_archival`]) that takes an
 //! [`AccountFetcher`](crate::AccountFetcher).
 
@@ -56,7 +56,7 @@ fn side_divergence_bps(predicted: u64, observed: u64) -> u32 {
 
 /// Per-component divergence between a Whirlpool replay's post-back
 /// checkpoint and the chain-observed post-state. Returned by
-/// [`compare_whirlpool_replay_to_archival`] / [`diff_attack_against_archival`].
+/// [`compare_clmm_replay_to_archival`] / [`diff_attack_against_archival`].
 ///
 /// `*_diff_bps` fields use the same relative-bps convention as
 /// [`reserves_divergence_bps`]. `tick_diff` is a signed absolute gap
@@ -78,8 +78,8 @@ pub struct WhirlpoolDiffReport {
 /// Returns `None` when `observed` isn't the Whirlpool variant — the
 /// concentrated-liquidity comparison surface only makes sense for
 /// concentrated-liquidity AMMs.
-pub fn compare_whirlpool_replay_to_archival(
-    predicted: &swap_events::types::WhirlpoolReplayTrace,
+pub fn compare_clmm_replay_to_archival(
+    predicted: &swap_events::types::ClmmReplayTrace,
     observed: &crate::lookup::DynamicPoolState,
 ) -> Option<WhirlpoolDiffReport> {
     let crate::lookup::DynamicPoolState::Whirlpool {
@@ -101,7 +101,7 @@ pub fn compare_whirlpool_replay_to_archival(
 /// Run the Whirlpool replay-vs-archival diff for a single sandwich
 /// attack. Fetches the pool account at `attack.slot + slot_offset` via
 /// the supplied fetcher and feeds the result into
-/// [`compare_whirlpool_replay_to_archival`].
+/// [`compare_clmm_replay_to_archival`].
 ///
 /// `slot_offset` is typically `1` — the state at the start of the slot
 /// *after* the sandwich is what we want to compare against the
@@ -111,7 +111,7 @@ pub fn compare_whirlpool_replay_to_archival(
 ///
 /// Returns `None` when:
 ///   * `attack.dex` isn't [`DexType::OrcaWhirlpool`](swap_events::types::DexType::OrcaWhirlpool),
-///   * the attack carries no [`WhirlpoolReplayTrace`] (enrichment
+///   * the attack carries no [`ClmmReplayTrace`] (enrichment
 ///     didn't run or it bailed),
 ///   * the archival fetch fails or the account doesn't parse as a
 ///     Whirlpool pool account.
@@ -123,7 +123,7 @@ pub async fn diff_attack_against_archival(
     if attack.dex != swap_events::types::DexType::OrcaWhirlpool {
         return None;
     }
-    let predicted = attack.whirlpool_replay.as_ref()?;
+    let predicted = attack.clmm_replay.as_ref()?;
     let pubkey = attack.pool.parse::<solana_sdk::pubkey::Pubkey>().ok()?;
     let account = fetcher
         .fetch_account(&pubkey, attack.slot.saturating_add(slot_offset))
@@ -135,7 +135,7 @@ pub async fn diff_attack_against_archival(
         tick_current_index: pool_state.tick_current_index,
         tick_spacing: pool_state.tick_spacing,
     };
-    compare_whirlpool_replay_to_archival(predicted, &observed)
+    compare_clmm_replay_to_archival(predicted, &observed)
 }
 
 /// u128 analogue of [`side_divergence_bps`]. Whirlpool sqrt_price
@@ -353,10 +353,10 @@ mod tests {
     // ----- Whirlpool archival diff (Tier 3.1 archival extension) ----
 
     use crate::lookup::DynamicPoolState;
-    use swap_events::types::WhirlpoolReplayTrace;
+    use swap_events::types::ClmmReplayTrace;
 
-    fn make_trace(sp: u128, liq: u128, tick: i32) -> WhirlpoolReplayTrace {
-        WhirlpoolReplayTrace {
+    fn make_trace(sp: u128, liq: u128, tick: i32) -> ClmmReplayTrace {
+        ClmmReplayTrace {
             sqrt_price_pre: sp,
             sqrt_price_post_front: sp,
             sqrt_price_post_victim: sp,
@@ -390,8 +390,7 @@ mod tests {
         let sp = 1u128 << 64;
         let predicted = make_trace(sp, 1_000_000_000, 10);
         let observed = make_observed(sp, 1_000_000_000, 10);
-        let diff =
-            compare_whirlpool_replay_to_archival(&predicted, &observed).expect("diff computed");
+        let diff = compare_clmm_replay_to_archival(&predicted, &observed).expect("diff computed");
         assert_eq!(diff.sqrt_price_diff_bps, 0);
         assert_eq!(diff.liquidity_diff_bps, 0);
         assert_eq!(diff.tick_diff, 0);
@@ -404,7 +403,7 @@ mod tests {
         // ⇒ 50_000 * 10_000 / 1_000_000 = 500 bps exactly.
         let predicted = make_trace(1_050_000, 1_000_000, 0);
         let observed = make_observed(1_000_000, 1_000_000, 0);
-        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        let diff = compare_clmm_replay_to_archival(&predicted, &observed).unwrap();
         assert_eq!(
             diff.sqrt_price_diff_bps, 500,
             "predicted 5% above observed should be exactly 500 bps",
@@ -419,11 +418,11 @@ mod tests {
         // predicted tick = 100, observed = 95 ⇒ tick_diff = +5 (we're high).
         let predicted = make_trace(sp, 1_000_000, 100);
         let observed = make_observed(sp, 1_000_000, 95);
-        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        let diff = compare_clmm_replay_to_archival(&predicted, &observed).unwrap();
         assert_eq!(diff.tick_diff, 5);
         // Reversed: predicted low.
         let predicted = make_trace(sp, 1_000_000, 90);
-        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        let diff = compare_clmm_replay_to_archival(&predicted, &observed).unwrap();
         assert_eq!(diff.tick_diff, -5);
     }
 
@@ -435,7 +434,7 @@ mod tests {
         let sp = 1u128 << 64;
         let predicted = make_trace(sp, 1, 0);
         let observed = make_observed(sp, 0, 0);
-        let diff = compare_whirlpool_replay_to_archival(&predicted, &observed).unwrap();
+        let diff = compare_clmm_replay_to_archival(&predicted, &observed).unwrap();
         assert_eq!(diff.liquidity_diff_bps, u32::MAX);
     }
 
@@ -467,7 +466,7 @@ mod tests {
 
     fn whirlpool_attack_at_slot(slot: u64) -> swap_events::types::SandwichAttack {
         use swap_events::types::{
-            DexType, SandwichAttack, SwapDirection, SwapEvent, WhirlpoolReplayTrace,
+            ClmmReplayTrace, DexType, SandwichAttack, SwapDirection, SwapEvent,
         };
         let pool_pubkey = solana_sdk::pubkey::Pubkey::new_unique().to_string();
         fn ev(sig: &str, signer: &str, dir: SwapDirection, pool: &str) -> SwapEvent {
@@ -507,7 +506,7 @@ mod tests {
             price_impact_bps: None,
             evidence: None,
             amm_replay: None,
-            whirlpool_replay: Some(WhirlpoolReplayTrace {
+            clmm_replay: Some(ClmmReplayTrace {
                 sqrt_price_pre: 1u128 << 64,
                 sqrt_price_post_front: 1u128 << 64,
                 sqrt_price_post_victim: 1u128 << 64,
@@ -578,12 +577,9 @@ mod tests {
             captured_slot: std::sync::Mutex::new(None),
         };
         let mut attack = whirlpool_attack_at_slot(100);
-        attack.whirlpool_replay = None;
+        attack.clmm_replay = None;
         let result = diff_attack_against_archival(&attack, &fetcher, 1).await;
-        assert!(
-            result.is_none(),
-            "missing whirlpool_replay should short-circuit",
-        );
+        assert!(result.is_none(), "missing clmm_replay should short-circuit",);
         assert!(
             fetcher.captured_slot.lock().unwrap().is_none(),
             "fetcher should not be called when there's no trace to compare",
@@ -694,7 +690,7 @@ mod tests {
             price_impact_bps: None,
             evidence: None,
             amm_replay: None,
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,

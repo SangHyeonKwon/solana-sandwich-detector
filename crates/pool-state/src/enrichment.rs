@@ -108,11 +108,11 @@ pub async fn enrich_attack(
     };
 
     // Dispatch by AMM kind. Each path produces (loss,
-    // amm_replay_trace_opt, whirlpool_replay_trace_opt,
+    // amm_replay_trace_opt, clmm_replay_trace_opt,
     // dlmm_replay_trace_opt, pool_quote_tvl). The three trace options
     // are mutually exclusive: ConstantProduct fills
     // `amm_replay_trace_opt`, Whirlpool fills
-    // `whirlpool_replay_trace_opt`, DLMM fills
+    // `clmm_replay_trace_opt`, DLMM fills
     // `dlmm_replay_trace_opt`. Common attack-field / signal wiring
     // runs after the match.
     let (loss, trace_opt, whirlpool_trace_opt, dlmm_trace_opt, pool_quote_tvl) = match config.kind {
@@ -535,7 +535,7 @@ pub async fn enrich_attack(
         attack.amm_replay = Some(trace);
     }
     if let Some(whirlpool_trace) = whirlpool_trace_opt {
-        attack.whirlpool_replay = Some(whirlpool_trace);
+        attack.clmm_replay = Some(whirlpool_trace);
     }
     if let Some(dlmm_trace) = dlmm_trace_opt {
         attack.dlmm_replay = Some(dlmm_trace);
@@ -676,7 +676,7 @@ mod tests {
             price_impact_bps: None,
             evidence: None,
             amm_replay: None,
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
@@ -1048,7 +1048,7 @@ mod tests {
         // Whirlpool path doesn't populate the constant-product trace.
         assert!(attack.amm_replay.is_none());
         // It does populate the Whirlpool-specific trace (Tier 3.4 trace-β).
-        let trace = attack.whirlpool_replay.expect("whirlpool_replay populated");
+        let trace = attack.clmm_replay.expect("clmm_replay populated");
         // Pre-state matches the dynamic state the lookup served.
         assert_eq!(
             trace.sqrt_price_pre,
@@ -1138,7 +1138,7 @@ mod tests {
         // Cross-tick path also populates the Whirlpool trace — the
         // post-front liquidity should differ from pre when a boundary
         // gets crossed (LP1 deactivates as the swap exits its range).
-        let trace = attack.whirlpool_replay.expect("whirlpool_replay populated");
+        let trace = attack.clmm_replay.expect("clmm_replay populated");
         assert_eq!(trace.liquidity_pre, 1_500_000_000);
     }
 
@@ -2258,7 +2258,7 @@ mod tests {
         // amm_replay trace is the constant-product variant — Pump.fun
         // reuses the V2 math so the trace shape matches Raydium V4.
         assert!(attack.amm_replay.is_some(), "amm_replay should populate");
-        assert!(attack.whirlpool_replay.is_none());
+        assert!(attack.clmm_replay.is_none());
         assert!(attack.dlmm_replay.is_none());
     }
 

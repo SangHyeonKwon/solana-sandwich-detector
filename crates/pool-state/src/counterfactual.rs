@@ -15,7 +15,7 @@
 //! SOL-quoted pools, or USDC micro-units for USDC-quoted pools).
 
 use swap_events::types::{
-    AmmReplayTrace, MeteoraDlmmReplayTrace, SandwichAttack, SwapDirection, WhirlpoolReplayTrace,
+    AmmReplayTrace, ClmmReplayTrace, MeteoraDlmmReplayTrace, SandwichAttack, SwapDirection,
 };
 
 use crate::meteora_dlmm::bin_array::ParsedBinArray;
@@ -255,7 +255,7 @@ fn reserves_to_u64(pool: &ConstantProduct) -> (u64, u64) {
 }
 
 /// Replay a detected sandwich through a Whirlpool pool, returning the
-/// loss estimate paired with a per-step [`WhirlpoolReplayTrace`].
+/// loss estimate paired with a per-step [`ClmmReplayTrace`].
 ///
 /// Mirrors [`compute_loss_with_trace`] for the V3-style swap math:
 /// same `LossEstimate` shape, same `Option` failure modes, plus a
@@ -282,7 +282,7 @@ pub fn compute_loss_whirlpool_with_trace(
     fee_den: u128,
     base_is_token_a: bool,
     tick_arrays: &[ParsedTickArray],
-) -> Option<(LossEstimate, WhirlpoolReplayTrace)> {
+) -> Option<(LossEstimate, ClmmReplayTrace)> {
     // Direction sanity (mirrors compute_loss_with_trace).
     if attack.victim.direction != attack.frontrun.direction {
         return None;
@@ -437,7 +437,7 @@ pub fn compute_loss_whirlpool_with_trace(
         victim_loss_upper,
     };
 
-    let trace = WhirlpoolReplayTrace {
+    let trace = ClmmReplayTrace {
         sqrt_price_pre: pool_0.sqrt_price_q64,
         sqrt_price_post_front: pool_1.sqrt_price_q64,
         sqrt_price_post_victim: pool_2.sqrt_price_q64,
@@ -1019,7 +1019,7 @@ mod tests {
             price_impact_bps: None,
             evidence: None,
             amm_replay: None,
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,

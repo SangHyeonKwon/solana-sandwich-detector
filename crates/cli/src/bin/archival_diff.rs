@@ -2,7 +2,7 @@
 //! chain-observed post-state.
 //!
 //! Reads `SandwichAttack` JSONL from stdin (the same shape `sandwich-detect`
-//! emits, plus the `whirlpool_replay` trace populated by enrichment), fetches
+//! emits, plus the `clmm_replay` trace populated by enrichment), fetches
 //! the pool account at `attack.slot + slot_offset` via the configured
 //! [`AccountFetcher`], and emits a per-attack diff record on stdout.
 //!
@@ -171,7 +171,7 @@ async fn process_attack(
             ..base
         };
     }
-    if attack.whirlpool_replay.is_none() {
+    if attack.clmm_replay.is_none() {
         return DiffRecord {
             skipped: Some("missing_trace"),
             ..base

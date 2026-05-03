@@ -398,21 +398,26 @@ pub struct SandwichAttack {
     /// enrichment didn't run or the DEX isn't supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amm_replay: Option<AmmReplayTrace>,
-    /// Whirlpool-specific replay trace — populated only when `dex` is
-    /// `OrcaWhirlpool` and pool-state enrichment ran successfully.
-    /// Mirrors [`AmmReplayTrace`] in spirit: lets a reader recompute
-    /// victim loss / attacker profit from the raw concentrated-liquidity
-    /// arithmetic. Distinct field rather than an enum so the existing
-    /// `amm_replay` shape stays backward-compatible for ConstantProduct
-    /// consumers.
+    /// Concentrated-liquidity (V3-style) replay trace — populated when
+    /// `dex` is `OrcaWhirlpool` or `RaydiumClmm` and pool-state
+    /// enrichment ran successfully. Mirrors [`AmmReplayTrace`] in
+    /// spirit: lets a reader recompute victim loss / attacker profit
+    /// from the raw concentrated-liquidity arithmetic. Distinct field
+    /// rather than an enum so the existing `amm_replay` shape stays
+    /// backward-compatible for ConstantProduct consumers.
+    ///
+    /// Renamed from `whirlpool_replay` once Raydium CLMM enrichment
+    /// joined the same V3 math path — the trace shape (`sqrt_price`,
+    /// `liquidity`, `tick_current`) is pool-layout-agnostic, so naming
+    /// it after a single DEX was misleading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub whirlpool_replay: Option<WhirlpoolReplayTrace>,
+    pub clmm_replay: Option<ClmmReplayTrace>,
     /// Meteora DLMM-specific replay trace — populated only when `dex`
     /// is `MeteoraDlmm` and Phase 2 cross-bin replay ran successfully.
-    /// Tracks `active_id` transitions instead of Whirlpool's
+    /// Tracks `active_id` transitions instead of the V3-style
     /// sqrt_price/liquidity/tick triple, since DLMM's discrete-bin
     /// model captures a leg's effect entirely in which bin became
-    /// active. Distinct field rather than a `whirlpool_replay` enum
+    /// active. Distinct field rather than a `clmm_replay` enum
     /// variant for the same backward-compat reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dlmm_replay: Option<MeteoraDlmmReplayTrace>,
@@ -965,8 +970,9 @@ pub struct AmmReplayTrace {
     pub fee_den: u64,
 }
 
-/// Whirlpool (concentrated-liquidity) replay trace — the analogue of
+/// Concentrated-liquidity (V3-style) replay trace — the analogue of
 /// [`AmmReplayTrace`] for the V3-style swap math added in Tier 3.4.
+/// Used by Whirlpool today and Raydium CLMM in Phase 5.
 ///
 /// Surfaces the per-step sqrt_price / liquidity / tick the replay walked
 /// through, so a reader can reconstruct the swap arithmetic the same way
@@ -979,7 +985,7 @@ pub struct AmmReplayTrace {
 /// Q64.64 sqrt_prices sit around `2^64`, well past that. TS-side parsers
 /// should use `BigInt(...)` to read these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct WhirlpoolReplayTrace {
+pub struct ClmmReplayTrace {
     /// Q64.64 sqrt(price) immediately before the frontrun.
     #[serde(with = "u128_string")]
     #[schemars(with = "String")]
@@ -1034,13 +1040,13 @@ pub struct WhirlpoolReplayTrace {
 }
 
 /// Per-step DLMM (Meteora Liquidity Book) replay trace surfaced on
-/// `SandwichAttack.dlmm_replay`. Mirrors [`WhirlpoolReplayTrace`] in
+/// `SandwichAttack.dlmm_replay`. Mirrors [`ClmmReplayTrace`] in
 /// shape but tracks `active_id` transitions instead of sqrt_price /
 /// liquidity / tick — DLMM's discrete-bin model means a leg's effect
 /// is fully captured by which bin became active.
 ///
 /// `bin_price_pre` is Q64.64; serialised as a base-10 decimal string
-/// per the same JS-BigInt rationale that drove [`WhirlpoolReplayTrace`].
+/// per the same JS-BigInt rationale that drove [`ClmmReplayTrace`].
 /// `active_id` fits in i32 (per the on-chain `MIN_BIN_ID` /
 /// `MAX_BIN_ID = ±443_636` cap), safe in JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1119,7 +1125,7 @@ pub struct MeteoraDlmmReplayTrace {
 /// Serde adapter that serialises a `u128` as a base-10 decimal string
 /// rather than a JSON number, so JS consumers can `BigInt(...)` it
 /// without losing precision past `2^53`. Used by
-/// [`WhirlpoolReplayTrace`] and [`MeteoraDlmmReplayTrace`].
+/// [`ClmmReplayTrace`] and [`MeteoraDlmmReplayTrace`].
 mod u128_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -1369,7 +1375,7 @@ mod evidence_tests {
             net_profit: Some(190),
             evidence: Some(evidence),
             amm_replay: Some(replay),
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
@@ -1462,7 +1468,7 @@ mod vigil_schema_tests {
                 fee_num: 25,
                 fee_den: 10_000,
             }),
-            whirlpool_replay: None,
+            clmm_replay: None,
             dlmm_replay: None,
             attack_signature: None,
             timestamp_ms: None,
@@ -1911,11 +1917,11 @@ mod vigil_schema_tests {
     }
 
     #[test]
-    fn whirlpool_replay_trace_round_trips_with_string_u128_fields() {
+    fn clmm_replay_trace_round_trips_with_string_u128_fields() {
         // u128 fields (sqrt_price, liquidity) serialise as base-10
         // strings. Round-trip pins both directions and the on-the-wire
         // shape Vigil's BE will see.
-        let trace = WhirlpoolReplayTrace {
+        let trace = ClmmReplayTrace {
             sqrt_price_pre: 1u128 << 64,
             sqrt_price_post_front: (1u128 << 64) - 12_345,
             sqrt_price_post_victim: (1u128 << 64) - 23_456,
@@ -1945,29 +1951,29 @@ mod vigil_schema_tests {
             "u128 liquidity should serialise as a base-10 string, got: {json}",
         );
         // Round-trip back.
-        let decoded: WhirlpoolReplayTrace = serde_json::from_str(&json).expect("deserialise");
+        let decoded: ClmmReplayTrace = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(decoded, trace);
     }
 
     #[test]
-    fn sandwich_attack_skips_whirlpool_replay_when_none() {
+    fn sandwich_attack_skips_clmm_replay_when_none() {
         // The new optional field is `skip_serializing_if = "Option::is_none"`
         // — legacy ConstantProduct attacks must round-trip unchanged in
-        // shape (no rogue `whirlpool_replay: null` keys).
+        // shape (no rogue `clmm_replay: null` keys).
         let attack = fresh_attack();
-        assert!(attack.whirlpool_replay.is_none());
+        assert!(attack.clmm_replay.is_none());
         let json = serde_json::to_string(&attack).expect("serialise");
         assert!(
-            !json.contains("whirlpool_replay"),
+            !json.contains("clmm_replay"),
             "skip-on-None should keep the key out of the JSON; got: {json}",
         );
     }
 
     #[test]
-    fn sandwich_attack_emits_whirlpool_replay_when_some() {
+    fn sandwich_attack_emits_clmm_replay_when_some() {
         let mut attack = fresh_attack();
         attack.dex = DexType::OrcaWhirlpool;
-        attack.whirlpool_replay = Some(WhirlpoolReplayTrace {
+        attack.clmm_replay = Some(ClmmReplayTrace {
             sqrt_price_pre: 1u128 << 64,
             sqrt_price_post_front: 1u128 << 63,
             sqrt_price_post_victim: 1u128 << 63,
@@ -1988,8 +1994,8 @@ mod vigil_schema_tests {
         let json = serde_json::to_string(&attack).expect("serialise");
         let value: Value = serde_json::from_str(&json).expect("parse");
         let trace = value
-            .get("whirlpool_replay")
-            .expect("whirlpool_replay key present when Some");
+            .get("clmm_replay")
+            .expect("clmm_replay key present when Some");
         assert_eq!(
             trace["sqrt_price_pre"].as_str(),
             Some("18446744073709551616"),

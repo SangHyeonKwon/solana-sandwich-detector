@@ -180,7 +180,7 @@ When enrichment succeeds, each `SandwichAttack` gets:
 - `attacker_profit` — counterfactual attacker gross profit (differs from `estimated_attacker_profit` when rule-based logic over-attributes)
 - `price_impact_bps` — frontrun-induced price shift in basis points
 - `severity` — bucket from the loss-to-pool-TVL ratio
-- Per-DEX trace: `amm_replay` (constant product), `whirlpool_replay` (Whirlpool), `dlmm_replay` (DLMM) — lets a downstream consumer recompute the loss from raw arithmetic
+- Per-DEX trace: `amm_replay` (constant product), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` (DLMM) — lets a downstream consumer recompute the loss from raw arithmetic
 
 Attacks on unsupported DEXes pass through with these fields set to `None`.
 
