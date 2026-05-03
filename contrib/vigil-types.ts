@@ -213,18 +213,21 @@ export interface AmmReplayTrace {
 }
 
 /**
- * Whirlpool (concentrated-liquidity) replay trace — the analogue of
- * {@link AmmReplayTrace} for the V3-style swap math.
+ * Concentrated-liquidity (V3-style) replay trace — the analogue of
+ * {@link AmmReplayTrace} for the V3-style swap math. Used by Whirlpool
+ * today and Raydium CLMM in Phase 5; both produce this exact shape so
+ * a single type covers both DEXes (the underlying on-chain pool layouts
+ * differ but the math surface — sqrt_price + liquidity + tick — does not).
  *
  * `sqrt_price_*` and `liquidity_*` are **base-10 decimal strings**
  * (`u128` on the wire). JS `number` rounds past `2^53`, but Q64.64
  * sqrt-prices sit at ~`2^64`. Parse with `BigInt(value)` to keep full
  * precision.
  *
- * `tick_current_*` are signed 32-bit integers (Whirlpool tick range
+ * `tick_current_*` are signed 32-bit integers (V3 tick range
  * `[-443_636, 443_636]`); they fit in `number` losslessly.
  */
-export interface WhirlpoolReplayTrace {
+export interface ClmmReplayTrace {
   /** Q64.64 sqrt(price) immediately before the frontrun. */
   sqrt_price_pre: string;
   sqrt_price_post_front: string;
@@ -412,15 +415,19 @@ export interface SandwichAttack {
 
   evidence?: DetectionEvidence | null;
   amm_replay?: AmmReplayTrace | null;
-  /** Whirlpool-specific replay trace — populated only when `dex` is
-   *  `orca_whirlpool` and pool-state enrichment ran successfully.
-   *  Mutually exclusive with `amm_replay`: dispatch by `dex` to pick
-   *  the right view of the swap arithmetic. */
-  whirlpool_replay?: WhirlpoolReplayTrace | null;
+  /** Concentrated-liquidity replay trace — populated when `dex` is
+   *  `orca_whirlpool` or `raydium_clmm` and pool-state enrichment ran
+   *  successfully. Mutually exclusive with `amm_replay`: dispatch by
+   *  `dex` to pick the right view of the swap arithmetic.
+   *
+   *  Renamed from `whirlpool_replay` once Raydium CLMM joined the same
+   *  V3 math path — the trace shape is pool-layout-agnostic, so naming
+   *  it after a single DEX was misleading. */
+  clmm_replay?: ClmmReplayTrace | null;
 
   /** Meteora DLMM-specific replay trace. Populated when `dex` is
    *  `meteora_dlmm` and Phase 2 cross-bin replay ran. Mutually exclusive
-   *  with `whirlpool_replay` and the constant-product `amm_replay`. */
+   *  with `clmm_replay` and the constant-product `amm_replay`. */
   dlmm_replay?: MeteoraDlmmReplayTrace | null;
 
   // -- Vigil v1 — populated by `finalize_for_vigil()` --

@@ -186,11 +186,11 @@
         }
       ]
     },
-    "whirlpool_replay": {
-      "description": "Whirlpool-specific replay trace — populated only when `dex` is `OrcaWhirlpool` and pool-state enrichment ran successfully. Mirrors [`AmmReplayTrace`] in spirit: lets a reader recompute victim loss / attacker profit from the raw concentrated-liquidity arithmetic. Distinct field rather than an enum so the existing `amm_replay` shape stays backward-compatible for ConstantProduct consumers.",
+    "clmm_replay": {
+      "description": "Concentrated-liquidity (V3-style) replay trace — populated when `dex` is `OrcaWhirlpool` or `RaydiumClmm` and pool-state enrichment ran successfully. Mirrors [`AmmReplayTrace`] in spirit: lets a reader recompute victim loss / attacker profit from the raw concentrated-liquidity arithmetic. Distinct field rather than an enum so the existing `amm_replay` shape stays backward-compatible for ConstantProduct consumers.\n\nRenamed from `whirlpool_replay` once Raydium CLMM enrichment joined the same V3 math path — the trace shape (`sqrt_price`, `liquidity`, `tick_current`) is pool-layout-agnostic, so naming it after a single DEX was misleading.",
       "anyOf": [
         {
-          "$ref": "#/definitions/WhirlpoolReplayTrace"
+          "$ref": "#/definitions/ClmmReplayTrace"
         },
         {
           "type": "null"
@@ -198,7 +198,7 @@
       ]
     },
     "dlmm_replay": {
-      "description": "Meteora DLMM-specific replay trace — populated only when `dex` is `MeteoraDlmm` and Phase 2 cross-bin replay ran successfully. Tracks `active_id` transitions instead of Whirlpool's sqrt_price/liquidity/tick triple, since DLMM's discrete-bin model captures a leg's effect entirely in which bin became active. Distinct field rather than a `whirlpool_replay` enum variant for the same backward-compat reason.",
+      "description": "Meteora DLMM-specific replay trace — populated only when `dex` is `MeteoraDlmm` and Phase 2 cross-bin replay ran successfully. Tracks `active_id` transitions instead of the V3-style sqrt_price/liquidity/tick triple, since DLMM's discrete-bin model captures a leg's effect entirely in which bin became active. Distinct field rather than a `clmm_replay` enum variant for the same backward-compat reason.",
       "anyOf": [
         {
           "$ref": "#/definitions/MeteoraDlmmReplayTrace"
@@ -1020,8 +1020,8 @@
         }
       }
     },
-    "WhirlpoolReplayTrace": {
-      "description": "Whirlpool (concentrated-liquidity) replay trace — the analogue of [`AmmReplayTrace`] for the V3-style swap math added in Tier 3.4.\n\nSurfaces the per-step sqrt_price / liquidity / tick the replay walked through, so a reader can reconstruct the swap arithmetic the same way `AmmReplayTrace` lets them re-derive constant-product victim_loss from raw reserves.\n\n`u128` fields (sqrt_price, liquidity) serialise as **base-10 decimal strings** to preserve precision in JSON consumers — JS's `number` is a 53-bit float and would lose information on values past `2^53`. Q64.64 sqrt_prices sit around `2^64`, well past that. TS-side parsers should use `BigInt(...)` to read these.",
+    "ClmmReplayTrace": {
+      "description": "Concentrated-liquidity (V3-style) replay trace — the analogue of [`AmmReplayTrace`] for the V3-style swap math added in Tier 3.4. Used by Whirlpool today and Raydium CLMM in Phase 5.\n\nSurfaces the per-step sqrt_price / liquidity / tick the replay walked through, so a reader can reconstruct the swap arithmetic the same way `AmmReplayTrace` lets them re-derive constant-product victim_loss from raw reserves.\n\n`u128` fields (sqrt_price, liquidity) serialise as **base-10 decimal strings** to preserve precision in JSON consumers — JS's `number` is a 53-bit float and would lose information on values past `2^53`. Q64.64 sqrt_prices sit around `2^64`, well past that. TS-side parsers should use `BigInt(...)` to read these.",
       "type": "object",
       "required": [
         "actual_victim_out",
@@ -1114,7 +1114,7 @@
       }
     },
     "MeteoraDlmmReplayTrace": {
-      "description": "Per-step DLMM (Meteora Liquidity Book) replay trace surfaced on `SandwichAttack.dlmm_replay`. Mirrors [`WhirlpoolReplayTrace`] in shape but tracks `active_id` transitions instead of sqrt_price / liquidity / tick — DLMM's discrete-bin model means a leg's effect is fully captured by which bin became active.\n\n`bin_price_pre` is Q64.64; serialised as a base-10 decimal string per the same JS-BigInt rationale that drove [`WhirlpoolReplayTrace`]. `active_id` fits in i32 (per the on-chain `MIN_BIN_ID` / `MAX_BIN_ID = ±443_636` cap), safe in JSON.",
+      "description": "Per-step DLMM (Meteora Liquidity Book) replay trace surfaced on `SandwichAttack.dlmm_replay`. Mirrors [`ClmmReplayTrace`] in shape but tracks `active_id` transitions instead of sqrt_price / liquidity / tick — DLMM's discrete-bin model means a leg's effect is fully captured by which bin became active.\n\n`bin_price_pre` is Q64.64; serialised as a base-10 decimal string per the same JS-BigInt rationale that drove [`ClmmReplayTrace`]. `active_id` fits in i32 (per the on-chain `MIN_BIN_ID` / `MAX_BIN_ID = ±443_636` cap), safe in JSON.",
       "type": "object",
       "required": [
         "active_id_post_back",

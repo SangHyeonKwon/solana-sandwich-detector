@@ -180,7 +180,7 @@ Enrichment 성공 시 각 `SandwichAttack`은 다음을 갖습니다:
 - `attacker_profit` — 반사실 attacker 총 이익 (rule 기반이 과대 귀속할 때 `estimated_attacker_profit`과 차이 발생)
 - `price_impact_bps` — frontrun이 유발한 가격 변화 (bp)
 - `severity` — loss 대비 pool TVL 비율의 버킷
-- DEX별 trace: `amm_replay`(constant product), `whirlpool_replay`, `dlmm_replay` — 다운스트림 소비자가 raw 산술로 loss를 재계산 가능
+- DEX별 trace: `amm_replay`(constant product), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` — 다운스트림 소비자가 raw 산술로 loss를 재계산 가능
 
 미지원 DEX의 공격은 이 필드들이 `None`인 채로 통과됩니다.
 

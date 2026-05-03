@@ -180,7 +180,7 @@ Cuando el enriquecimiento tiene éxito, cada `SandwichAttack` recibe:
 - `attacker_profit` — ganancia bruta contrafactual del atacante (difiere de `estimated_attacker_profit` cuando la lógica por reglas sobre-atribuye)
 - `price_impact_bps` — desplazamiento de precio inducido por el frontrun (en bps)
 - `severity` — categoría según la razón loss/TVL del pool
-- Trace por DEX: `amm_replay` (producto constante), `whirlpool_replay`, `dlmm_replay` — permite a un consumidor downstream recalcular la pérdida desde la aritmética cruda
+- Trace por DEX: `amm_replay` (producto constante), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` — permite a un consumidor downstream recalcular la pérdida desde la aritmética cruda
 
 Los ataques en DEXes no soportados pasan con estos campos en `None`.
 

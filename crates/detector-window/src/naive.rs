@@ -126,7 +126,7 @@ impl NaiveWindowDetector {
                             price_impact_bps: None,
                             evidence: Some(evidence),
                             amm_replay: None,
-                            whirlpool_replay: None,
+                            clmm_replay: None,
                             dlmm_replay: None,
                             attack_signature: None,
                             timestamp_ms: None,
