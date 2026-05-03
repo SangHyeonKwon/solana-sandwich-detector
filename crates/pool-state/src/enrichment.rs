@@ -251,10 +251,13 @@ pub async fn enrich_attack(
                         pool_0.tick_spacing,
                     ),
                 ),
-                // Unreachable: outer match arm gates this branch to
-                // OrcaWhirlpool | RaydiumClmm. A future kind added to
-                // the V3 group must extend this inner match too.
-                _ => return EnrichmentResult::ReplayFailed,
+                // Outer match already gates this branch to
+                // OrcaWhirlpool | RaydiumClmm. Hitting `_` would mean a
+                // future kind was added to the V3 group without
+                // extending this inner match — the panic surfaces that
+                // bug at the call site instead of silently fetching the
+                // wrong PDAs.
+                _ => unreachable!("V3 dispatch arm only reaches OrcaWhirlpool | RaydiumClmm"),
             };
             let start_indices: [i32; 5] = [
                 center - 2 * span,

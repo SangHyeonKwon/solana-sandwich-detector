@@ -560,6 +560,15 @@ pub mod tick_array {
     /// i128 alignment. Whirlpool's `Tick` carries a `bool` + 15-byte
     /// padding before its own `liquidity_net`; Raydium starts with the
     /// `tick: i32` instead. Same final offset though.
+    ///
+    /// Caveat for future fixture-test work: this offset assumes i128
+    /// has 8-byte alignment under `#[repr(C)]` on Solana's BPF target,
+    /// which matches the Raydium source comment (`// alignment padding
+    /// to 8 — 4 bytes — for next i128`). If a mainnet fixture diff
+    /// surfaces a parser disagreement here, the most likely cause is
+    /// that the on-chain layout actually uses 16-byte i128 alignment —
+    /// in which case `liquidity_net` would land at offset 16 and
+    /// `liquidity_gross` at 32. Adjust both constants together.
     const TICK_OFFSET_LIQUIDITY_NET: usize = 8;
     /// `liquidity_gross` immediately follows `liquidity_net`. Used to
     /// derive `initialised` — Raydium's `TickState` has no explicit
