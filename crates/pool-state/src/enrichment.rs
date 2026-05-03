@@ -321,6 +321,19 @@ pub async fn enrich_attack(
                 .unwrap_or(0);
             (loss, None, None, Some(dlmm_trace), pool_quote_tvl)
         }
+        AmmKind::PumpFun => {
+            // Phase 5 step 1: bonding-curve enrichment scaffolding only.
+            // Replay path needs the Trade-event log parser (step 2) and
+            // virtual-reserves wiring (step 3); until then we land here
+            // and short-circuit.
+            //
+            // `pool_config` for Pump.fun has no fetcher implementation
+            // today either, so in practice the early `ConfigUnavailable`
+            // return upstream catches it first — this arm is the
+            // type-system completeness backstop for when the fetcher
+            // lands without the replay being ready.
+            return EnrichmentResult::ReplayFailed;
+        }
     };
 
     attack.victim_loss_lamports = Some(loss.victim_loss);
