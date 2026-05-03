@@ -19,9 +19,7 @@ use crate::jupiter_v6;
 use crate::lookup::{AmmKind, DynamicPoolState, PoolConfig};
 use crate::meteora_dlmm::bin_array::{bin_id_to_bin_array_index, ParsedBinArray};
 use crate::meteora_dlmm::DlmmPool;
-use crate::orca_whirlpool::tick_array::{
-    start_tick_index_for, ticks_per_array_span, ParsedTickArray,
-};
+use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::pump_fun;
 use crate::{
     compute_loss_dlmm_with_trace, compute_loss_whirlpool_with_trace, compute_loss_with_trace,
@@ -192,14 +190,14 @@ pub async fn enrich_attack(
             // parser can't recover from logs. ReplayFailed when the
             // lookup can't serve it (RPC error, unsupported provider).
             //
-            // TickArray fetcher is Whirlpool-only today
-            // (`RpcPoolLookup::tick_arrays` short-circuits any non-
-            // Whirlpool DEX to empty), so Raydium CLMM stays on the
-            // within-tick path. Cross-tick legs surface as
-            // `CrossBoundaryUnsupported` rather than ReplayFailed —
-            // metric-bucket parity with how Whirlpool handles its own
-            // cross-tick exhaustion. A future Raydium CLMM TickArray
-            // parser lifts that limitation.
+            // TickArray fetcher handles both Whirlpool (88-tick) and
+            // Raydium CLMM (60-tick) accounts — `RpcPoolLookup::tick_arrays`
+            // dispatches on `attack.dex` to pick the right PDA seed
+            // encoding and `TickArrayState` parser. Lookups that don't
+            // speak the protocol (`NoPoolLookup`, partial mocks)
+            // return `Vec::new()` and the per-leg fallback drops back
+            // to within-tick — `CrossBoundaryUnsupported` then fires
+            // only when *both* paths fail.
             let Some(state) = lookup
                 .pool_dynamic_state(&effective_pool, effective_dex, attack.slot)
                 .await
@@ -233,13 +231,31 @@ pub async fn enrich_attack(
             // and falls back to `cross_tick_swap` when the within-tick
             // fast path can't resolve a leg.
             //
-            // Implementations that don't speak the TickArray protocol
-            // (`NoPoolLookup`, partial mocks) return `Vec::new()` here;
-            // the per-leg fallback then sees no arrays and stays on the
-            // within-tick path — `CrossBoundaryUnsupported` fires only when
-            // *both* paths fail.
-            let span = ticks_per_array_span(pool_0.tick_spacing);
-            let center = start_tick_index_for(pool_0.tick_current_index, pool_0.tick_spacing);
+            // Per-dex span: Whirlpool packs 88 ticks per array, Raydium
+            // CLMM packs 60. Hardcoding either size on this side would
+            // mis-align the start_indices against the on-chain PDA grid
+            // for the other DEX, so each variant picks its own
+            // `ticks_per_array_span` / `start_tick_index_for` helper.
+            let (span, center) = match config.kind {
+                AmmKind::OrcaWhirlpool => (
+                    crate::orca_whirlpool::tick_array::ticks_per_array_span(pool_0.tick_spacing),
+                    crate::orca_whirlpool::tick_array::start_tick_index_for(
+                        pool_0.tick_current_index,
+                        pool_0.tick_spacing,
+                    ),
+                ),
+                AmmKind::RaydiumClmm => (
+                    crate::raydium_clmm::tick_array::ticks_per_array_span(pool_0.tick_spacing),
+                    crate::raydium_clmm::tick_array::start_tick_index_for(
+                        pool_0.tick_current_index,
+                        pool_0.tick_spacing,
+                    ),
+                ),
+                // Unreachable: outer match arm gates this branch to
+                // OrcaWhirlpool | RaydiumClmm. A future kind added to
+                // the V3 group must extend this inner match too.
+                _ => return EnrichmentResult::ReplayFailed,
+            };
             let start_indices: [i32; 5] = [
                 center - 2 * span,
                 center - span,

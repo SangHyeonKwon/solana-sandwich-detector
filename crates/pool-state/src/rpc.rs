@@ -301,13 +301,18 @@ impl PoolStateLookup for RpcPoolLookup {
         }
     }
 
-    /// Fetch one or more Whirlpool TickArray accounts via the
-    /// configured [`AccountFetcher`]. PDA is derived per-slot from
-    /// `(pool, start_tick_index)`; missing accounts (slot
-    /// uninitialised on-chain or fetcher dropped them) come back as
-    /// `None` at the matching index. A whole-call fetch failure fills
-    /// the result with `None`s of the right length so callers can
-    /// still match `start_indices` slot-by-slot.
+    /// Fetch one or more TickArray accounts via the configured
+    /// [`AccountFetcher`]. Handles both Whirlpool and Raydium CLMM —
+    /// the PDA seed encoding and `TickArrayState` layout differ between
+    /// the two, so this method dispatches on `dex` to pick the right
+    /// derivation + parser. Other DEXes return an empty `Vec` (the
+    /// "not supported" signal callers fall back on).
+    ///
+    /// PDAs are derived per-slot from `(pool, start_tick_index)`;
+    /// missing accounts (slot uninitialised on-chain or fetcher dropped
+    /// them) come back as `None` at the matching index. A whole-call
+    /// fetch failure fills the result with `None`s of the right length
+    /// so callers can still match `start_indices` slot-by-slot.
     ///
     /// Not cached — TickArray contents change every swap that crosses
     /// or initialises a tick within the array. A stale snapshot would
@@ -319,7 +324,9 @@ impl PoolStateLookup for RpcPoolLookup {
         start_indices: &[i32],
         slot: u64,
     ) -> Vec<Option<ParsedTickArray>> {
-        if !matches!(dex, DexType::OrcaWhirlpool) || start_indices.is_empty() {
+        if !matches!(dex, DexType::OrcaWhirlpool | DexType::RaydiumClmm)
+            || start_indices.is_empty()
+        {
             return Vec::new();
         }
         let pool_pubkey = match pool.parse::<Pubkey>() {
@@ -331,7 +338,18 @@ impl PoolStateLookup for RpcPoolLookup {
         };
         let pdas: Vec<Pubkey> = start_indices
             .iter()
-            .map(|&start| orca_whirlpool::tick_array::tick_array_pda(&pool_pubkey, start).0)
+            .map(|&start| match dex {
+                DexType::OrcaWhirlpool => {
+                    orca_whirlpool::tick_array::tick_array_pda(&pool_pubkey, start).0
+                }
+                DexType::RaydiumClmm => {
+                    raydium_clmm::tick_array::tick_array_pda(&pool_pubkey, start).0
+                }
+                // Unreachable: the outer guard already filtered to
+                // V3-shaped dexes. A future kind added to the V3 group
+                // must extend this match too.
+                _ => unreachable!(),
+            })
             .collect();
         let accounts = self.fetcher.fetch_multiple_accounts(&pdas, slot).await;
         // Defensive: a misbehaving custom fetcher could return a
@@ -348,7 +366,17 @@ impl PoolStateLookup for RpcPoolLookup {
         }
         accounts
             .into_iter()
-            .map(|opt| opt.and_then(|a| orca_whirlpool::tick_array::parse_tick_array(&a.data)))
+            .map(|opt| {
+                opt.and_then(|a| match dex {
+                    DexType::OrcaWhirlpool => {
+                        orca_whirlpool::tick_array::parse_tick_array(&a.data)
+                    }
+                    DexType::RaydiumClmm => {
+                        raydium_clmm::tick_array::parse_tick_array(&a.data)
+                    }
+                    _ => unreachable!(),
+                })
+            })
             .collect()
     }
 
@@ -643,6 +671,70 @@ mod tests {
             result.len(),
             starts.len(),
             "result vec must align 1:1 with start_indices",
+        );
+    }
+
+    /// Same shape as `tick_arrays_forwards_slot_per_pda` but for Raydium
+    /// CLMM. Critically, the fetched PDAs must be derived with
+    /// `raydium_clmm::tick_array::tick_array_pda` (BE-bytes seed, Raydium
+    /// program id) — *not* Whirlpool's. Pin that by computing the
+    /// expected Raydium PDA per start_index and asserting bytewise
+    /// equality with the fetcher's call log; a regression that left
+    /// the Whirlpool PDA in place would silently fetch from the wrong
+    /// program-derived address and parse latest-confirmed Whirlpool
+    /// account data through the Raydium parser (likely None, but the
+    /// failure surfaces here, not in production).
+    #[tokio::test]
+    async fn tick_arrays_uses_raydium_pda_when_dex_is_raydium_clmm() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let pool = Pubkey::new_unique();
+        // 60 ticks per Raydium array × 64 spacing = 3840 span; pick
+        // start_indices that look like a real center±2 window.
+        let starts = [-7_680i32, -3_840, 0, 3_840, 7_680];
+        let result = lookup
+            .tick_arrays(&pool.to_string(), DexType::RaydiumClmm, &starts, 88_888)
+            .await;
+        let calls = fetcher.calls();
+        assert_eq!(calls.len(), starts.len(), "one fetch entry per start_index");
+        for (i, &start) in starts.iter().enumerate() {
+            let expected = crate::raydium_clmm::tick_array::tick_array_pda(&pool, start).0;
+            assert_eq!(calls[i].0, expected, "PDA must be Raydium-derived for slot {}", start);
+            assert_eq!(calls[i].1, 88_888, "slot must propagate to every PDA");
+            // Raydium's PDA must NOT collide with the Whirlpool PDA
+            // for the same (pool, start). They use different program
+            // ids and seed encodings, so collision would mean both
+            // helpers were derived from the same program/seeds — a
+            // regression that would silently fetch the wrong account.
+            let whirl = crate::orca_whirlpool::tick_array::tick_array_pda(&pool, start).0;
+            assert_ne!(expected, whirl, "Raydium and Whirlpool PDAs must differ");
+        }
+        assert_eq!(result.len(), starts.len(), "result vec aligns 1:1");
+    }
+
+    /// DEX outside the V3 group (`OrcaWhirlpool | RaydiumClmm`) short-
+    /// circuits to an empty `Vec` — no fetcher call wasted on AMMs that
+    /// don't speak the TickArray protocol. Pin so a future kind added
+    /// to the V3 dispatch arm without a parser doesn't silently issue
+    /// useless RPCs.
+    #[tokio::test]
+    async fn tick_arrays_skips_fetcher_for_non_v3_dex() {
+        let fetcher = Arc::new(RecordingFetcher::new());
+        let lookup = RpcPoolLookup::with_account_fetcher(
+            "http://127.0.0.1:1",
+            fetcher.clone() as Arc<dyn AccountFetcher>,
+        );
+        let pool = Pubkey::new_unique();
+        let result = lookup
+            .tick_arrays(&pool.to_string(), DexType::RaydiumV4, &[0, 5_632], 12_345)
+            .await;
+        assert!(result.is_empty(), "non-V3 dex should short-circuit to empty");
+        assert!(
+            fetcher.calls().is_empty(),
+            "fetcher should not be called for unsupported dex",
         );
     }
 
