@@ -25,7 +25,7 @@ use crate::lookup::{DynamicPoolState, PoolConfig, PoolStateLookup, SlotLeaderLoo
 use crate::meteora_dlmm::bin_array::ParsedBinArray;
 use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::spl_mint::{self, MintInfo};
-use crate::{meteora_dlmm, orca_whirlpool, raydium_cpmm, raydium_v4};
+use crate::{meteora_dlmm, orca_whirlpool, raydium_clmm, raydium_cpmm, raydium_v4};
 
 /// Slot-aware account-fetch surface for archival providers.
 ///
@@ -183,8 +183,40 @@ impl RpcPoolLookup {
             DexType::RaydiumCpmm => raydium_cpmm::parse_config(pool, &account.data),
             DexType::OrcaWhirlpool => orca_whirlpool::parse_config(pool, &account.data),
             DexType::MeteoraDlmm => meteora_dlmm::parse_config(pool, &account.data),
+            DexType::RaydiumClmm => self.fetch_raydium_clmm_config(pool, &account.data).await,
             _ => None,
         }
+    }
+
+    /// Two-step config fetch unique to Raydium CLMM: the pool's `PoolState`
+    /// account points at a shared `AmmConfig` (one config per
+    /// tick-spacing tier, many pools share each), and the trade-fee
+    /// numerator we need lives on that second account. Whirlpool
+    /// inlines `fee_rate` directly so its single-fetch path stays
+    /// outside this branch.
+    ///
+    /// `pool_state_data` is the `PoolState` blob the caller already
+    /// fetched; we extract the `amm_config` pubkey from it, fetch
+    /// the config blob, and hand both to the parsing layer.
+    async fn fetch_raydium_clmm_config(
+        &self,
+        pool: &str,
+        pool_state_data: &[u8],
+    ) -> Option<PoolConfig> {
+        let amm_config_pubkey = raydium_clmm::parse_amm_config_pubkey(pool_state_data)?;
+        let amm_config_account = match self.client.get_account(&amm_config_pubkey).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    pool,
+                    amm_config = %amm_config_pubkey,
+                    error = %e,
+                    "raydium clmm amm_config account fetch failed",
+                );
+                return None;
+            }
+        };
+        raydium_clmm::parse_config(pool, pool_state_data, &amm_config_account.data)
     }
 }
 
@@ -247,6 +279,23 @@ impl PoolStateLookup for RpcPoolLookup {
                 let account = self.fetcher.fetch_account(&pubkey, slot).await?;
                 let dlmm_pool = meteora_dlmm::parse_pool_state(&account.data)?;
                 Some(DynamicPoolState::Dlmm(dlmm_pool))
+            }
+            DexType::RaydiumClmm => {
+                // Raydium CLMM produces the same V3-style sqrt_price /
+                // liquidity / tick state as Whirlpool, so it returns
+                // through the `Whirlpool` variant of `DynamicPoolState`.
+                // Variant naming is a layout-agnostic carrier — the
+                // dispatch in `enrich_attack` treats either DEX as a
+                // V3 source for the same `compute_loss_whirlpool_with_trace`
+                // replay path.
+                let account = self.fetcher.fetch_account(&pubkey, slot).await?;
+                let pool_state = raydium_clmm::parse_pool_state(&account.data)?;
+                Some(DynamicPoolState::Whirlpool {
+                    sqrt_price_q64: pool_state.sqrt_price_q64,
+                    liquidity: pool_state.liquidity,
+                    tick_current_index: pool_state.tick_current_index,
+                    tick_spacing: pool_state.tick_spacing,
+                })
             }
             _ => None,
         }

@@ -143,11 +143,25 @@ pub async fn enrich_attack(
             };
             (loss, Some(trace), None, None, tx_reserves.pre.1)
         }
-        AmmKind::OrcaWhirlpool => {
-            // Within-tick Whirlpool replay (Tier 3.4 step 4-α). Needs
-            // slot-anchored dynamic state — sqrt_price / liquidity / tick —
-            // that the parser can't recover from logs. ReplayFailed when
-            // the lookup can't serve it (RPC error, unsupported provider).
+        AmmKind::OrcaWhirlpool | AmmKind::RaydiumClmm => {
+            // V3-style replay (Tier 3.4 step 4-α). Whirlpool and
+            // Raydium CLMM share the swap-math surface (sqrt_price +
+            // liquidity + tick walked through TickArrays); the dynamic
+            // state for both arrives via `pool_dynamic_state` in the
+            // `DynamicPoolState::Whirlpool` carrier variant (named for
+            // its first user, but layout-agnostic). Needs slot-anchored
+            // dynamic state — sqrt_price / liquidity / tick — that the
+            // parser can't recover from logs. ReplayFailed when the
+            // lookup can't serve it (RPC error, unsupported provider).
+            //
+            // TickArray fetcher is Whirlpool-only today
+            // (`RpcPoolLookup::tick_arrays` short-circuits any non-
+            // Whirlpool DEX to empty), so Raydium CLMM stays on the
+            // within-tick path. Cross-tick legs surface as
+            // `CrossBoundaryUnsupported` rather than ReplayFailed —
+            // metric-bucket parity with how Whirlpool handles its own
+            // cross-tick exhaustion. A future Raydium CLMM TickArray
+            // parser lifts that limitation.
             let Some(state) = lookup
                 .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
                 .await
@@ -427,20 +441,6 @@ pub async fn enrich_attack(
             // path uses for vault-based AMMs.
             let pool_quote_tvl = pre_virtual_sol;
             (loss, Some(trace), None, None, pool_quote_tvl)
-        }
-        AmmKind::RaydiumClmm => {
-            // Phase 5 step 1 (CLMM series): variant exists so dispatch
-            // reaches this arm; the actual replay (PoolState parser →
-            // dynamic state → 5-array TickArray window →
-            // `compute_loss_whirlpool_with_trace`) lands in subsequent
-            // steps.
-            //
-            // `RpcPoolLookup::pool_config` has no Raydium CLMM branch
-            // today either, so the upstream `ConfigUnavailable` early
-            // return catches Raydium CLMM first in practice — this arm
-            // is the type-system completeness backstop for when the
-            // fetcher lands without the replay being ready.
-            return EnrichmentResult::ReplayFailed;
         }
     };
 
