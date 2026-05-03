@@ -42,13 +42,26 @@ pub enum AmmKind {
     /// dispatch reaches the CLMM arm; pool-config / dynamic-state
     /// parsers + the actual replay wiring land in subsequent steps.
     RaydiumClmm,
+    /// Jupiter aggregator V6 — *not* an AMM itself. Jupiter routes a
+    /// user's swap through one or more underlying pools (Raydium V4 /
+    /// CPMM, Whirlpool, DLMM, Pump.fun, Raydium CLMM) and the
+    /// resulting sandwich attack is mathematically a sandwich on the
+    /// underlying pool, not on Jupiter. Enrichment for this variant
+    /// extracts the underlying-DEX dispatch from the Jupiter swap's
+    /// inner instructions and recurses through the existing replay
+    /// paths. Phase 5 step 1: variant exists so dispatch reaches the
+    /// Jupiter arm; route extraction + dispatch land in steps 2-3.
+    /// Multi-hop routes are out of scope for the first cut and
+    /// short-circuit to a recognisable metric bucket (likely
+    /// `CrossBoundaryUnsupported` or a new variant).
+    JupiterV6,
 }
 
 impl AmmKind {
     /// Map a [`DexType`] to an AMM kind this crate can recognise. Returns
     /// `None` for DEXes we have neither config parsing nor replay for
-    /// (Phoenix, Jupiter today; Pump.fun and Raydium CLMM moved under
-    /// supported in Phase 5).
+    /// (Phoenix today; Pump.fun, Raydium CLMM, and Jupiter V6 moved
+    /// under supported in Phase 5).
     pub fn from_dex(dex: DexType) -> Option<Self> {
         match dex {
             DexType::RaydiumV4 => Some(AmmKind::RaydiumV4),
@@ -57,6 +70,7 @@ impl AmmKind {
             DexType::MeteoraDlmm => Some(AmmKind::MeteoraDlmm),
             DexType::PumpFun => Some(AmmKind::PumpFun),
             DexType::RaydiumClmm => Some(AmmKind::RaydiumClmm),
+            DexType::JupiterV6 => Some(AmmKind::JupiterV6),
             _ => None,
         }
     }
@@ -326,13 +340,23 @@ mod tests {
         );
     }
 
-    /// Companion to the above: DEXes still in the unsupported set
-    /// (Phoenix, Jupiter as of Phase 5 step 2) keep returning `None`.
-    /// When their replay lands, move them out of this assertion one
-    /// at a time.
+    /// Jupiter V6 moved out of the unsupported set in Phase 5 step 3.
+    /// Note Jupiter is a router, not an AMM — `Some(JupiterV6)` here
+    /// means "dispatch reaches the route-extraction layer", not "we
+    /// know how to replay a Jupiter swap directly".
     #[test]
-    fn from_dex_still_rejects_phoenix_and_jupiter() {
+    fn from_dex_recognises_jupiter_v6() {
+        assert_eq!(
+            AmmKind::from_dex(DexType::JupiterV6),
+            Some(AmmKind::JupiterV6)
+        );
+    }
+
+    /// Companion to the above: Phoenix is the last DEX in the
+    /// unsupported set as of Phase 5 step 3. Move it out of this
+    /// assertion when its replay (orderbook-style) lands.
+    #[test]
+    fn from_dex_still_rejects_phoenix() {
         assert_eq!(AmmKind::from_dex(DexType::Phoenix), None);
-        assert_eq!(AmmKind::from_dex(DexType::JupiterV6), None);
     }
 }

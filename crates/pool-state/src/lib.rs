@@ -19,6 +19,7 @@ pub mod counterfactual;
 pub mod diff_test;
 pub mod enrichment;
 pub mod fixed_point;
+pub mod jupiter_v6;
 pub mod lookup;
 pub mod meteora_dlmm;
 pub mod orca_whirlpool;
