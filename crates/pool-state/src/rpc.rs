@@ -344,10 +344,12 @@ impl PoolStateLookup for RpcPoolLookup {
                 DexType::RaydiumClmm => {
                     raydium_clmm::tick_array::tick_array_pda(&pool_pubkey, start).0
                 }
-                // Unreachable: the outer guard already filtered to
-                // V3-shaped dexes. A future kind added to the V3 group
-                // must extend this match too.
-                _ => unreachable!(),
+                // Outer guard already filtered to V3 dexes. A future
+                // kind added to the V3 group without extending this
+                // match would land here — panicking surfaces the bug
+                // at the call site instead of silently fetching the
+                // wrong PDAs.
+                _ => unreachable!("tick_arrays PDA dispatch only reaches V3 dexes"),
             })
             .collect();
         let accounts = self.fetcher.fetch_multiple_accounts(&pdas, slot).await;
@@ -369,7 +371,9 @@ impl PoolStateLookup for RpcPoolLookup {
                 opt.and_then(|a| match dex {
                     DexType::OrcaWhirlpool => orca_whirlpool::tick_array::parse_tick_array(&a.data),
                     DexType::RaydiumClmm => raydium_clmm::tick_array::parse_tick_array(&a.data),
-                    _ => unreachable!(),
+                    // Same invariant as the PDA dispatch above — the
+                    // outer guard ensures only V3 dexes reach here.
+                    _ => unreachable!("tick_arrays parse dispatch only reaches V3 dexes"),
                 })
             })
             .collect()
