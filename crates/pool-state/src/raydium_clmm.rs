@@ -107,8 +107,8 @@ const FEE_RATE_DEN: u64 = 1_000_000;
 /// distort price-impact math if we ever land here in production.
 const DEFAULT_TRADE_FEE_RATE: u64 = 3_000;
 
-/// Raydium CLMM program ID on Solana mainnet. Used by the (yet-to-land)
-/// TickArray fetch path to derive PDAs.
+/// Raydium CLMM program ID on Solana mainnet. Used by the
+/// [`tick_array`] submodule to derive `TickArrayState` account PDAs.
 pub fn raydium_clmm_program_id() -> Pubkey {
     Pubkey::from_str("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK")
         .expect("raydium clmm program id is a hardcoded valid base58 pubkey")
@@ -517,5 +517,283 @@ mod tests {
         write_pubkey_str(&mut buf, 0, USDC);
         let parsed = read_pubkey(&buf, 0).unwrap();
         assert_eq!(parsed.to_string(), USDC);
+    }
+}
+
+/// `TickArrayState` account parsing + PDA derivation for the cross-tick
+/// replay path. Mirrors [`crate::orca_whirlpool::tick_array`] in shape
+/// (so `compute_loss_whirlpool_with_trace` consumes either DEX through
+/// the same [`crate::orca_whirlpool::tick_array::ParsedTickArray`]
+/// carrier) but diverges on three points:
+///
+///   * `TICK_ARRAY_SIZE = 60` (Whirlpool: 88).
+///   * `TickState` is 168 bytes (Whirlpool's `Tick` is 128) and lacks an
+///     explicit `initialised: bool` — we derive it from
+///     `liquidity_gross != 0`, mirroring Raydium's own SDK.
+///   * PDA seeds use `start_tick_index.to_be_bytes()` (raw 4-byte i32
+///     big-endian); Whirlpool uses the decimal ASCII string. The
+///     program ID also differs — see [`raydium_clmm_program_id`].
+///
+/// Reference:
+///   <https://github.com/raydium-io/raydium-clmm/blob/master/programs/amm/src/states/tick_array.rs>
+pub mod tick_array {
+    use solana_sdk::pubkey::Pubkey;
+
+    use crate::orca_whirlpool::tick_array::{ParsedTickArray, TickData};
+
+    /// Number of ticks per `TickArrayState` account. Raydium-specific —
+    /// Whirlpool's TickArray packs 88.
+    pub const TICK_ARRAY_SIZE: usize = 60;
+
+    const DISCRIMINATOR_LEN: usize = 8;
+    const POOL_ID_LEN: usize = 32;
+    /// On-chain `TickState` size with `#[repr(C)]` padding. 168 bytes
+    /// covers `tick: i32` + 4 bytes alignment padding for the next
+    /// i128, plus `liquidity_net: i128`, `liquidity_gross: u128`,
+    /// `fee_growth_outside_{0,1}_x64: u128`, `reward_growths_outside_x64:
+    /// [u128; 3]`, and trailing padding bytes — the LP-accounting
+    /// fields after `liquidity_gross` aren't read here.
+    const TICK_LEN: usize = 168;
+
+    /// Within a `TickState`, `liquidity_net` sits at offset 8 — after
+    /// the 4-byte `tick` field plus 4 bytes of `#[repr(C)]` padding for
+    /// i128 alignment. Whirlpool's `Tick` carries a `bool` + 15-byte
+    /// padding before its own `liquidity_net`; Raydium starts with the
+    /// `tick: i32` instead. Same final offset though.
+    const TICK_OFFSET_LIQUIDITY_NET: usize = 8;
+    /// `liquidity_gross` immediately follows `liquidity_net`. Used to
+    /// derive `initialised` — Raydium's `TickState` has no explicit
+    /// boolean (the official SDK treats `liquidity_gross != 0` as the
+    /// initialised condition; ticks with no LP boundary have zero gross
+    /// liquidity by construction).
+    const TICK_OFFSET_LIQUIDITY_GROSS: usize = 24;
+
+    const OFFSET_START_TICK: usize = DISCRIMINATOR_LEN + POOL_ID_LEN; // 40
+    const OFFSET_TICKS: usize = OFFSET_START_TICK + 4; // 44
+
+    /// Minimum account-data length covering every tick we read. The
+    /// trailing `initialized_tick_count: u8`, `recent_epoch: u64`, and
+    /// 107-byte padding are intentionally skipped — none feed the
+    /// cross-tick walk.
+    pub const MIN_LAYOUT_LEN: usize = OFFSET_TICKS + TICK_LEN * TICK_ARRAY_SIZE;
+
+    /// Parse a Raydium CLMM `TickArrayState` account blob into a
+    /// [`ParsedTickArray`] (Whirlpool-shaped — the V3 swap-math layer
+    /// only cares about `start_tick_index`, `tick_index_at`, and
+    /// per-slot `(initialised, liquidity_net)`). Returns `None` for
+    /// blobs shorter than [`MIN_LAYOUT_LEN`].
+    ///
+    /// `liquidity_gross != 0` derives the `initialised` flag — Raydium
+    /// doesn't carry one explicitly, but a tick with no LP boundary has
+    /// zero gross liquidity by construction. The walker correctly skips
+    /// such slots via the same path Whirlpool uses for explicit
+    /// `initialised: false`.
+    pub fn parse_tick_array(data: &[u8]) -> Option<ParsedTickArray> {
+        if data.len() < MIN_LAYOUT_LEN {
+            return None;
+        }
+        let start_tick_index = read_i32(data, OFFSET_START_TICK)?;
+        let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
+        for (i, slot) in ticks.iter_mut().enumerate() {
+            let tick_offset = OFFSET_TICKS + i * TICK_LEN;
+            let liquidity_net = read_i128(data, tick_offset + TICK_OFFSET_LIQUIDITY_NET)?;
+            let liquidity_gross = read_u128(data, tick_offset + TICK_OFFSET_LIQUIDITY_GROSS)?;
+            *slot = TickData {
+                initialised: liquidity_gross != 0,
+                liquidity_net,
+            };
+        }
+        Some(ParsedTickArray {
+            start_tick_index,
+            ticks,
+        })
+    }
+
+    /// Tick span (in ticks) one Raydium TickArray account covers, given
+    /// the parent pool's `tick_spacing`. Always
+    /// [`TICK_ARRAY_SIZE`]` * tick_spacing` — diverges from Whirlpool's
+    /// 88-based span, so callers that mix DEXes must pick the right
+    /// helper per-attack.
+    pub fn ticks_per_array_span(tick_spacing: u16) -> i32 {
+        (tick_spacing as i32) * (TICK_ARRAY_SIZE as i32)
+    }
+
+    /// `start_tick_index` of the Raydium TickArray that contains
+    /// `tick_current`. Floors negative ticks toward `-∞` (Rust's `/`
+    /// would round toward zero, landing in the array *above* a negative
+    /// tick).
+    pub fn start_tick_index_for(tick_current: i32, tick_spacing: u16) -> i32 {
+        crate::orca_whirlpool::floor_to_spacing(
+            tick_current,
+            ticks_per_array_span(tick_spacing),
+        )
+    }
+
+    /// Raydium CLMM TickArray PDA. Seeds:
+    /// `[b"tick_array", pool, start_tick_index_be_bytes]`.
+    /// Returned tuple is `(pda, bump)` from
+    /// [`Pubkey::find_program_address`].
+    ///
+    /// The third seed is the *raw 4-byte big-endian* representation of
+    /// `start_tick_index` — not the decimal ASCII Whirlpool uses.
+    /// Mirroring Raydium's own derivation is the only thing that makes
+    /// the PDA match the on-chain account.
+    pub fn tick_array_pda(pool: &Pubkey, start_tick_index: i32) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[
+                b"tick_array",
+                pool.as_ref(),
+                &start_tick_index.to_be_bytes(),
+            ],
+            &super::raydium_clmm_program_id(),
+        )
+    }
+
+    fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
+        let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+        Some(i32::from_le_bytes(bytes))
+    }
+
+    fn read_i128(data: &[u8], offset: usize) -> Option<i128> {
+        let bytes: [u8; 16] = data.get(offset..offset + 16)?.try_into().ok()?;
+        Some(i128::from_le_bytes(bytes))
+    }
+
+    fn read_u128(data: &[u8], offset: usize) -> Option<u128> {
+        let bytes: [u8; 16] = data.get(offset..offset + 16)?.try_into().ok()?;
+        Some(u128::from_le_bytes(bytes))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Build a synthetic Raydium TickArray blob with sparse
+        /// `(slot, liquidity_net, liquidity_gross)` overrides. Slots
+        /// not listed have zero gross + zero net (parse as
+        /// uninitialised).
+        fn make_blob(
+            start_tick_index: i32,
+            overrides: &[(usize, i128, u128)],
+        ) -> Vec<u8> {
+            let mut data = vec![0u8; MIN_LAYOUT_LEN];
+            data[OFFSET_START_TICK..OFFSET_START_TICK + 4]
+                .copy_from_slice(&start_tick_index.to_le_bytes());
+            for (i, liquidity_net, liquidity_gross) in overrides {
+                let tick_offset = OFFSET_TICKS + i * TICK_LEN;
+                data[tick_offset + TICK_OFFSET_LIQUIDITY_NET
+                    ..tick_offset + TICK_OFFSET_LIQUIDITY_NET + 16]
+                    .copy_from_slice(&liquidity_net.to_le_bytes());
+                data[tick_offset + TICK_OFFSET_LIQUIDITY_GROSS
+                    ..tick_offset + TICK_OFFSET_LIQUIDITY_GROSS + 16]
+                    .copy_from_slice(&liquidity_gross.to_le_bytes());
+            }
+            data
+        }
+
+        #[test]
+        fn parse_extracts_start_tick_and_initialised_ticks() {
+            let blob = make_blob(
+                -3840, // 60 * 64 negation — plausible negative-region start.
+                &[
+                    (5, 1_000_000_000, 1_000_000_000),
+                    (44, -500_000_000, 700_000_000),
+                ],
+            );
+            let p = parse_tick_array(&blob).unwrap();
+            assert_eq!(p.start_tick_index, -3840);
+            assert_eq!(p.ticks.len(), TICK_ARRAY_SIZE);
+            assert!(p.ticks[5].initialised);
+            assert_eq!(p.ticks[5].liquidity_net, 1_000_000_000);
+            assert!(p.ticks[44].initialised);
+            assert_eq!(p.ticks[44].liquidity_net, -500_000_000);
+            // Untouched slots: zero gross ⇒ uninitialised.
+            assert!(!p.ticks[0].initialised);
+            assert_eq!(p.ticks[0].liquidity_net, 0);
+            assert!(!p.ticks[59].initialised);
+        }
+
+        #[test]
+        fn liquidity_gross_zero_means_uninitialised_even_with_nonzero_net() {
+            // Defensive: liquidity_gross is the source of truth for
+            // initialised. A malformed account with zero gross but
+            // nonzero net must NOT be treated as initialised — applying
+            // its liquidity_net delta would corrupt active liquidity.
+            // Raydium's writers can't produce this state, so the case
+            // covers data corruption / fixture mistakes only.
+            let blob = make_blob(0, &[(10, 12_345, 0)]);
+            let p = parse_tick_array(&blob).unwrap();
+            assert!(!p.ticks[10].initialised);
+        }
+
+        #[test]
+        fn parse_rejects_short_blob() {
+            assert!(parse_tick_array(&[0u8; 100]).is_none());
+            assert!(parse_tick_array(&vec![0u8; MIN_LAYOUT_LEN - 1]).is_none());
+            assert!(parse_tick_array(&vec![0u8; MIN_LAYOUT_LEN]).is_some());
+        }
+
+        #[test]
+        fn liquidity_net_round_trips_signed_extremes() {
+            let blob = make_blob(
+                0,
+                &[(0, i128::MAX, 1), (1, i128::MIN, 1), (2, -1, 1)],
+            );
+            let p = parse_tick_array(&blob).unwrap();
+            assert_eq!(p.ticks[0].liquidity_net, i128::MAX);
+            assert_eq!(p.ticks[1].liquidity_net, i128::MIN);
+            assert_eq!(p.ticks[2].liquidity_net, -1);
+        }
+
+        #[test]
+        fn ticks_per_array_span_uses_60_not_88() {
+            // Raydium's TICK_ARRAY_SIZE differs from Whirlpool's. Pin
+            // the divergence so a copy-paste regression to Whirlpool's
+            // 88-tick math fails immediately.
+            assert_eq!(ticks_per_array_span(1), 60);
+            assert_eq!(ticks_per_array_span(64), 60 * 64);
+            assert_eq!(ticks_per_array_span(128), 60 * 128);
+        }
+
+        #[test]
+        fn start_tick_index_for_handles_positives_zero_and_negatives() {
+            // tick_spacing=64 ⇒ array span = 60 * 64 = 3840.
+            assert_eq!(start_tick_index_for(0, 64), 0);
+            assert_eq!(start_tick_index_for(3839, 64), 0);
+            assert_eq!(start_tick_index_for(3840, 64), 3840);
+            // Negatives: floor toward -∞.
+            assert_eq!(start_tick_index_for(-1, 64), -3840);
+            assert_eq!(start_tick_index_for(-3840, 64), -3840);
+            assert_eq!(start_tick_index_for(-3841, 64), -7680);
+        }
+
+        #[test]
+        fn tick_array_pda_is_deterministic_and_distinguishes_inputs() {
+            let pool = Pubkey::new_unique();
+            let (pda1, bump1) = tick_array_pda(&pool, 3840);
+            let (pda2, bump2) = tick_array_pda(&pool, 3840);
+            assert_eq!(pda1, pda2);
+            assert_eq!(bump1, bump2);
+            // Different start_tick_index ⇒ different PDA.
+            let (pda_other, _) = tick_array_pda(&pool, 0);
+            assert_ne!(pda1, pda_other);
+            // Different pool ⇒ different PDA.
+            let other_pool = Pubkey::new_unique();
+            let (pda_other_pool, _) = tick_array_pda(&other_pool, 3840);
+            assert_ne!(pda1, pda_other_pool);
+        }
+
+        #[test]
+        fn tick_array_pda_distinguishes_negative_start_indices_via_be_bytes() {
+            // Raw i32 big-endian — sign bit lands in the high byte.
+            // Pin the seed encoding by ensuring (-3840) and 3840 produce
+            // different PDAs; the bytewise hash of `[0,0,0x0F,0]` (3840
+            // BE) and `[0xFF,0xFF,0xF0,0]` (-3840 BE) is what makes
+            // them distinct on-chain.
+            let pool = Pubkey::new_unique();
+            let (pos, _) = tick_array_pda(&pool, 3840);
+            let (neg, _) = tick_array_pda(&pool, -3840);
+            assert_ne!(pos, neg);
+        }
     }
 }

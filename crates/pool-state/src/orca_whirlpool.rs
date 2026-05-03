@@ -167,7 +167,7 @@ impl WhirlpoolPool {
 /// integer division truncates toward zero, which mishandles negative
 /// ticks (`-3 / 64 = 0` instead of the `-64` we need for the bracket
 /// containing `-3`). This helper does the proper floor.
-fn floor_to_spacing(tick: i32, spacing: i32) -> i32 {
+pub(crate) fn floor_to_spacing(tick: i32, spacing: i32) -> i32 {
     let q = tick / spacing;
     let r = tick % spacing;
     if r < 0 {
