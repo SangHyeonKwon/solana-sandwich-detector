@@ -19,9 +19,7 @@ use crate::jupiter_v6;
 use crate::lookup::{AmmKind, DynamicPoolState, PoolConfig};
 use crate::meteora_dlmm::bin_array::{bin_id_to_bin_array_index, ParsedBinArray};
 use crate::meteora_dlmm::DlmmPool;
-use crate::orca_whirlpool::tick_array::{
-    start_tick_index_for, ticks_per_array_span, ParsedTickArray,
-};
+use crate::orca_whirlpool::tick_array::ParsedTickArray;
 use crate::pump_fun;
 use crate::{
     compute_loss_dlmm_with_trace, compute_loss_whirlpool_with_trace, compute_loss_with_trace,
@@ -192,14 +190,14 @@ pub async fn enrich_attack(
             // parser can't recover from logs. ReplayFailed when the
             // lookup can't serve it (RPC error, unsupported provider).
             //
-            // TickArray fetcher is Whirlpool-only today
-            // (`RpcPoolLookup::tick_arrays` short-circuits any non-
-            // Whirlpool DEX to empty), so Raydium CLMM stays on the
-            // within-tick path. Cross-tick legs surface as
-            // `CrossBoundaryUnsupported` rather than ReplayFailed —
-            // metric-bucket parity with how Whirlpool handles its own
-            // cross-tick exhaustion. A future Raydium CLMM TickArray
-            // parser lifts that limitation.
+            // TickArray fetcher handles both Whirlpool (88-tick) and
+            // Raydium CLMM (60-tick) accounts — `RpcPoolLookup::tick_arrays`
+            // dispatches on `attack.dex` to pick the right PDA seed
+            // encoding and `TickArrayState` parser. Lookups that don't
+            // speak the protocol (`NoPoolLookup`, partial mocks)
+            // return `Vec::new()` and the per-leg fallback drops back
+            // to within-tick — `CrossBoundaryUnsupported` then fires
+            // only when *both* paths fail.
             let Some(state) = lookup
                 .pool_dynamic_state(&effective_pool, effective_dex, attack.slot)
                 .await
@@ -233,13 +231,34 @@ pub async fn enrich_attack(
             // and falls back to `cross_tick_swap` when the within-tick
             // fast path can't resolve a leg.
             //
-            // Implementations that don't speak the TickArray protocol
-            // (`NoPoolLookup`, partial mocks) return `Vec::new()` here;
-            // the per-leg fallback then sees no arrays and stays on the
-            // within-tick path — `CrossBoundaryUnsupported` fires only when
-            // *both* paths fail.
-            let span = ticks_per_array_span(pool_0.tick_spacing);
-            let center = start_tick_index_for(pool_0.tick_current_index, pool_0.tick_spacing);
+            // Per-dex span: Whirlpool packs 88 ticks per array, Raydium
+            // CLMM packs 60. Hardcoding either size on this side would
+            // mis-align the start_indices against the on-chain PDA grid
+            // for the other DEX, so each variant picks its own
+            // `ticks_per_array_span` / `start_tick_index_for` helper.
+            let (span, center) = match config.kind {
+                AmmKind::OrcaWhirlpool => (
+                    crate::orca_whirlpool::tick_array::ticks_per_array_span(pool_0.tick_spacing),
+                    crate::orca_whirlpool::tick_array::start_tick_index_for(
+                        pool_0.tick_current_index,
+                        pool_0.tick_spacing,
+                    ),
+                ),
+                AmmKind::RaydiumClmm => (
+                    crate::raydium_clmm::tick_array::ticks_per_array_span(pool_0.tick_spacing),
+                    crate::raydium_clmm::tick_array::start_tick_index_for(
+                        pool_0.tick_current_index,
+                        pool_0.tick_spacing,
+                    ),
+                ),
+                // Outer match already gates this branch to
+                // OrcaWhirlpool | RaydiumClmm. Hitting `_` would mean a
+                // future kind was added to the V3 group without
+                // extending this inner match — the panic surfaces that
+                // bug at the call site instead of silently fetching the
+                // wrong PDAs.
+                _ => unreachable!("V3 dispatch arm only reaches OrcaWhirlpool | RaydiumClmm"),
+            };
             let start_indices: [i32; 5] = [
                 center - 2 * span,
                 center - span,
@@ -1128,7 +1147,7 @@ mod tests {
     /// local because this module's tests don't share that one.
     fn make_test_tick_array(start_tick_index: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
         use crate::orca_whirlpool::tick_array::{TickData, TICK_ARRAY_SIZE};
-        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
         for (i, net) in slots {
             ticks[*i] = TickData {
                 initialised: true,
@@ -2458,10 +2477,12 @@ mod tests {
     async fn raydium_clmm_returns_cross_boundary_unsupported_when_lookup_serves_no_tick_arrays() {
         // Force a within-tick bail by parking sqrt_price exactly on a
         // tick boundary in the direction the frontrun moves. Lookup
-        // serves no TickArrays (empty Vec, mirroring the v1 Raydium CLMM
-        // wiring), so the cross-tick fallback can't resolve and the
-        // path lands on `CrossBoundaryUnsupported` — same metric bucket
-        // Whirlpool fires when its 5-array window is too narrow.
+        // serves no TickArrays (empty Vec) — the contract every lookup
+        // implementation that doesn't speak the protocol falls back on
+        // (`NoPoolLookup`, partial test mocks). The cross-tick fallback
+        // then sees no arrays and surfaces `CrossBoundaryUnsupported`,
+        // same metric bucket Whirlpool fires when its window is too
+        // narrow.
         //
         // Sell-first sandwich with `base_is_token_a=true` makes the
         // frontrun walk a→b, the direction the boundary at tick=0
@@ -2490,10 +2511,6 @@ mod tests {
         let lookup = MockLookup {
             config,
             dynamic_state: Some(dynamic_state),
-            // Empty TickArrays: matches the v1 wiring of Raydium CLMM —
-            // `RpcPoolLookup::tick_arrays` short-circuits to Vec::new()
-            // for non-Whirlpool dexes until a Raydium TickArrayState
-            // parser lands.
             tick_arrays: vec![],
             bin_arrays: vec![],
             mint_accounts: vec![],
@@ -2673,5 +2690,205 @@ mod tests {
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::UnsupportedDex);
+    }
+
+    // ---------------------------------------------------------------------
+    // Raydium CLMM cross-tick enrichment (Phase 5/CLMM step 10) — drives
+    // a full Enriched outcome through the per-dex dispatch + walker.
+    // ---------------------------------------------------------------------
+
+    /// TickArray fixture builder for Raydium CLMM — 60-tick layout.
+    /// Same `(slot, liquidity_net)` sparse-override pattern as
+    /// `make_test_tick_array` (Whirlpool, 88-tick), but the resulting
+    /// vec is sized to Raydium's `TICK_ARRAY_SIZE = 60` so the walker
+    /// derives the right per-array span. A test that mistakenly fed a
+    /// Whirlpool-shaped 88-element array into a Raydium attack would
+    /// silently mis-align tick lookups against the wrong span.
+    fn make_test_raydium_tick_array(
+        start_tick_index: i32,
+        slots: &[(usize, i128)],
+    ) -> ParsedTickArray {
+        use crate::orca_whirlpool::tick_array::TickData;
+        use crate::raydium_clmm::tick_array::TICK_ARRAY_SIZE;
+        let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
+        for (i, net) in slots {
+            ticks[*i] = TickData {
+                initialised: true,
+                liquidity_net: *net,
+            };
+        }
+        ParsedTickArray {
+            start_tick_index,
+            ticks,
+        }
+    }
+
+    /// Mirror of `whirlpool_cross_tick_fallback_via_lookup_enriches` for
+    /// Raydium CLMM. Same boundary-seated pool + double-LP fixture, but
+    /// the TickArray window uses Raydium's 60-tick spans (3840 ticks
+    /// per array at spacing 64) — the dispatch in `enrich_attack` picks
+    /// the Raydium `ticks_per_array_span` / `start_tick_index_for`
+    /// helpers, and the walker derives per-array span from
+    /// `ticks.len()`. End-to-end exercise of step 8/9 wiring: lookup
+    /// serves Raydium-shaped arrays, dispatch picks the right window
+    /// helpers, walker resolves the cross-tick legs, replay produces
+    /// `clmm_replay` trace + non-zero loss.
+    #[tokio::test]
+    async fn raydium_clmm_cross_tick_fallback_via_lookup_enriches() {
+        let mut attack = make_attack();
+        attack.dex = DexType::RaydiumClmm;
+        attack.frontrun.direction = SwapDirection::Sell;
+        attack.victim.direction = SwapDirection::Sell;
+        attack.backrun.direction = SwapDirection::Buy;
+        // Small amounts so each leg's cross-tick walk caps within the
+        // first segment after the boundary at 1.5B liquidity. Test
+        // exercises the *fallback path*, not the swap arithmetic.
+        attack.frontrun.amount_in = 100_000;
+        attack.victim.amount_in = 50_000;
+        attack.backrun.amount_in = 100_000;
+        let mut config = make_config();
+        config.kind = AmmKind::RaydiumClmm;
+        config.base_is_token_a = true;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(0),
+            liquidity: 1_500_000_000,
+            tick_current_index: 0,
+            tick_spacing: 64,
+        };
+        // Two LPs sharing the same fixture shape as the Whirlpool
+        // cross-tick test, but the array boundaries are 60-spaced
+        // (Raydium's array span = 60 * 64 = 3840) instead of 88-spaced.
+        //   * LP1 (tight): [-128, 128], 1B liquidity.
+        //     - upper at tick 128 = array_at_zero slot 2 (delta -1B)
+        //     - lower at tick -128 = array_at_neg_3840 slot 58
+        //       ((-128 - (-3840)) / 64 = 58, delta +1B)
+        //   * LP2 (wide): [-2048, 2048], 500M liquidity.
+        //     - upper at tick 2048 = array_at_zero slot 32 (delta -500M)
+        //     - lower at tick -2048 = array_at_neg_3840 slot 28
+        //       ((-2048 - (-3840)) / 64 = 28, delta +500M)
+        let tick_arrays = vec![
+            Some(make_test_raydium_tick_array(
+                0,
+                &[(2, -1_000_000_000), (32, -500_000_000)],
+            )),
+            Some(make_test_raydium_tick_array(
+                -3_840,
+                &[(58, 1_000_000_000), (28, 500_000_000)],
+            )),
+        ];
+        let lookup = MockLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+            tick_arrays,
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.is_some());
+        assert!(attack.attacker_profit.is_some());
+        // Cross-tick path populates the V3 trace — same shape Whirlpool
+        // emits, populated through the renamed `clmm_replay` field.
+        let trace = attack.clmm_replay.expect("clmm_replay populated");
+        assert_eq!(trace.liquidity_pre, 1_500_000_000);
+    }
+
+    /// Pin that `enrich_attack`'s V3 dispatch arm picks Raydium's
+    /// 60-tick `ticks_per_array_span` / `start_tick_index_for` helpers
+    /// for `RaydiumClmm` attacks — *not* Whirlpool's 88-tick variants.
+    ///
+    /// The cross-tick integration test above can't catch a helper-mixup
+    /// bug on its own: `MockLookup` returns its preset arrays
+    /// regardless of which `start_indices` were requested, and the
+    /// walker derives per-array span from `ticks.len()`. So even if
+    /// the dispatch passed Whirlpool-spaced indices (5632 instead of
+    /// 3840), the replay would still resolve through the Raydium
+    /// arrays the mock serves, hiding the misalignment. In production
+    /// against `RpcPoolLookup`, those wrong-grid PDAs would return
+    /// `None` from the on-chain fetch → most cross-tick legs would
+    /// bail with `CrossBoundaryUnsupported`.
+    ///
+    /// This test uses an inline `SpyLookup` to record the actual
+    /// `start_indices` the dispatch hands to `tick_arrays`. With
+    /// `tick_current = 0`, `tick_spacing = 64`, Raydium's center±2
+    /// window must be `[-7680, -3840, 0, 3840, 7680]` (multiples of
+    /// 60 × 64 = 3840). Whirlpool's would be `[-11264, -5632, 0,
+    /// 5632, 11264]` — a regression mixing them up fails this
+    /// assertion.
+    #[tokio::test]
+    async fn raydium_clmm_dispatch_passes_raydium_grid_start_indices_to_lookup() {
+        use std::sync::Mutex as StdMutex;
+
+        struct SpyLookup {
+            config: PoolConfig,
+            dynamic_state: Option<DynamicPoolState>,
+            recorded: StdMutex<Vec<i32>>,
+        }
+
+        #[async_trait]
+        impl PoolStateLookup for SpyLookup {
+            async fn pool_config(&self, _pool: &str, _dex: DexType) -> Option<PoolConfig> {
+                Some(self.config.clone())
+            }
+
+            async fn pool_dynamic_state(
+                &self,
+                _pool: &str,
+                _dex: DexType,
+                _slot: u64,
+            ) -> Option<DynamicPoolState> {
+                self.dynamic_state
+            }
+
+            async fn tick_arrays(
+                &self,
+                _pool: &str,
+                _dex: DexType,
+                start_indices: &[i32],
+                _slot: u64,
+            ) -> Vec<Option<ParsedTickArray>> {
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(start_indices);
+                // Return empty so the per-leg fallback is exercised but
+                // doesn't depend on parser output — this test pins
+                // *which indices the dispatch requests*, not the walker
+                // outcome.
+                Vec::new()
+            }
+        }
+
+        let mut attack = make_attack();
+        attack.dex = DexType::RaydiumClmm;
+        let mut config = make_config();
+        config.kind = AmmKind::RaydiumClmm;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(0),
+            liquidity: 1_500_000_000,
+            tick_current_index: 0,
+            tick_spacing: 64,
+        };
+        let lookup = SpyLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+            recorded: StdMutex::new(Vec::new()),
+        };
+
+        let _ = enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        let recorded = lookup.recorded.lock().unwrap().clone();
+        // Raydium-grid: span = 60 * 64 = 3840, center = 0.
+        assert_eq!(
+            recorded,
+            vec![-7_680, -3_840, 0, 3_840, 7_680],
+            "dispatch must hand Raydium-spaced indices to tick_arrays — \
+             Whirlpool-spaced ([-11264, -5632, 0, 5632, 11264]) means the \
+             RaydiumClmm arm picked the wrong span helper"
+        );
     }
 }

@@ -167,7 +167,7 @@ impl WhirlpoolPool {
 /// integer division truncates toward zero, which mishandles negative
 /// ticks (`-3 / 64 = 0` instead of the `-64` we need for the bracket
 /// containing `-3`). This helper does the proper floor.
-fn floor_to_spacing(tick: i32, spacing: i32) -> i32 {
+pub(crate) fn floor_to_spacing(tick: i32, spacing: i32) -> i32 {
     let q = tick / spacing;
     let r = tick % spacing;
     if r < 0 {
@@ -358,7 +358,7 @@ pub mod tick_math {
 ///   * Uniswap V3 `sqrt_price_math::get_next_sqrt_price_from_amount_in`
 ///   * `orca-so/whirlpools` `programs/whirlpool/src/math/sqrt_price_math.rs`
 pub mod swap_math {
-    use super::tick_array::{ticks_per_array_span, ParsedTickArray, TickData};
+    use super::tick_array::{ParsedTickArray, TickData};
     use super::tick_math;
     use super::WhirlpoolPool;
     use crate::fixed_point::{mul_div_ceil, mul_div_floor};
@@ -837,13 +837,19 @@ pub mod swap_math {
     /// Look up the [`TickData`] at `target_tick`. Returns `None` when
     /// the tick falls outside every supplied array (caller fetched the
     /// wrong start indices).
+    ///
+    /// Span is derived per-array from `array.ticks.len() * tick_spacing`
+    /// — Whirlpool's 88-tick layout and Raydium CLMM's 60-tick layout
+    /// each carry their own length, and a global `ticks_per_array_span`
+    /// hardcoded to 88 would falsely match Raydium ticks against the
+    /// adjacent (uninitialised) padding.
     fn lookup_tick_data(
         tick_arrays: &[Option<ParsedTickArray>],
         target_tick: i32,
         tick_spacing: u16,
     ) -> Option<TickData> {
-        let span = ticks_per_array_span(tick_spacing);
         for array in tick_arrays.iter().filter_map(|x| x.as_ref()) {
+            let span = (array.ticks.len() as i32) * (tick_spacing as i32);
             let array_min = array.start_tick_index;
             let array_max_exclusive = array_min + span;
             if target_tick < array_min || target_tick >= array_max_exclusive {
@@ -851,9 +857,9 @@ pub mod swap_math {
             }
             let offset = (target_tick - array_min) / (tick_spacing as i32);
             // Defensive: if tick_spacing doesn't divide evenly, the
-            // tick isn't on the array's grid. Real Whirlpool ticks
-            // always align, but the `as usize` cast would otherwise
-            // index out of bounds on a malformed input.
+            // tick isn't on the array's grid. Real V3 ticks always
+            // align, but the `as usize` cast would otherwise index out
+            // of bounds on a malformed input.
             if (target_tick - array_min) % (tick_spacing as i32) != 0 {
                 return None;
             }
@@ -944,18 +950,26 @@ pub mod tick_array {
     }
 
     /// One parsed TickArray account.
+    ///
+    /// `ticks` is a `Vec` rather than a fixed-size array so the struct
+    /// can carry tick chunks from V3 DEXes that don't share Whirlpool's
+    /// 88-tick layout (Raydium CLMM packs 60 ticks per array). Whirlpool
+    /// always produces a 88-element vec; Raydium produces 60. The
+    /// cross-tick walker derives each array's tick span from
+    /// `ticks.len()` so a heterogeneous slice would still parse — though
+    /// in practice every call site is fed arrays from one source DEX.
     #[derive(Debug, Clone)]
     pub struct ParsedTickArray {
         /// Tick index of the first slot. Always a multiple of
-        /// `tick_spacing * TICK_ARRAY_SIZE`.
+        /// `tick_spacing * ticks.len()`.
         pub start_tick_index: i32,
-        pub ticks: [TickData; TICK_ARRAY_SIZE],
+        pub ticks: Vec<TickData>,
     }
 
     impl ParsedTickArray {
-        /// Tick index of the slot at position `i` (0..[`TICK_ARRAY_SIZE`]).
+        /// Tick index of the slot at position `i` (0..`ticks.len()`).
         /// `tick_spacing` isn't stored on the array — it's a property of
-        /// the parent Whirlpool — so the caller passes it in.
+        /// the parent pool — so the caller passes it in.
         pub fn tick_index_at(&self, i: usize, tick_spacing: u16) -> i32 {
             self.start_tick_index + (i as i32) * (tick_spacing as i32)
         }
@@ -973,7 +987,7 @@ pub mod tick_array {
             return None;
         }
         let start_tick_index = read_i32(data, OFFSET_START_TICK)?;
-        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
         for (i, slot) in ticks.iter_mut().enumerate() {
             let tick_offset = OFFSET_TICKS + i * TICK_LEN;
             let initialised_byte = *data.get(tick_offset + TICK_OFFSET_INITIALISED)?;
@@ -1876,7 +1890,7 @@ mod tests {
     /// liquidity_net)` entries. All listed slots are marked
     /// initialised; the rest default to uninitialised.
     fn make_array(start_tick_index: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
-        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
         for (i, net) in slots {
             ticks[*i] = TickData {
                 initialised: true,

@@ -1395,7 +1395,7 @@ mod tests {
     fn double_lp_arrays() -> Vec<crate::orca_whirlpool::tick_array::ParsedTickArray> {
         use crate::orca_whirlpool::tick_array::{ParsedTickArray, TickData, TICK_ARRAY_SIZE};
         fn array(start: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
-            let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+            let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
             for (i, net) in slots {
                 ticks[*i] = TickData {
                     initialised: true,
