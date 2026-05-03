@@ -4,6 +4,43 @@ All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-05-03
+
+### Fixed
+
+- **Raydium CLMM pool address extraction** (`crates/swap-events/src/dex/raydium_clmm.rs`).
+  The CLMM swap parser was reading `accounts[1]` from each `swap` /
+  `swap_v2` instruction and storing it as the pool address. `accounts[1]`
+  is the `amm_config` PDA — a 117-byte fee-tier account shared across
+  many pools — whereas the pool state is at `accounts[2]` (~1544 bytes).
+  This is the same class of bug previously fixed in `raydium_cpmm.rs`
+  (see comments there).
+
+  Effect on detection: the same-block detector groups swaps by
+  `SwapEvent.pool`, so every CLMM swap that shared a fee tier was
+  bucketed under one "pool" address regardless of which actual pool —
+  and which mint pair — it touched. A 10k-slot mainnet sample on
+  `417236145..417246145` (2026-05-03) surfaced 4 raydium_clmm
+  "sandwiches" with three distinct token mints across
+  frontrun / victim / backrun (impossible for a 2-token pool),
+  all unenriched (`severity = null`, `victim_loss_lamports` absent)
+  because pool-state lookup was feeding the 117-byte `AmmConfig` into
+  `PoolState` parsers and silently failing.
+
+  Adds 4 unit tests in `raydium_clmm.rs` covering top-level `swap_v2`,
+  top-level `swap`, the inner-CPI router pattern, and the `< 3`
+  accounts edge case. Each asserts `pool == accounts[2]` and rejects
+  `accounts[1]`; all four fail on the pre-fix indexing.
+
+### Operational notes
+
+- Re-running the same 10k mainnet range with the fix should drop the
+  4 false-positive raydium_clmm "sandwiches" (or surface them with
+  correct, distinct pool addresses if any are actual sandwiches).
+  Phoenix and pump_fun behavior is unchanged.
+- No schema changes — the wire format and Vigil contract (`vigil-v1`)
+  are byte-for-byte identical to v1.0.0.
+
 ## [1.0.0] — 2026-05-03
 
 **Phase 5 closure: 7 of 8 supported DEXes have AMM-replay enrichment, and the
@@ -77,4 +114,5 @@ Pre-1.0 development is recorded in git history. High-level milestones:
 
 For step-by-step history, see `git log` and the merged PRs (#1 through #27).
 
+[1.0.1]: https://github.com/SangHyeonKwon/solana-sandwich-detector/releases/tag/v1.0.1
 [1.0.0]: https://github.com/SangHyeonKwon/solana-sandwich-detector/releases/tag/v1.0.0
