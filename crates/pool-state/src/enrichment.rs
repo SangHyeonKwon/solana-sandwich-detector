@@ -428,6 +428,20 @@ pub async fn enrich_attack(
             let pool_quote_tvl = pre_virtual_sol;
             (loss, Some(trace), None, None, pool_quote_tvl)
         }
+        AmmKind::RaydiumClmm => {
+            // Phase 5 step 1 (CLMM series): variant exists so dispatch
+            // reaches this arm; the actual replay (PoolState parser →
+            // dynamic state → 5-array TickArray window →
+            // `compute_loss_whirlpool_with_trace`) lands in subsequent
+            // steps.
+            //
+            // `RpcPoolLookup::pool_config` has no Raydium CLMM branch
+            // today either, so the upstream `ConfigUnavailable` early
+            // return catches Raydium CLMM first in practice — this arm
+            // is the type-system completeness backstop for when the
+            // fetcher lands without the replay being ready.
+            return EnrichmentResult::ReplayFailed;
+        }
     };
 
     attack.victim_loss_lamports = Some(loss.victim_loss);
