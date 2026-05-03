@@ -613,7 +613,8 @@ mod tests {
     use crate::lookup::{AmmKind, PoolConfig};
     use async_trait::async_trait;
     use swap_events::types::{
-        DexType, SwapDirection, SwapEvent, TokenBalanceChange, TransactionData,
+        DexType, InnerInstructionGroup, InstructionData, SwapDirection, SwapEvent,
+        TokenBalanceChange, TransactionData,
     };
 
     struct MockLookup {
@@ -2501,5 +2502,176 @@ mod tests {
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::CrossBoundaryUnsupported);
+    }
+
+    // ---------------------------------------------------------------------
+    // Jupiter V6 enrichment (Phase 5/Jupiter step 4) — pivot to underlying
+    // DEX via inner-instruction route extraction.
+    // ---------------------------------------------------------------------
+
+    /// Wrap a frontrun tx with a synthetic Jupiter V6 inner-instruction
+    /// group. `inner` is the underlying DEX CPI(s) the route extractor
+    /// should classify. Token-balance changes carry over from
+    /// `make_frontrun_tx` so the underlying-DEX replay path's
+    /// `reserves::extract` finds vault entries.
+    fn jupiter_frontrun_tx(inner: Vec<InstructionData>) -> TransactionData {
+        TransactionData {
+            inner_instructions: vec![InnerInstructionGroup {
+                index: 0,
+                instructions: inner,
+            }],
+            ..make_frontrun_tx()
+        }
+    }
+
+    fn make_ix(program_id: &str, data: Vec<u8>, accounts: Vec<&str>) -> InstructionData {
+        InstructionData {
+            program_id: program_id.to_string(),
+            accounts: accounts.into_iter().map(String::from).collect(),
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn jupiter_v6_single_hop_via_raydium_v4_enriches() {
+        // User submits Jupiter swap, Jupiter routes through Raydium V4.
+        // Pivot resolves underlying ⇒ pool_config / replay run via the
+        // existing constant-product path. Pins that Jupiter dispatch
+        // doesn't lose any signal vs hitting Raydium V4 directly.
+        use swap_events::dex::raydium::RAYDIUM_V4_PROGRAM_ID;
+
+        let mut attack = make_attack();
+        attack.dex = DexType::JupiterV6;
+        // attack.pool stays "POOL" — same address the route's accounts[1]
+        // will carry, mirroring how the Jupiter parser sets pool to the
+        // underlying when it can find it.
+
+        let tx = jupiter_frontrun_tx(vec![make_ix(
+            RAYDIUM_V4_PROGRAM_ID,
+            vec![9, 0, 0, 0],
+            vec!["x", "POOL", "y"],
+        )]);
+        let lookup = MockLookup {
+            // Mock returns RaydiumV4 config for any (pool, dex) pair —
+            // sufficient because the pivot routes the lookup to
+            // (effective_pool="POOL", effective_dex=RaydiumV4).
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.unwrap() > 0);
+        assert!(attack.attacker_profit.is_some());
+        // Constant-product trace populates because pivot landed on V4.
+        assert!(attack.amm_replay.is_some());
+        assert!(attack.clmm_replay.is_none());
+        assert!(attack.dlmm_replay.is_none());
+        // attack.dex stays JupiterV6 — semantic record of what the user
+        // actually submitted, even though math ran against the underlying
+        // pool. Vigil's BE keys dashboards on this field.
+        assert_eq!(attack.dex, DexType::JupiterV6);
+    }
+
+    #[tokio::test]
+    async fn jupiter_v6_multi_hop_returns_cross_boundary_unsupported() {
+        // Route through TWO distinct underlying DEXes — out of scope for
+        // v1 enrichment. Surfaces on the same metric bucket as V3
+        // cross-tick exhaustion ("we know what's missing, just haven't
+        // built it yet").
+        use swap_events::dex::orca::ORCA_WHIRLPOOL_PROGRAM_ID;
+        use swap_events::dex::raydium::RAYDIUM_V4_PROGRAM_ID;
+        const WHIRLPOOL_SWAP_DISC: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+
+        let mut attack = make_attack();
+        attack.dex = DexType::JupiterV6;
+        let tx = jupiter_frontrun_tx(vec![
+            make_ix(
+                RAYDIUM_V4_PROGRAM_ID,
+                vec![9, 0, 0, 0],
+                vec!["x", "POOL_V4", "y"],
+            ),
+            make_ix(
+                ORCA_WHIRLPOOL_PROGRAM_ID,
+                WHIRLPOOL_SWAP_DISC.to_vec(),
+                vec!["x", "y", "POOL_WP", "z"],
+            ),
+        ]);
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::CrossBoundaryUnsupported);
+        // No replay ⇒ enrichment-derived fields stay None.
+        assert!(attack.victim_loss_lamports.is_none());
+        assert!(attack.amm_replay.is_none());
+    }
+
+    #[tokio::test]
+    async fn jupiter_v6_no_underlying_cpi_returns_reserves_missing() {
+        // Jupiter parser saw a Jupiter ix (so attack.dex is JupiterV6)
+        // but the inner instructions don't include any recognised DEX
+        // CPI. Either Jupiter dispatched to a DEX we don't yet
+        // recognise, or this is a parser false positive. Surface as
+        // ReservesMissing — same shape as parser-data-missing for
+        // vault-based AMMs.
+        let mut attack = make_attack();
+        attack.dex = DexType::JupiterV6;
+        let tx = jupiter_frontrun_tx(vec![make_ix(
+            "11111111111111111111111111111111", // System program transfer
+            vec![2, 0, 0, 0],
+            vec!["x", "y"],
+        )]);
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::ReservesMissing);
+        assert!(attack.victim_loss_lamports.is_none());
+    }
+
+    #[tokio::test]
+    async fn jupiter_v6_single_hop_via_phoenix_returns_unsupported_dex() {
+        // Route through Phoenix (still unsupported as of step 3) ⇒ the
+        // pivot resolves to Phoenix, then `AmmKind::from_dex(Phoenix)`
+        // returns None ⇒ surface UnsupportedDex. The bucket parity
+        // matters: the heartbeat metric should match what would have
+        // fired had the user hit Phoenix directly.
+        use swap_events::dex::phoenix::PHOENIX_PROGRAM_ID;
+
+        let mut attack = make_attack();
+        attack.dex = DexType::JupiterV6;
+        let tx = jupiter_frontrun_tx(vec![make_ix(
+            PHOENIX_PROGRAM_ID,
+            vec![],
+            vec!["PHOENIX_MARKET"],
+        )]);
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::UnsupportedDex);
     }
 }
