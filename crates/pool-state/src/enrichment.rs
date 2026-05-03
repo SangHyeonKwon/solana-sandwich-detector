@@ -1128,7 +1128,7 @@ mod tests {
     /// local because this module's tests don't share that one.
     fn make_test_tick_array(start_tick_index: i32, slots: &[(usize, i128)]) -> ParsedTickArray {
         use crate::orca_whirlpool::tick_array::{TickData, TICK_ARRAY_SIZE};
-        let mut ticks = [TickData::default(); TICK_ARRAY_SIZE];
+        let mut ticks = vec![TickData::default(); TICK_ARRAY_SIZE];
         for (i, net) in slots {
             ticks[*i] = TickData {
                 initialised: true,
