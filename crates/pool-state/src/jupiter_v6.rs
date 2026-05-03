@@ -247,7 +247,10 @@ mod tests {
                 vec!["x", "y", "POOL_WP", "z"],
             ),
         ]]);
-        assert_eq!(extract_route(&tx), RouteInfo::MultiHop { distinct_count: 2 });
+        assert_eq!(
+            extract_route(&tx),
+            RouteInfo::MultiHop { distinct_count: 2 }
+        );
     }
 
     #[test]
@@ -288,14 +291,21 @@ mod tests {
                 vec!["x", "y", "POOL_WP_B", "z"],
             ),
         ]]);
-        assert_eq!(extract_route(&tx), RouteInfo::MultiHop { distinct_count: 2 });
+        assert_eq!(
+            extract_route(&tx),
+            RouteInfo::MultiHop { distinct_count: 2 }
+        );
     }
 
     #[test]
     fn no_dex_cpi_returns_no_dex_cpi() {
         // System program transfer + token program — nothing routable.
         let tx = make_tx(vec![vec![
-            make_ix("11111111111111111111111111111111", vec![2, 0, 0, 0], vec!["x", "y"]),
+            make_ix(
+                "11111111111111111111111111111111",
+                vec![2, 0, 0, 0],
+                vec!["x", "y"],
+            ),
             make_ix(
                 "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                 vec![3],
@@ -358,6 +368,9 @@ mod tests {
                 vec!["x", "y", "BC_POOL", "z"],
             ),
         ]]);
-        assert_eq!(extract_route(&tx), RouteInfo::MultiHop { distinct_count: 2 });
+        assert_eq!(
+            extract_route(&tx),
+            RouteInfo::MultiHop { distinct_count: 2 }
+        );
     }
 }
