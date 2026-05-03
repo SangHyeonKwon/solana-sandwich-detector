@@ -43,12 +43,12 @@ Sandwich attacks are the most common form of MEV exploitation on Solana. An atta
 |-----|--------------------|---------------------------|
 | Raydium V4 | Direct swaps + CPI | ✅ Constant product |
 | Raydium CPMM | Direct swaps + CPI | ✅ Constant product |
-| Raydium CLMM | Direct swaps + CPI | — |
+| Raydium CLMM | Direct swaps + CPI | ✅ Concentrated, within-tick + cross-tick |
 | Orca Whirlpool | Direct swaps + CPI | ✅ Concentrated, within-tick + cross-tick |
 | Meteora DLMM | Direct swaps + CPI | ✅ Constant-sum, within-bin + cross-bin |
-| Jupiter V6 | Route-through (resolves underlying pool) | (via underlying pool) |
-| Pump.fun | Direct swaps + CPI | — |
-| Phoenix | Direct swaps + CPI | — |
+| Jupiter V6 | Route-through (resolves underlying pool) | ✅ Single-hop dispatch via underlying DEX (multi-hop deferred) |
+| Pump.fun | Direct swaps + CPI | ✅ Bonding curve, virtual reserves recovered from `TradeEvent` log |
+| Phoenix | Direct swaps + CPI | — (CLOB; not yet supported) |
 
 > Adding a new DEX takes ~50 lines for swap parsing; replay support adds another module. See [Contributing](#contributing).
 
@@ -171,7 +171,7 @@ state_2c = state_0 after victim, no frontrun       (replay, "counterfactual")
 victim_loss = victim_out(state_2c) - victim_out(state_2)
 ```
 
-Reserves at each step come from the transaction's own `pre_token_balances` / `post_token_balances` — no historical RPC needed for constant-product pools. Concentrated-liquidity AMMs (Whirlpool, DLMM) need the dynamic `sqrt_price` / `liquidity` / `active_id` snapshot, fetched via `getAccountInfo` on the pool account; the `AccountFetcher` trait lets you plug in archival providers for backfill.
+Reserves at each step come from the transaction's own `pre_token_balances` / `post_token_balances` — no historical RPC needed for constant-product pools. Concentrated-liquidity AMMs (Whirlpool, Raydium CLMM, DLMM) need the dynamic `sqrt_price` / `liquidity` / `active_id` snapshot, fetched via `getAccountInfo` on the pool account; the `AccountFetcher` trait lets you plug in archival providers for backfill. Pump.fun is a special case — its bonding-curve `virtual_*_reserves` are recovered from the `TradeEvent` Anchor log Pump.fun emits per swap, so no extra RPC is needed and archival replay works out of the box.
 
 When enrichment succeeds, each `SandwichAttack` gets:
 
@@ -182,7 +182,7 @@ When enrichment succeeds, each `SandwichAttack` gets:
 - `severity` — bucket from the loss-to-pool-TVL ratio
 - Per-DEX trace: `amm_replay` (constant product), `clmm_replay` (V3-style: Whirlpool + Raydium CLMM), `dlmm_replay` (DLMM) — lets a downstream consumer recompute the loss from raw arithmetic
 
-Attacks on unsupported DEXes pass through with these fields set to `None`.
+Attacks on unsupported DEXes (Phoenix today; Jupiter routes through unsupported underlying pools count too) pass through with these fields set to `None`. Multi-hop Jupiter routes surface as `cross_boundary_unsupported` on the heartbeat metric — single-hop pivots through the underlying DEX's existing replay path.
 
 ---
 
