@@ -43,3 +43,4 @@ dotenvy = "0.15"
 schemars = { version = "0.8", features = ["preserve_order"] }
 proptest = "1"
 primitive-types = { version = "0.13", default-features = false }
+base64 = "0.22"

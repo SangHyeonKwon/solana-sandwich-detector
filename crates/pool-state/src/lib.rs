@@ -22,6 +22,7 @@ pub mod fixed_point;
 pub mod lookup;
 pub mod meteora_dlmm;
 pub mod orca_whirlpool;
+pub mod pump_fun;
 pub mod raydium_cpmm;
 pub mod raydium_v4;
 pub mod reserves;
