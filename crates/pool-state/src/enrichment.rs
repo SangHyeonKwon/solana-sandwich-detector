@@ -442,6 +442,27 @@ pub async fn enrich_attack(
             let pool_quote_tvl = pre_virtual_sol;
             (loss, Some(trace), None, None, pool_quote_tvl)
         }
+        AmmKind::JupiterV6 => {
+            // Phase 5 step 1 (Jupiter series): variant exists so
+            // dispatch reaches this arm; route extraction (parse the
+            // Jupiter swap's inner instructions to identify the
+            // underlying DEX + pool) and dispatch into the existing
+            // per-DEX replay paths land in subsequent steps.
+            //
+            // `RpcPoolLookup::pool_config` has no Jupiter branch
+            // today either, so the upstream `ConfigUnavailable`
+            // early return catches Jupiter first in practice — this
+            // arm is the type-system completeness backstop for when
+            // the route extractor lands without the dispatch wiring
+            // being ready.
+            //
+            // Note Jupiter has no native pool / fee schedule of its
+            // own; the eventual config synthesis pattern follows
+            // Pump.fun's lead (no `RpcPoolLookup::pool_config`
+            // branch; build a synthetic config off the underlying
+            // DEX once the route is extracted).
+            return EnrichmentResult::ReplayFailed;
+        }
     };
 
     attack.victim_loss_lamports = Some(loss.victim_loss);
