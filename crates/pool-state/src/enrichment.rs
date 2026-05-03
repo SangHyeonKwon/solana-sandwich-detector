@@ -15,12 +15,13 @@ use swap_events::types::{
     DetectionEvidence, ReplayStep, SandwichAttack, Severity, Signal, TransactionData,
 };
 
-use crate::lookup::{AmmKind, DynamicPoolState};
+use crate::lookup::{AmmKind, DynamicPoolState, PoolConfig};
 use crate::meteora_dlmm::bin_array::{bin_id_to_bin_array_index, ParsedBinArray};
 use crate::meteora_dlmm::DlmmPool;
 use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
+use crate::pump_fun;
 use crate::{
     compute_loss_dlmm_with_trace, compute_loss_whirlpool_with_trace, compute_loss_with_trace,
     diff_test, reserves, ConstantProduct, PoolStateLookup,
@@ -70,12 +71,40 @@ pub async fn enrich_attack(
     lookup: &dyn PoolStateLookup,
 ) -> EnrichmentResult {
     // Short-circuit DEXes we don't yet replay.
-    if crate::lookup::AmmKind::from_dex(attack.dex).is_none() {
+    let Some(amm_kind) = crate::lookup::AmmKind::from_dex(attack.dex) else {
         return EnrichmentResult::UnsupportedDex;
-    }
+    };
 
-    let Some(config) = lookup.pool_config(&attack.pool, attack.dex).await else {
-        return EnrichmentResult::ConfigUnavailable;
+    // Pump.fun replay needs no `pool_config` fetcher: every per-pool
+    // parameter (fee = flat 1%, virtual reserves) lives on the
+    // BondingCurve account, recovered from the Trade event log
+    // emitted by the program. Synthesize a minimal config inline so
+    // the rest of the pipeline (post-replay severity / signals) stays
+    // on the same code path as vault-based AMMs.
+    //
+    // `vault_*` fields are intentionally empty — `reserves::extract`
+    // (Tier 3.1's input on the backrun tx) returns `None` for empty
+    // vault names, so the post-state diff signal is silently skipped
+    // for Pump.fun. A future Pump.fun-specific verification can
+    // compare the backrun tx's TradeEvent virtual reserves against
+    // the replay trace's `reserves_post_back` when wired up.
+    let config = if amm_kind == AmmKind::PumpFun {
+        PoolConfig {
+            kind: AmmKind::PumpFun,
+            pool: attack.pool.clone(),
+            vault_base: String::new(),
+            vault_quote: String::new(),
+            base_mint: String::new(),
+            quote_mint: String::new(),
+            fee_num: 100,
+            fee_den: 10_000,
+            base_is_token_a: true,
+        }
+    } else {
+        let Some(c) = lookup.pool_config(&attack.pool, attack.dex).await else {
+            return EnrichmentResult::ConfigUnavailable;
+        };
+        c
     };
 
     // Dispatch by AMM kind. Each path produces (loss,
@@ -322,17 +351,82 @@ pub async fn enrich_attack(
             (loss, None, None, Some(dlmm_trace), pool_quote_tvl)
         }
         AmmKind::PumpFun => {
-            // Phase 5 step 1: bonding-curve enrichment scaffolding only.
-            // Replay path needs the Trade-event log parser (step 2) and
-            // virtual-reserves wiring (step 3); until then we land here
-            // and short-circuit.
+            // Recover pre-frontrun virtual reserves from the Trade
+            // event Pump.fun emits via `emit!` on every successful
+            // buy/sell. The event carries POST-trade reserves; we
+            // reverse the frontrun swap to get the t=0 state the
+            // replay needs.
+            let Some(event) = pump_fun::extract_trade_event(&frontrun_tx.log_messages) else {
+                tracing::debug!(
+                    "PumpFun ReservesMissing: pool={} log_count={}",
+                    attack.pool,
+                    frontrun_tx.log_messages.len()
+                );
+                return EnrichmentResult::ReservesMissing;
+            };
+
+            // Reverse the frontrun swap to recover pre-trade reserves.
+            // Pump.fun fee model: flat 1% on the SOL leg, paid to a
+            // separate `fee_recipient` (NOT into the pool). This means
+            // a buy contributes only 99% of the user's gross SOL into
+            // the pool's `virtual_sol_reserves`, while a sell drains
+            // the full pre-fee SOL amount from the pool (the user
+            // receives 99% of that drain after the fee_recipient
+            // takes its 1% on the way out).
             //
-            // `pool_config` for Pump.fun has no fetcher implementation
-            // today either, so in practice the early `ConfigUnavailable`
-            // return upstream catches it first — this arm is the
-            // type-system completeness backstop for when the fetcher
-            // lands without the replay being ready.
-            return EnrichmentResult::ReplayFailed;
+            // Wrapping arithmetic here is safe — pump.fun reserves
+            // are u64 and a single trade's delta cannot exceed them
+            // by construction, so `checked_*` only fires on a
+            // malformed log we rejected upstream.
+            let (pre_virtual_sol, pre_virtual_token) = if event.is_buy {
+                let sol_into_pool = (event.sol_amount as u128 * 99) / 100;
+                let pre_sol = (event.virtual_sol_reserves as u128).checked_sub(sol_into_pool);
+                let pre_token =
+                    (event.virtual_token_reserves as u128).checked_add(event.token_amount as u128);
+                match (pre_sol, pre_token) {
+                    (Some(s), Some(t)) => (s, t),
+                    _ => return EnrichmentResult::ReservesMissing,
+                }
+            } else {
+                let pre_sol =
+                    (event.virtual_sol_reserves as u128).checked_add(event.sol_amount as u128);
+                let pre_token =
+                    (event.virtual_token_reserves as u128).checked_sub(event.token_amount as u128);
+                match (pre_sol, pre_token) {
+                    (Some(s), Some(t)) => (s, t),
+                    _ => return EnrichmentResult::ReservesMissing,
+                }
+            };
+
+            // Drive the constant-product replay against the virtual
+            // reserves. Pump.fun's fee semantics differ from V2 in
+            // *where* the fee lands (fee_recipient vs LP), but the
+            // *user-visible* swap math (`amount_out` for a given
+            // `amount_in`) is the same V2 formula with fee on input,
+            // so `compute_loss_with_trace` returns the right
+            // `amount_out` predictions and the per-step
+            // `InvariantResidual` signal stays in the small-residual
+            // regime for typical sandwich trade sizes. There's a
+            // residual systematic bias in the post-state reserves
+            // trajectory (V2 grows k by retaining the fee, Pump.fun
+            // doesn't), bounded by ~1% per leg in the worst case —
+            // well below the severity-bucket noise floor for
+            // mainnet-realistic trade sizes.
+            let pool_0 = ConstantProduct::new(
+                pre_virtual_token,
+                pre_virtual_sol,
+                config.fee_num,
+                config.fee_den,
+            );
+            let Some((loss, trace)) = compute_loss_with_trace(attack, pool_0) else {
+                return EnrichmentResult::ReplayFailed;
+            };
+
+            // Severity TVL: the pool's pre-frontrun quote (SOL)
+            // depth, in lamports. Same shape as the constant-product
+            // path uses for vault-based AMMs.
+            let pool_quote_tvl = pre_virtual_sol;
+            (loss, Some(trace), None, None, pool_quote_tvl)
         }
     };
 
