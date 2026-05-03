@@ -2126,4 +2126,188 @@ mod tests {
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::CrossBoundaryUnsupported);
     }
+
+    // ---------------------------------------------------------------------
+    // Pump.fun enrichment (Phase 5 step 3) — log-derived virtual reserves.
+    // ---------------------------------------------------------------------
+
+    /// Build a `Program data: <base64>` log line carrying a Pump.fun
+    /// `TradeEvent` with the given post-trade reserves and swap delta.
+    /// Mirrors `pump_fun::tests::build_trade_event_payload` but exposes
+    /// the result as a fully-framed log message so tests can drop it
+    /// straight into `TransactionData.log_messages`.
+    fn build_trade_event_log(
+        is_buy: bool,
+        sol_amount: u64,
+        token_amount: u64,
+        post_virtual_sol: u64,
+        post_virtual_token: u64,
+    ) -> String {
+        use crate::pump_fun::TRADE_EVENT_DISCRIMINATOR;
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let mut buf = Vec::with_capacity(113);
+        buf.extend_from_slice(&TRADE_EVENT_DISCRIMINATOR);
+        buf.extend_from_slice(&[0x11; 32]); // mint
+        buf.extend_from_slice(&sol_amount.to_le_bytes());
+        buf.extend_from_slice(&token_amount.to_le_bytes());
+        buf.push(if is_buy { 1 } else { 0 });
+        buf.extend_from_slice(&[0x22; 32]); // user
+        buf.extend_from_slice(&1_730_000_000_i64.to_le_bytes());
+        buf.extend_from_slice(&post_virtual_sol.to_le_bytes());
+        buf.extend_from_slice(&post_virtual_token.to_le_bytes());
+        format!("Program data: {}", STANDARD.encode(&buf))
+    }
+
+    /// Pump.fun-flavoured frontrun tx: empty token-balance-changes
+    /// (Pump.fun replay reads from the Trade event log, not vault
+    /// balances) plus a single Trade-event log line. The defaults
+    /// model a buy of `1 SOL gross` against a 30-SOL / 1B-token
+    /// virtual reserve pool (typical mid-life Pump.fun bonding curve).
+    fn pump_fun_buy_frontrun_tx() -> TransactionData {
+        // Pre-trade virtual reserves (what the replay needs to recover):
+        //   pre_sol = 30_000_000_000 (30 SOL)
+        //   pre_token = 1_000_000_000_000_000 (1B tokens, 6 decimals)
+        // Frontrun: buy with sol_amount = 1_000_000_000 (1 SOL gross).
+        // Pool's effective input = 1 SOL × 99/100 = 990_000_000.
+        // Token out = pre_token × 990_000_000 / (pre_sol + 990_000_000)
+        //           = 1e15 × 990_000_000 / 30_990_000_000
+        //           ≈ 31_945_788_641_497 (rounded) — we hardcode the
+        // exact value the V2 math produces so the round-trip matches.
+        const SOL_AMOUNT: u64 = 1_000_000_000;
+        const TOKEN_OUT: u64 = 31_945_788_641_497;
+        const POST_VIRTUAL_SOL: u64 = 30_990_000_000;
+        const POST_VIRTUAL_TOKEN: u64 = 1_000_000_000_000_000 - TOKEN_OUT;
+        TransactionData {
+            signature: "f".into(),
+            signer: "atk".into(),
+            success: true,
+            tx_index: 0,
+            account_keys: vec![],
+            instructions: vec![],
+            inner_instructions: vec![],
+            // Pump.fun replay doesn't read vault balances — empty is
+            // fine and matches reality (Pump.fun's BondingCurve isn't
+            // a vault-pair AMM).
+            token_balance_changes: vec![],
+            sol_balance_changes: vec![],
+            fee: 5000,
+            log_messages: vec![
+                "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]".into(),
+                "Program log: Instruction: Buy".into(),
+                build_trade_event_log(
+                    true,
+                    SOL_AMOUNT,
+                    TOKEN_OUT,
+                    POST_VIRTUAL_SOL,
+                    POST_VIRTUAL_TOKEN,
+                ),
+                "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success".into(),
+            ],
+        }
+    }
+
+    fn pump_fun_attack() -> SandwichAttack {
+        // Frontrun buys 1 SOL gross; victim is a smaller buy that
+        // gets price-impacted by the frontrun; backrun sells the
+        // tokens the frontrun acquired. Numbers don't need to be
+        // exact for the test to assert "loss > 0" — the contract
+        // pinned here is "Pump.fun reaches the replay arm and
+        // populates `victim_loss_lamports` instead of leaving null".
+        SandwichAttack {
+            dex: DexType::PumpFun,
+            frontrun: make_swap(
+                "f",
+                "atk",
+                SwapDirection::Buy,
+                1_000_000_000,
+                31_945_788_641_497,
+            ),
+            victim: make_swap("v", "vic", SwapDirection::Buy, 100_000_000, 0),
+            backrun: make_swap("b", "atk", SwapDirection::Sell, 31_945_788_641_497, 0),
+            ..make_attack()
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_fun_enriches_via_log_derived_virtual_reserves() {
+        let mut attack = pump_fun_attack();
+        let tx = pump_fun_buy_frontrun_tx();
+        // PoolStateLookup is unused by Pump.fun's path — config is
+        // synthesized inline in `enrich_attack`. Keep the mock so
+        // the trait object resolves; whatever it returns is
+        // ignored for `dex == PumpFun`.
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(
+            attack.victim_loss_lamports.unwrap() > 0,
+            "Pump.fun victim_loss_lamports should be positive after enrichment"
+        );
+        assert!(attack.attacker_profit.is_some());
+        assert!(attack.price_impact_bps.unwrap() > 0);
+        // amm_replay trace is the constant-product variant — Pump.fun
+        // reuses the V2 math so the trace shape matches Raydium V4.
+        assert!(attack.amm_replay.is_some(), "amm_replay should populate");
+        assert!(attack.whirlpool_replay.is_none());
+        assert!(attack.dlmm_replay.is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_fun_returns_reserves_missing_when_no_trade_event() {
+        let mut attack = pump_fun_attack();
+        let tx = TransactionData {
+            log_messages: vec![
+                "Program log: Instruction: Buy".into(),
+                "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success".into(),
+            ],
+            ..pump_fun_buy_frontrun_tx()
+        };
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::ReservesMissing);
+        // No replay ⇒ enrichment-derived fields stay None.
+        assert!(attack.victim_loss_lamports.is_none());
+        assert!(attack.amm_replay.is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_fun_returns_reserves_missing_when_log_corrupted() {
+        let mut attack = pump_fun_attack();
+        let tx = TransactionData {
+            log_messages: vec![
+                "Program data: not!valid!base64!".into(),
+                "Program data: aGVsbG8=".into(), // valid b64 of "hello", wrong discriminator
+            ],
+            ..pump_fun_buy_frontrun_tx()
+        };
+        let lookup = MockLookup {
+            config: make_config(),
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::ReservesMissing);
+    }
 }
