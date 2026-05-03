@@ -34,12 +34,20 @@ pub enum AmmKind {
     /// reaches the Pump.fun arm; replay (log-derived virtual reserves
     /// → `compute_loss_with_trace`) lands in steps 2-3.
     PumpFun,
+    /// Raydium Concentrated Liquidity Market Maker (CLMM). Same V3-style
+    /// `sqrt_price + liquidity + tick` swap math as Whirlpool — only the
+    /// on-chain account layouts differ. Replay reuses
+    /// `compute_loss_whirlpool_with_trace` once dynamic state +
+    /// TickArray fetchers land. Phase 5 step 1: variant exists so
+    /// dispatch reaches the CLMM arm; pool-config / dynamic-state
+    /// parsers + the actual replay wiring land in subsequent steps.
+    RaydiumClmm,
 }
 
 impl AmmKind {
     /// Map a [`DexType`] to an AMM kind this crate can recognise. Returns
     /// `None` for DEXes we have neither config parsing nor replay for
-    /// (Phoenix, Jupiter, Raydium CLMM today; Pump.fun moves under
+    /// (Phoenix, Jupiter today; Pump.fun and Raydium CLMM moved under
     /// supported in Phase 5).
     pub fn from_dex(dex: DexType) -> Option<Self> {
         match dex {
@@ -48,6 +56,7 @@ impl AmmKind {
             DexType::OrcaWhirlpool => Some(AmmKind::OrcaWhirlpool),
             DexType::MeteoraDlmm => Some(AmmKind::MeteoraDlmm),
             DexType::PumpFun => Some(AmmKind::PumpFun),
+            DexType::RaydiumClmm => Some(AmmKind::RaydiumClmm),
             _ => None,
         }
     }
@@ -307,14 +316,23 @@ mod tests {
         assert_eq!(AmmKind::from_dex(DexType::PumpFun), Some(AmmKind::PumpFun));
     }
 
-    /// Companion to the above: DEXes still in the unsupported set
-    /// (Phoenix, Jupiter, Raydium CLMM as of Phase 5 step 1) keep
-    /// returning `None`. When their replay lands, move them out of
-    /// this assertion one at a time.
+    /// Raydium CLMM moved out of the unsupported set in Phase 5 step 2.
+    /// Same regression-pin shape as `from_dex_recognises_pump_fun`.
     #[test]
-    fn from_dex_still_rejects_phoenix_jupiter_clmm() {
+    fn from_dex_recognises_raydium_clmm() {
+        assert_eq!(
+            AmmKind::from_dex(DexType::RaydiumClmm),
+            Some(AmmKind::RaydiumClmm)
+        );
+    }
+
+    /// Companion to the above: DEXes still in the unsupported set
+    /// (Phoenix, Jupiter as of Phase 5 step 2) keep returning `None`.
+    /// When their replay lands, move them out of this assertion one
+    /// at a time.
+    #[test]
+    fn from_dex_still_rejects_phoenix_and_jupiter() {
         assert_eq!(AmmKind::from_dex(DexType::Phoenix), None);
         assert_eq!(AmmKind::from_dex(DexType::JupiterV6), None);
-        assert_eq!(AmmKind::from_dex(DexType::RaydiumClmm), None);
     }
 }

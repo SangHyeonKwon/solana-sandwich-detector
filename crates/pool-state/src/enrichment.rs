@@ -143,11 +143,25 @@ pub async fn enrich_attack(
             };
             (loss, Some(trace), None, None, tx_reserves.pre.1)
         }
-        AmmKind::OrcaWhirlpool => {
-            // Within-tick Whirlpool replay (Tier 3.4 step 4-α). Needs
-            // slot-anchored dynamic state — sqrt_price / liquidity / tick —
-            // that the parser can't recover from logs. ReplayFailed when
-            // the lookup can't serve it (RPC error, unsupported provider).
+        AmmKind::OrcaWhirlpool | AmmKind::RaydiumClmm => {
+            // V3-style replay (Tier 3.4 step 4-α). Whirlpool and
+            // Raydium CLMM share the swap-math surface (sqrt_price +
+            // liquidity + tick walked through TickArrays); the dynamic
+            // state for both arrives via `pool_dynamic_state` in the
+            // `DynamicPoolState::Whirlpool` carrier variant (named for
+            // its first user, but layout-agnostic). Needs slot-anchored
+            // dynamic state — sqrt_price / liquidity / tick — that the
+            // parser can't recover from logs. ReplayFailed when the
+            // lookup can't serve it (RPC error, unsupported provider).
+            //
+            // TickArray fetcher is Whirlpool-only today
+            // (`RpcPoolLookup::tick_arrays` short-circuits any non-
+            // Whirlpool DEX to empty), so Raydium CLMM stays on the
+            // within-tick path. Cross-tick legs surface as
+            // `CrossBoundaryUnsupported` rather than ReplayFailed —
+            // metric-bucket parity with how Whirlpool handles its own
+            // cross-tick exhaustion. A future Raydium CLMM TickArray
+            // parser lifts that limitation.
             let Some(state) = lookup
                 .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
                 .await
@@ -2309,5 +2323,134 @@ mod tests {
 
         let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
         assert_eq!(result, EnrichmentResult::ReservesMissing);
+    }
+
+    // ---------------------------------------------------------------------
+    // Raydium CLMM enrichment (Phase 5/CLMM step 6) — within-tick replay
+    // through the merged `OrcaWhirlpool | RaydiumClmm` match arm.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn raydium_clmm_within_tick_enriches() {
+        // Same dispatch shape as the Whirlpool within-tick test —
+        // dynamic state served via `DynamicPoolState::Whirlpool`
+        // (the layout-agnostic V3 carrier), modest amounts so neither
+        // leg walks past the active tick. Pins the contract that
+        // Raydium CLMM uses the same V3 replay path as Whirlpool and
+        // populates the same `clmm_replay` field on the attack.
+        let mut attack = make_attack();
+        attack.dex = DexType::RaydiumClmm;
+        let mut config = make_config();
+        config.kind = AmmKind::RaydiumClmm;
+        config.base_is_token_a = true;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(10),
+            liquidity: 1_000_000_000_000,
+            tick_current_index: 10,
+            tick_spacing: 64,
+        };
+        let lookup = MockLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::Enriched);
+        assert!(attack.victim_loss_lamports.is_some());
+        assert!(attack.attacker_profit.is_some());
+        // Constant-product trace stays None on V3 replay.
+        assert!(attack.amm_replay.is_none());
+        // V3 path populates the (formerly Whirlpool-specific, now
+        // generalized) `clmm_replay` field — same shape Whirlpool
+        // uses, here driven by Raydium CLMM dispatch.
+        let trace = attack.clmm_replay.expect("clmm_replay populated");
+        assert_eq!(
+            trace.sqrt_price_pre,
+            crate::orca_whirlpool::tick_math::sqrt_price_at_tick(10),
+        );
+        assert_eq!(trace.liquidity_pre, 1_000_000_000_000);
+        assert_eq!(trace.tick_current_pre, 10);
+    }
+
+    #[tokio::test]
+    async fn raydium_clmm_returns_replay_failed_when_dynamic_state_unavailable() {
+        // Lookup returns `None` for `pool_dynamic_state` — same dispatch
+        // contract as Whirlpool: ReplayFailed (RPC unavailable / unsupported
+        // provider). Pin so a regression that silently downgrades to
+        // `ConfigUnavailable` or `UnsupportedDex` is caught on the metrics
+        // bucket rather than only at the data-flow assertion below.
+        let mut attack = make_attack();
+        attack.dex = DexType::RaydiumClmm;
+        let mut config = make_config();
+        config.kind = AmmKind::RaydiumClmm;
+        let tx = make_frontrun_tx();
+        let lookup = MockLookup {
+            config,
+            dynamic_state: None,
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::ReplayFailed);
+        assert!(attack.victim_loss_lamports.is_none());
+        assert!(attack.clmm_replay.is_none());
+    }
+
+    #[tokio::test]
+    async fn raydium_clmm_returns_cross_boundary_unsupported_when_lookup_serves_no_tick_arrays() {
+        // Force a within-tick bail by parking sqrt_price exactly on a
+        // tick boundary in the direction the frontrun moves. Lookup
+        // serves no TickArrays (empty Vec, mirroring the v1 Raydium CLMM
+        // wiring), so the cross-tick fallback can't resolve and the
+        // path lands on `CrossBoundaryUnsupported` — same metric bucket
+        // Whirlpool fires when its 5-array window is too narrow.
+        //
+        // Sell-first sandwich with `base_is_token_a=true` makes the
+        // frontrun walk a→b, the direction the boundary at tick=0
+        // forces through cross-tick.
+        let mut attack = make_attack();
+        attack.dex = DexType::RaydiumClmm;
+        attack.frontrun.direction = SwapDirection::Sell;
+        attack.victim.direction = SwapDirection::Sell;
+        attack.backrun.direction = SwapDirection::Buy;
+        attack.frontrun.amount_in = 100_000;
+        attack.victim.amount_in = 50_000;
+        attack.backrun.amount_in = 100_000;
+        let mut config = make_config();
+        config.kind = AmmKind::RaydiumClmm;
+        config.base_is_token_a = true;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            // Boundary-aligned sqrt_price ⇒ within-tick a→b leg bails
+            // on the very first step. Same fixture shape Whirlpool's
+            // cross-tick test uses.
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(0),
+            liquidity: 1_500_000_000,
+            tick_current_index: 0,
+            tick_spacing: 64,
+        };
+        let lookup = MockLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+            // Empty TickArrays: matches the v1 wiring of Raydium CLMM —
+            // `RpcPoolLookup::tick_arrays` short-circuits to Vec::new()
+            // for non-Whirlpool dexes until a Raydium TickArrayState
+            // parser lands.
+            tick_arrays: vec![],
+            bin_arrays: vec![],
+            mint_accounts: vec![],
+            epoch: None,
+        };
+
+        let result = enrich_attack(&mut attack, &tx, None, &lookup).await;
+        assert_eq!(result, EnrichmentResult::CrossBoundaryUnsupported);
     }
 }
