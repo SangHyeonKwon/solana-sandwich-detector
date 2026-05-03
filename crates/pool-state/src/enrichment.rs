@@ -21,6 +21,7 @@ use crate::meteora_dlmm::DlmmPool;
 use crate::orca_whirlpool::tick_array::{
     start_tick_index_for, ticks_per_array_span, ParsedTickArray,
 };
+use crate::jupiter_v6;
 use crate::pump_fun;
 use crate::{
     compute_loss_dlmm_with_trace, compute_loss_whirlpool_with_trace, compute_loss_with_trace,
@@ -75,6 +76,43 @@ pub async fn enrich_attack(
         return EnrichmentResult::UnsupportedDex;
     };
 
+    // Jupiter V6 pivot: Jupiter is a router, not an AMM. Resolve the
+    // underlying-DEX dispatch from the frontrun tx's inner instructions
+    // and use *those* identifiers for downstream `pool_config` /
+    // `pool_dynamic_state` / `tick_arrays` / `bin_arrays` lookups. The
+    // attack's own `dex` and `pool` stay untouched (semantic record:
+    // user used Jupiter; the parser-derived `pool` may already be the
+    // underlying pool address or a `jup:<sig>` fallback).
+    //
+    // Multi-hop routes are out-of-scope for v1 enrichment — surface as
+    // `CrossBoundaryUnsupported` so the metric bucket parallels how
+    // V3 cross-tick exhaustion is reported. NoDexCpi (parser saw a
+    // Jupiter instruction but no recognised underlying CPI) maps to
+    // `ReservesMissing` — same shape as the parser-data-missing path
+    // for vault-based AMMs.
+    let (effective_dex, effective_pool, effective_amm_kind) = if amm_kind == AmmKind::JupiterV6 {
+        match jupiter_v6::extract_route(frontrun_tx) {
+            jupiter_v6::RouteInfo::SingleHop { dex, pool } => {
+                let Some(kind) = crate::lookup::AmmKind::from_dex(dex) else {
+                    // Underlying DEX is itself unsupported (e.g. Phoenix
+                    // today). Surface as UnsupportedDex so the heartbeat
+                    // metric bucket matches what would have fired if
+                    // the user had hit that DEX directly.
+                    return EnrichmentResult::UnsupportedDex;
+                };
+                (dex, pool, kind)
+            }
+            jupiter_v6::RouteInfo::MultiHop { .. } => {
+                return EnrichmentResult::CrossBoundaryUnsupported;
+            }
+            jupiter_v6::RouteInfo::NoDexCpi => {
+                return EnrichmentResult::ReservesMissing;
+            }
+        }
+    } else {
+        (attack.dex, attack.pool.clone(), amm_kind)
+    };
+
     // Pump.fun replay needs no `pool_config` fetcher: every per-pool
     // parameter (fee = flat 1%, virtual reserves) lives on the
     // BondingCurve account, recovered from the Trade event log
@@ -88,10 +126,10 @@ pub async fn enrich_attack(
     // for Pump.fun. A future Pump.fun-specific verification can
     // compare the backrun tx's TradeEvent virtual reserves against
     // the replay trace's `reserves_post_back` when wired up.
-    let config = if amm_kind == AmmKind::PumpFun {
+    let config = if effective_amm_kind == AmmKind::PumpFun {
         PoolConfig {
             kind: AmmKind::PumpFun,
-            pool: attack.pool.clone(),
+            pool: effective_pool.clone(),
             vault_base: String::new(),
             vault_quote: String::new(),
             base_mint: String::new(),
@@ -101,7 +139,7 @@ pub async fn enrich_attack(
             base_is_token_a: true,
         }
     } else {
-        let Some(c) = lookup.pool_config(&attack.pool, attack.dex).await else {
+        let Some(c) = lookup.pool_config(&effective_pool, effective_dex).await else {
             return EnrichmentResult::ConfigUnavailable;
         };
         c
@@ -163,7 +201,7 @@ pub async fn enrich_attack(
             // cross-tick exhaustion. A future Raydium CLMM TickArray
             // parser lifts that limitation.
             let Some(state) = lookup
-                .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
+                .pool_dynamic_state(&effective_pool, effective_dex, attack.slot)
                 .await
             else {
                 return EnrichmentResult::ReplayFailed;
@@ -210,7 +248,7 @@ pub async fn enrich_attack(
                 center + 2 * span,
             ];
             let tick_arrays: Vec<ParsedTickArray> = lookup
-                .tick_arrays(&attack.pool, attack.dex, &start_indices, attack.slot)
+                .tick_arrays(&effective_pool, effective_dex, &start_indices, attack.slot)
                 .await
                 .into_iter()
                 .flatten()
@@ -241,7 +279,7 @@ pub async fn enrich_attack(
             // the active bin, then run `compute_loss_dlmm`. Cross-bin
             // legs bail with `CrossBoundaryUnsupported` for Phase 2 follow-up.
             let Some(state) = lookup
-                .pool_dynamic_state(&attack.pool, attack.dex, attack.slot)
+                .pool_dynamic_state(&effective_pool, effective_dex, attack.slot)
                 .await
             else {
                 return EnrichmentResult::ReplayFailed;
@@ -268,7 +306,7 @@ pub async fn enrich_attack(
                 array_index + 2,
             ];
             let arrays_raw = lookup
-                .bin_arrays(&attack.pool, attack.dex, &array_indices, attack.slot)
+                .bin_arrays(&effective_pool, effective_dex, &array_indices, attack.slot)
                 .await;
             // Empty `Vec` from a lookup that doesn't speak BinArray is
             // the "not supported" signal — same convention as Whirlpool's
@@ -443,24 +481,14 @@ pub async fn enrich_attack(
             (loss, Some(trace), None, None, pool_quote_tvl)
         }
         AmmKind::JupiterV6 => {
-            // Phase 5 step 1 (Jupiter series): variant exists so
-            // dispatch reaches this arm; route extraction (parse the
-            // Jupiter swap's inner instructions to identify the
-            // underlying DEX + pool) and dispatch into the existing
-            // per-DEX replay paths land in subsequent steps.
-            //
-            // `RpcPoolLookup::pool_config` has no Jupiter branch
-            // today either, so the upstream `ConfigUnavailable`
-            // early return catches Jupiter first in practice — this
-            // arm is the type-system completeness backstop for when
-            // the route extractor lands without the dispatch wiring
-            // being ready.
-            //
-            // Note Jupiter has no native pool / fee schedule of its
-            // own; the eventual config synthesis pattern follows
-            // Pump.fun's lead (no `RpcPoolLookup::pool_config`
-            // branch; build a synthetic config off the underlying
-            // DEX once the route is extracted).
+            // Unreachable: the Jupiter pivot at the top of
+            // `enrich_attack` rewrites `effective_amm_kind` to the
+            // underlying DEX before this match runs (or short-circuits
+            // on multi-hop / no-CPI). Reaching here would mean the
+            // pivot logic has drifted out of sync with this match —
+            // surface as `ReplayFailed` rather than panicking so a
+            // regression shows up on the heartbeat metric instead of
+            // crashing the detector.
             return EnrichmentResult::ReplayFailed;
         }
     };
