@@ -2795,4 +2795,100 @@ mod tests {
         let trace = attack.clmm_replay.expect("clmm_replay populated");
         assert_eq!(trace.liquidity_pre, 1_500_000_000);
     }
+
+    /// Pin that `enrich_attack`'s V3 dispatch arm picks Raydium's
+    /// 60-tick `ticks_per_array_span` / `start_tick_index_for` helpers
+    /// for `RaydiumClmm` attacks — *not* Whirlpool's 88-tick variants.
+    ///
+    /// The cross-tick integration test above can't catch a helper-mixup
+    /// bug on its own: `MockLookup` returns its preset arrays
+    /// regardless of which `start_indices` were requested, and the
+    /// walker derives per-array span from `ticks.len()`. So even if
+    /// the dispatch passed Whirlpool-spaced indices (5632 instead of
+    /// 3840), the replay would still resolve through the Raydium
+    /// arrays the mock serves, hiding the misalignment. In production
+    /// against `RpcPoolLookup`, those wrong-grid PDAs would return
+    /// `None` from the on-chain fetch → most cross-tick legs would
+    /// bail with `CrossBoundaryUnsupported`.
+    ///
+    /// This test uses an inline `SpyLookup` to record the actual
+    /// `start_indices` the dispatch hands to `tick_arrays`. With
+    /// `tick_current = 0`, `tick_spacing = 64`, Raydium's center±2
+    /// window must be `[-7680, -3840, 0, 3840, 7680]` (multiples of
+    /// 60 × 64 = 3840). Whirlpool's would be `[-11264, -5632, 0,
+    /// 5632, 11264]` — a regression mixing them up fails this
+    /// assertion.
+    #[tokio::test]
+    async fn raydium_clmm_dispatch_passes_raydium_grid_start_indices_to_lookup() {
+        use std::sync::Mutex as StdMutex;
+
+        struct SpyLookup {
+            config: PoolConfig,
+            dynamic_state: Option<DynamicPoolState>,
+            recorded: StdMutex<Vec<i32>>,
+        }
+
+        #[async_trait]
+        impl PoolStateLookup for SpyLookup {
+            async fn pool_config(&self, _pool: &str, _dex: DexType) -> Option<PoolConfig> {
+                Some(self.config.clone())
+            }
+
+            async fn pool_dynamic_state(
+                &self,
+                _pool: &str,
+                _dex: DexType,
+                _slot: u64,
+            ) -> Option<DynamicPoolState> {
+                self.dynamic_state
+            }
+
+            async fn tick_arrays(
+                &self,
+                _pool: &str,
+                _dex: DexType,
+                start_indices: &[i32],
+                _slot: u64,
+            ) -> Vec<Option<ParsedTickArray>> {
+                self.recorded
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(start_indices);
+                // Return empty so the per-leg fallback is exercised but
+                // doesn't depend on parser output — this test pins
+                // *which indices the dispatch requests*, not the walker
+                // outcome.
+                Vec::new()
+            }
+        }
+
+        let mut attack = make_attack();
+        attack.dex = DexType::RaydiumClmm;
+        let mut config = make_config();
+        config.kind = AmmKind::RaydiumClmm;
+        let tx = make_frontrun_tx();
+        let dynamic_state = DynamicPoolState::Whirlpool {
+            sqrt_price_q64: crate::orca_whirlpool::tick_math::sqrt_price_at_tick(0),
+            liquidity: 1_500_000_000,
+            tick_current_index: 0,
+            tick_spacing: 64,
+        };
+        let lookup = SpyLookup {
+            config,
+            dynamic_state: Some(dynamic_state),
+            recorded: StdMutex::new(Vec::new()),
+        };
+
+        let _ = enrich_attack(&mut attack, &tx, None, &lookup).await;
+
+        let recorded = lookup.recorded.lock().unwrap().clone();
+        // Raydium-grid: span = 60 * 64 = 3840, center = 0.
+        assert_eq!(
+            recorded,
+            vec![-7_680, -3_840, 0, 3_840, 7_680],
+            "dispatch must hand Raydium-spaced indices to tick_arrays — \
+             Whirlpool-spaced ([-11264, -5632, 0, 5632, 11264]) means the \
+             RaydiumClmm arm picked the wrong span helper"
+        );
+    }
 }
