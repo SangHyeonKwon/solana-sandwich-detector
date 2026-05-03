@@ -623,10 +623,7 @@ pub mod tick_array {
     /// would round toward zero, landing in the array *above* a negative
     /// tick).
     pub fn start_tick_index_for(tick_current: i32, tick_spacing: u16) -> i32 {
-        crate::orca_whirlpool::floor_to_spacing(
-            tick_current,
-            ticks_per_array_span(tick_spacing),
-        )
+        crate::orca_whirlpool::floor_to_spacing(tick_current, ticks_per_array_span(tick_spacing))
     }
 
     /// Raydium CLMM TickArray PDA. Seeds:
@@ -672,10 +669,7 @@ pub mod tick_array {
         /// `(slot, liquidity_net, liquidity_gross)` overrides. Slots
         /// not listed have zero gross + zero net (parse as
         /// uninitialised).
-        fn make_blob(
-            start_tick_index: i32,
-            overrides: &[(usize, i128, u128)],
-        ) -> Vec<u8> {
+        fn make_blob(start_tick_index: i32, overrides: &[(usize, i128, u128)]) -> Vec<u8> {
             let mut data = vec![0u8; MIN_LAYOUT_LEN];
             data[OFFSET_START_TICK..OFFSET_START_TICK + 4]
                 .copy_from_slice(&start_tick_index.to_le_bytes());
@@ -735,10 +729,7 @@ pub mod tick_array {
 
         #[test]
         fn liquidity_net_round_trips_signed_extremes() {
-            let blob = make_blob(
-                0,
-                &[(0, i128::MAX, 1), (1, i128::MIN, 1), (2, -1, 1)],
-            );
+            let blob = make_blob(0, &[(0, i128::MAX, 1), (1, i128::MIN, 1), (2, -1, 1)]);
             let p = parse_tick_array(&blob).unwrap();
             assert_eq!(p.ticks[0].liquidity_net, i128::MAX);
             assert_eq!(p.ticks[1].liquidity_net, i128::MIN);

@@ -324,8 +324,7 @@ impl PoolStateLookup for RpcPoolLookup {
         start_indices: &[i32],
         slot: u64,
     ) -> Vec<Option<ParsedTickArray>> {
-        if !matches!(dex, DexType::OrcaWhirlpool | DexType::RaydiumClmm)
-            || start_indices.is_empty()
+        if !matches!(dex, DexType::OrcaWhirlpool | DexType::RaydiumClmm) || start_indices.is_empty()
         {
             return Vec::new();
         }
@@ -368,12 +367,8 @@ impl PoolStateLookup for RpcPoolLookup {
             .into_iter()
             .map(|opt| {
                 opt.and_then(|a| match dex {
-                    DexType::OrcaWhirlpool => {
-                        orca_whirlpool::tick_array::parse_tick_array(&a.data)
-                    }
-                    DexType::RaydiumClmm => {
-                        raydium_clmm::tick_array::parse_tick_array(&a.data)
-                    }
+                    DexType::OrcaWhirlpool => orca_whirlpool::tick_array::parse_tick_array(&a.data),
+                    DexType::RaydiumClmm => raydium_clmm::tick_array::parse_tick_array(&a.data),
                     _ => unreachable!(),
                 })
             })
@@ -702,7 +697,11 @@ mod tests {
         assert_eq!(calls.len(), starts.len(), "one fetch entry per start_index");
         for (i, &start) in starts.iter().enumerate() {
             let expected = crate::raydium_clmm::tick_array::tick_array_pda(&pool, start).0;
-            assert_eq!(calls[i].0, expected, "PDA must be Raydium-derived for slot {}", start);
+            assert_eq!(
+                calls[i].0, expected,
+                "PDA must be Raydium-derived for slot {}",
+                start
+            );
             assert_eq!(calls[i].1, 88_888, "slot must propagate to every PDA");
             // Raydium's PDA must NOT collide with the Whirlpool PDA
             // for the same (pool, start). They use different program
@@ -731,7 +730,10 @@ mod tests {
         let result = lookup
             .tick_arrays(&pool.to_string(), DexType::RaydiumV4, &[0, 5_632], 12_345)
             .await;
-        assert!(result.is_empty(), "non-V3 dex should short-circuit to empty");
+        assert!(
+            result.is_empty(),
+            "non-V3 dex should short-circuit to empty"
+        );
         assert!(
             fetcher.calls().is_empty(),
             "fetcher should not be called for unsupported dex",
